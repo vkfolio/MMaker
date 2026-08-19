@@ -49,7 +49,6 @@ else
   fi
 
   log "starting ACE-Step on :${ACESTEP_PORT} (first run downloads weights)"
-  setsid_maybe() { command -v setsid >/dev/null && setsid "$@" || "$@"; }
   (
     cd "$ACESTEP_DIR"
     # Bind to localhost: the model server is an internal dependency, not a
@@ -59,14 +58,15 @@ else
     # which re-downloads multi-GB CUDA wheels whenever the venv was populated
     # any other way -- turning a start into another hour of downloading.
     if [ -x .venv/bin/acestep-api ]; then
-      exec setsid_maybe .venv/bin/acestep-api --host 127.0.0.1 --port "$ACESTEP_PORT"         >> "${ACESTEP_LOG:-/workspace/acestep.log}" 2>&1
+      exec .venv/bin/acestep-api --host 127.0.0.1 --port "$ACESTEP_PORT"         >> "${ACESTEP_LOG:-/workspace/acestep.log}" 2>&1
     fi
-    exec setsid_maybe uv run acestep-api --host 127.0.0.1 --port "$ACESTEP_PORT"         >> "${ACESTEP_LOG:-/workspace/acestep.log}" 2>&1
+    exec uv run acestep-api --host 127.0.0.1 --port "$ACESTEP_PORT"         >> "${ACESTEP_LOG:-/workspace/acestep.log}" 2>&1
   ) &
   ACESTEP_PID=$!
-  # No EXIT trap here: this script ends by exec'ing uvicorn, and an EXIT trap
+  # No EXIT trap here. This script ends by exec'ing uvicorn, and an EXIT trap
   # fires on the way out -- killing the ACE-Step we just waited for and leaving
-  # a zombie. ACE-Step is detached with setsid so it outlives this shell.
+  # a zombie. Keep it a plain background child so $! stays valid for the
+  # liveness check below; setsid would detach it and break that check.
 
   # Its output would otherwise interleave with musicmaker's and be unreadable.
   log "ACE-Step logging to ${ACESTEP_LOG:-/workspace/acestep.log}"
