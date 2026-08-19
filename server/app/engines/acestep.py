@@ -43,9 +43,14 @@ def _deep_audio(obj, _depth=0):
         return None
     if isinstance(obj, str):
         text = obj.strip()
-        # A serialised list/dict also contains ".mp3"; matching it would send
-        # the whole JSON blob to /v1/audio as a path.
-        if text[:1] in ("[", "{") or len(text) > 2048:
+        # ACE-Step nests the real payload as a JSON *string* under "result",
+        # so parse it and keep looking rather than matching the blob itself.
+        if text[:1] in ("[", "{"):
+            try:
+                return _deep_audio(json.loads(text), _depth + 1)
+            except (ValueError, TypeError):
+                return None
+        if len(text) > 2048:
             return None
         if text.startswith("/v1/audio") or AUDIO_RE.search(text):
             return text
