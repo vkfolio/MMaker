@@ -68,6 +68,30 @@ def describe(path) -> dict:
     }
 
 
+def resample(data: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
+    """Resample [samples, channels] between rates.
+
+    Demucs emits 44.1 kHz while ACE-Step emits 48 kHz, so a project routinely
+    holds both. Refusing to mix them is not an option -- export has to work.
+    """
+    if sr_from == sr_to or len(data) == 0:
+        return data
+    try:
+        import librosa
+        chans = [librosa.resample(np.ascontiguousarray(data[:, c]),
+                                  orig_sr=sr_from, target_sr=sr_to)
+                 for c in range(data.shape[1])]
+        return np.stack(chans, axis=1).astype(np.float32)
+    except ImportError:
+        # Linear interpolation: lower quality than librosa's, but it keeps the
+        # pipeline working on a machine without it rather than failing outright.
+        n_out = int(round(len(data) * sr_to / sr_from))
+        src = np.arange(len(data), dtype=np.float64)
+        dst = np.linspace(0, len(data) - 1, n_out)
+        return np.stack([np.interp(dst, src, data[:, c]) for c in range(data.shape[1])],
+                        axis=1).astype(np.float32)
+
+
 def to_mono(data: np.ndarray) -> np.ndarray:
     return data.mean(axis=1) if data.ndim == 2 else data
 
@@ -91,13 +115,18 @@ def mix(sources: list[tuple], dest, headroom_db: float = -1.0, sr_hint: int | No
     Peak-normalised to leave headroom, because a clipped mix passed back as
     conditioning audio is a corrupted signal, not merely a loud one.
     """
-    layers, sr = [], sr_hint
+    loaded = []
     for path, gain_db, pan in sources:
         data, this_sr = load(path)
-        if sr is None:
-            sr = this_sr
-        elif this_sr != sr:
-            raise ValueError(f"sample-rate mismatch: {path} is {this_sr}, expected {sr}")
+        loaded.append((path, data, this_sr, gain_db, pan))
+
+    # Mix at the highest rate present so nothing is downsampled needlessly.
+    sr = sr_hint or max((r for _, _, r, _, _ in loaded), default=48000)
+
+    layers = []
+    for path, data, this_sr, gain_db, pan in loaded:
+        if this_sr != sr:
+            data = resample(data, this_sr, sr)
         data = apply_pan(data, pan) * db_to_gain(gain_db)
         layers.append(data)
 
@@ -123,7 +152,7 @@ def null_test(path_a, path_b) -> float:
     a, sr_a = load(path_a)
     b, sr_b = load(path_b)
     if sr_a != sr_b:
-        raise ValueError(f"sample-rate mismatch: {sr_a} vs {sr_b}")
+        b = resample(b, sr_b, sr_a)
     n = min(len(a), len(b))
     w = min(a.shape[1], b.shape[1])
     a, b = a[:n, :w], b[:n, :w]
@@ -148,13 +177,9 @@ def slice_seconds(path, dest, start_s: float, end_s: float):
 
 
 def concat(paths, dest):
-    parts, sr = [], None
-    for p in paths:
-        data, this_sr = load(p)
-        sr = sr or this_sr
-        if this_sr != sr:
-            raise ValueError("sample-rate mismatch in concat")
-        parts.append(data)
+    loaded = [load(p) for p in paths]
+    sr = max((r for _, r in loaded), default=48000)
+    parts = [resample(d, r, sr) if r != sr else d for d, r in loaded]
     width = max(p.shape[1] for p in parts)
     parts = [np.repeat(p, width, axis=1) if p.shape[1] == 1 and width > 1 else p
              for p in parts]

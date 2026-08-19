@@ -1,0 +1,166 @@
+{
+  "id": "prj_90c61988ed",
+  "title": "transport v2",
+  "grid": {
+    "bpm": 96,
+    "key_scale": "A Minor",
+    "time_sig": "4/4",
+    "bars": 8,
+    "confirmed": true
+  },
+  "idea_kind": "prompt",
+  "prompt": "transport v2",
+  "style": "",
+  "lyrics": "",
+  "vocal_language": "en",
+  "source_audio": null,
+  "variations": [
+    {
+      "id": "var_f2853388cd",
+      "seed": 1499280932,
+      "audio": "variations/var_1_1499280932.wav",
+      "prompt": "transport v2",
+      "created_at": 1787144580.2108905
+    },
+    {
+      "id": "var_51cffd9c28",
+      "seed": 597957358,
+      "audio": "variations/var_2_597957358.wav",
+      "prompt": "transport v2",
+      "created_at": 1787144580.2373133
+    }
+  ],
+  "chosen_variation": "var_f2853388cd",
+  "stems": [
+    {
+      "id": "stem_29b5e44c8c",
+      "track_class": "drums",
+      "label": "Drums",
+      "prompt": "transport v2",
+      "versions": [
+        {
+          "id": "ver_44fddb6787",
+          "audio": "stems/drums.wav",
+          "op": "import",
+          "params": {
+            "from": "var_f2853388cd",
+            "method": "demucs"
+          },
+          "sync": {
+            "detected_bpm": null,
+            "median_dev_ms": null,
+            "p90_dev_ms": null,
+            "verdict": "unmeasured",
+            "nudge_ms": 0.0
+          },
+          "created_at": 1787144591.2464528,
+          "note": ""
+        }
+      ],
+      "current": 0,
+      "gain_db": 0.0,
+      "pan": 0.0,
+      "muted": false,
+      "soloed": false,
+      "voice_id": null
+    },
+    {
+      "id": "stem_71e48c1a13",
+      "track_class": "bass",
+      "label": "Bass",
+      "prompt": "transport v2",
+      "versions": [
+        {
+          "id": "ver_f7ce5d1af6",
+          "audio": "stems/bass.wav",
+          "op": "import",
+          "params": {
+            "from": "var_f2853388cd",
+            "method": "demucs"
+          },
+          "sync": {
+            "detected_bpm": null,
+            "median_dev_ms": null,
+            "p90_dev_ms": null,
+            "verdict": "unmeasured",
+            "nudge_ms": 0.0
+          },
+          "created_at": 1787144591.2464528,
+          "note": ""
+        }
+      ],
+      "current": 0,
+      "gain_db": 0.0,
+      "pan": 0.0,
+      "muted": false,
+      "soloed": false,
+      "voice_id": null
+    },
+    {
+      "id": "stem_c9569aae54",
+      "track_class": "keyboard",
+      "label": "Keyboard",
+      "prompt": "transport v2",
+      "versions": [
+        {
+          "id": "ver_1e45ac473b",
+          "audio": "stems/keyboard.wav",
+          "op": "import",
+          "params": {
+            "from": "var_f2853388cd",
+            "method": "demucs"
+          },
+          "sync": {
+            "detected_bpm": null,
+            "median_dev_ms": null,
+            "p90_dev_ms": null,
+            "verdict": "unmeasured",
+            "nudge_ms": 0.0
+          },
+          "created_at": 1787144591.2464528,
+          "note": ""
+        }
+      ],
+      "current": 0,
+      "gain_db": 0.0,
+      "pan": 0.0,
+      "muted": false,
+      "soloed": false,
+      "voice_id": null
+    },
+    {
+      "id": "stem_e2b6e4482c",
+      "track_class": "vocals",
+      "label": "Vocals",
+      "prompt": "transport v2",
+      "versions": [
+        {
+          "id": "ver_1c6606dc31",
+          "audio": "stems/vocals.wav",
+          "op": "import",
+          "params": {
+            "from": "var_f2853388cd",
+            "method": "demucs"
+          },
+          "sync": {
+            "detected_bpm": null,
+            "median_dev_ms": null,
+            "p90_dev_ms": null,
+            "verdict": "unmeasured",
+            "nudge_ms": 0.0
+          },
+          "created_at": 1787144591.2464528,
+          "note": ""
+        }
+      ],
+      "current": 0,
+      "gain_db": 0.0,
+      "pan": 0.0,
+      "muted": false,
+      "soloed": false,
+      "voice_id": null
+    }
+  ],
+  "created_at": 1787144580.159084,
+  "updated_at": 1787144591.2464528
+}
