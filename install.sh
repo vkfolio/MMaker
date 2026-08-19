@@ -9,6 +9,7 @@
 # Flags:
 #   --stub          skip ACE-Step; run the synthetic engine (fast, proves the pod)
 #   --no-start      install only
+#   --foreground    run in this shell instead of detaching
 #   --port N        default 8000
 #   --repo URL      default the one baked in below
 set -euo pipefail
@@ -19,11 +20,13 @@ APP="$ROOT/MMaker"
 PORT=8000
 STUB=0
 START=1
+FOREGROUND=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --stub) STUB=1 ;;
     --no-start) START=0 ;;
+    --foreground) FOREGROUND=1 ;;
     --port) PORT="$2"; shift ;;
     --repo) REPO="$2"; shift ;;
     -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
@@ -139,8 +142,79 @@ printf '  Token:   %s  (saved in %s)\n' "$TOKEN" "$TOKEN_FILE"
 [ "$STUB" = "1" ] && printf '\n  STUB MODE: output is a diagnostic tone, not music.\n'
 printf '\n'
 
-if [ "$START" = "1" ]; then
-  step "starting"
-  info "first run downloads model weights; watch below, or poll /health"
+if [ "$START" != "1" ]; then
+  exit 0
+fi
+
+if [ "$FOREGROUND" = "1" ]; then
+  step "starting (foreground)"
   exec "$ROOT/run-musicmaker.sh"
+fi
+
+# Detached by default. Run in the foreground and the server is a child of this
+# shell -- closing the RunPod web terminal, or letting it time out, kills it.
+step "starting"
+LOG="$ROOT/musicmaker.log"
+PIDFILE="$ROOT/musicmaker.pid"
+
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  info "already running as PID $(cat "$PIDFILE"); restarting"
+  kill "$(cat "$PIDFILE")" 2>/dev/null || true
+  sleep 2
+fi
+
+nohup "$ROOT/run-musicmaker.sh" > "$LOG" 2>&1 &
+echo $! > "$PIDFILE"
+info "PID $(cat "$PIDFILE"), logging to $LOG"
+
+# Don't just claim it started -- wait until it actually answers.
+info "waiting for the engine to answer…"
+READY=0
+for i in $(seq 1 900); do
+  BODY="$(curl -fsS "http://127.0.0.1:${PORT}/health" 2>/dev/null || true)"
+  case "$BODY" in
+    *'"status":"ready"'*|*'"status": "ready"'*) READY=1; break ;;
+  esac
+  if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    printf '
+[1mThe server exited during startup.[0m Last lines of %s:
+
+' "$LOG"
+    tail -30 "$LOG"
+    exit 1
+  fi
+  case "$BODY" in
+    *downloading*) [ $((i % 30)) = 0 ] && info "still downloading weights (${i}s)…" ;;
+  esac
+  sleep 1
+done
+
+if [ "$READY" = "1" ]; then
+  printf '
+[1mRunning.[0m
+
+'
+  printf '  Open:    %s
+' "$URL"
+  printf '  Logs:    tail -f %s
+' "$LOG"
+  printf '  Stop:    kill $(cat %s)
+' "$PIDFILE"
+  printf '  Restart: %s
+
+' "$ROOT/run-musicmaker.sh"
+  if [ -n "$POD_ID" ]; then
+    printf '  If that link 404s, the port is not exposed: RunPod console -> your pod
+'
+    printf '  -> Edit Pod -> Expose HTTP Ports -> add %s. The app itself is fine --
+' "$PORT"
+    printf '  "curl localhost:%s/health" from this terminal proves it.
+
+' "$PORT"
+  fi
+else
+  printf '
+[1mStill not ready after 15 minutes.[0m Check: tail -f %s
+
+' "$LOG"
 fi
