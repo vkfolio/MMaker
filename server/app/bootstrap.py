@@ -5,6 +5,7 @@ the UI polls /health and shows a progress bar rather than hanging on a request
 that takes twenty minutes.
 """
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -68,6 +69,11 @@ def load_registry(path=None):
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     models = []
     for entry in raw.get("models", []):
+        # MUSICMAKER_<NAME>_REPO overrides a repo id, so a private mirror can be
+        # swapped in without editing a tracked file.
+        override = os.environ.get(f"MUSICMAKER_{entry['name'].upper()}_REPO")
+        if override:
+            entry = {**entry, "repo_id": override}
         models.append(ModelState(
             name=entry["name"],
             label=entry.get("label", entry["name"]),
