@@ -46,6 +46,19 @@ if [ ! -d "$ROOT" ]; then
   exit 1
 fi
 
+step "network"
+# Some RunPod hosts have a dead IPv6 path to Fastly/CloudFront, which front
+# PyPI and download.pytorch.org. Symptom: downloads crawl at ~200 KB/s and then
+# uv parks all its workers in futex_wait and never finishes. Preferring IPv4
+# fixes it; harmless where IPv6 works.
+if [ -w /etc/gai.conf ] || [ ! -e /etc/gai.conf ]; then
+  grep -q "::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null     || echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+  info "prefer IPv4 for package downloads"
+fi
+# Cap concurrency and make dead sockets fail fast rather than hang forever.
+export UV_CONCURRENT_DOWNLOADS="${UV_CONCURRENT_DOWNLOADS:-8}"
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-180}"
+
 step "system packages"
 if command -v apt-get >/dev/null 2>&1; then
   # fluidsynth + a SoundFont are what turn an uploaded MIDI file into audio;
