@@ -132,8 +132,11 @@ class AceStepEngine:
             if elapsed > MAX_WAIT_S:
                 raise EngineError(f"ACE-Step task {task_id} exceeded {MAX_WAIT_S}s")
             try:
+                # The route reads body["task_id_list"] (see
+                # acestep/api/http/query_result_route.py). Sending "task_id"
+                # parses as an empty list, so results are never returned.
                 resp = requests.post(f"{self.base_url}/query_result",
-                                     json={"task_id": task_id}, timeout=60)
+                                     json={"task_id_list": [task_id]}, timeout=60)
                 resp.raise_for_status()
                 body = resp.json()
             except requests.RequestException as exc:
