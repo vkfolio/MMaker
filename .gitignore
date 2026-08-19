@@ -3,6 +3,9 @@ __pycache__/
 research/out/
 server/_models/
 server/_data/
+server/_t/
+server/out/
 *.wav
+*.mp3
 *.zip
 .env
