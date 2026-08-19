@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # musicmaker one-command installer for a stock RunPod pod.
 #
-#   bash <(curl -sL https://raw.githubusercontent.com/USER/musicmaker/main/install.sh)
+#   bash <(curl -sL https://raw.githubusercontent.com/vkfolio/MMaker/main/install.sh)
 #
 # Idempotent and resumable: re-running it updates the code and skips whatever is
 # already installed. Everything lands on /workspace so it survives a pod restart.
@@ -13,9 +13,9 @@
 #   --repo URL      default the one baked in below
 set -euo pipefail
 
-REPO="${MUSICMAKER_REPO:-https://github.com/USER/musicmaker.git}"
+REPO="${MUSICMAKER_REPO:-https://github.com/vkfolio/MMaker.git}"
 ROOT="${MUSICMAKER_ROOT:-/workspace}"
-APP="$ROOT/musicmaker"
+APP="$ROOT/MMaker"
 PORT=8000
 STUB=0
 START=1

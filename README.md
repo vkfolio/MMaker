@@ -277,4 +277,4 @@ These are honest holes, not oversights. Each fails loudly with a message saying 
    `service.add_layer` needs a Demucs pass after generation.
 
 `QUICKSTART.md` runs it locally. `RUNPOD.md` runs it on a pod — the short
-version is one line: `bash <(curl -sL .../install.sh)`.
+version is one line: `bash <(curl -sL https://raw.githubusercontent.com/vkfolio/MMaker/main/install.sh)`.

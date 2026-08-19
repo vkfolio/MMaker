@@ -1,6 +1,6 @@
 {
   "name": "musicmaker-engine",
-  "imageName": "<your-registry>/musicmaker:latest",
+  "imageName": "<dockerhub-user>/mmaker:latest",
   "containerDiskInGb": 20,
   "volumeInGb": 100,
   "volumeMountPath": "/workspace",

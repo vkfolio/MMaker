@@ -17,7 +17,7 @@ know the plumbing works.
 On a stock RunPod pod, one line:
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/USER/musicmaker/main/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/vkfolio/MMaker/main/install.sh)
 ```
 
 It installs system packages, the app, and ACE-Step; generates an access token; writes
@@ -26,8 +26,6 @@ Re-running it updates the code and skips whatever is already installed.
 
 Add `--stub` to skip ACE-Step entirely and prove the pod in about two minutes. Do that
 first — see Path A.
-
-**Replace `USER` with your GitHub username** once you have pushed this repo.
 
 ---
 
@@ -45,8 +43,8 @@ Use any cheap pod. A GPU is not required for this step.
 
 ```bash
 cd /workspace
-git clone <your-repo-url> musicmaker    # or upload the folder
-cd musicmaker/server
+git clone https://github.com/vkfolio/MMaker.git
+cd MMaker/server
 pip install -r requirements.txt
 
 MUSICMAKER_ENGINE=stub \
@@ -86,15 +84,15 @@ Then:
 git tag v0.1.0 && git push --tags
 ```
 
-The image lands at `docker.io/<username>/musicmaker:latest`. No local Docker needed, and
+The image lands at `docker.io/<username>/mmaker:latest`. No local Docker needed, and
 the runner has more disk than most laptops want to spare — the ACE-Step layer is large.
 
 **Option 2 — build locally:**
 
 ```bash
 cd server
-docker build -t <your-registry>/musicmaker:latest .
-docker push <your-registry>/musicmaker:latest
+docker build -t <dockerhub-user>/mmaker:latest .
+docker push <dockerhub-user>/mmaker:latest
 ```
 
 Weights are **not** in the image either way; they land on the volume at first run.
@@ -105,7 +103,7 @@ Use `runpod-template.json` as the reference, or set it up by hand:
 
 | Setting | Value |
 |---|---|
-| Image | `<your-registry>/musicmaker:latest` |
+| Image | `<dockerhub-user>/mmaker:latest` |
 | GPU | 24 GB is comfortable; ACE-Step runs from ~4 GB but headroom helps |
 | Container disk | 20 GB |
 | Network volume | 100 GB at `/workspace` |
@@ -157,7 +155,7 @@ The gate scripts talk to ACE-Step directly, so run them from the pod's terminal 
 the engine is up:
 
 ```bash
-cd /workspace/musicmaker
+cd /workspace/MMaker
 pip install -r research/requirements.txt
 export ACESTEP_URL=http://127.0.0.1:8001
 
