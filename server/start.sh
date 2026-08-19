@@ -49,6 +49,7 @@ else
   fi
 
   log "starting ACE-Step on :${ACESTEP_PORT} (first run downloads weights)"
+  setsid_maybe() { command -v setsid >/dev/null && setsid "$@" || "$@"; }
   (
     cd "$ACESTEP_DIR"
     # Bind to localhost: the model server is an internal dependency, not a
@@ -58,13 +59,17 @@ else
     # which re-downloads multi-GB CUDA wheels whenever the venv was populated
     # any other way -- turning a start into another hour of downloading.
     if [ -x .venv/bin/acestep-api ]; then
-      exec .venv/bin/acestep-api --host 127.0.0.1 --port "$ACESTEP_PORT"
+      exec setsid_maybe .venv/bin/acestep-api --host 127.0.0.1 --port "$ACESTEP_PORT"         >> "${ACESTEP_LOG:-/workspace/acestep.log}" 2>&1
     fi
-    exec uv run acestep-api --host 127.0.0.1 --port "$ACESTEP_PORT"
+    exec setsid_maybe uv run acestep-api --host 127.0.0.1 --port "$ACESTEP_PORT"         >> "${ACESTEP_LOG:-/workspace/acestep.log}" 2>&1
   ) &
   ACESTEP_PID=$!
-  trap 'kill $ACESTEP_PID 2>/dev/null || true' EXIT
+  # No EXIT trap here: this script ends by exec'ing uvicorn, and an EXIT trap
+  # fires on the way out -- killing the ACE-Step we just waited for and leaving
+  # a zombie. ACE-Step is detached with setsid so it outlives this shell.
 
+  # Its output would otherwise interleave with musicmaker's and be unreadable.
+  log "ACE-Step logging to ${ACESTEP_LOG:-/workspace/acestep.log}"
   log "waiting for ACE-Step to answer…"
   for i in $(seq 1 600); do
     if curl -fsS "http://127.0.0.1:${ACESTEP_PORT}/openapi.json" >/dev/null 2>&1; then
