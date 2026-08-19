@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -25,6 +26,43 @@ from .base import EngineError, NotSupported
 DEFAULT_URL = os.environ.get("ACESTEP_URL", "http://127.0.0.1:8001")
 POLL_S = float(os.environ.get("ACESTEP_POLL_S", "3"))
 MAX_WAIT_S = float(os.environ.get("ACESTEP_MAX_WAIT_S", "1800"))
+
+
+AUDIO_RE = re.compile(r"\.(mp3|wav|flac|ogg|m4a)(\?|$)", re.I)
+
+
+def _deep_audio(obj, _depth=0):
+    """Find an audio reference anywhere in the payload.
+
+    ACE-Step wraps results in a `data` envelope and the field naming is not
+    documented, so matching on key names is fragile. Matching on the *value*
+    -- anything that looks like an audio path or an /v1/audio link -- survives
+    schema changes we cannot see in advance.
+    """
+    if _depth > 6:
+        return None
+    if isinstance(obj, str):
+        if AUDIO_RE.search(obj) or "/v1/audio" in obj:
+            return obj
+        return None
+    if isinstance(obj, dict):
+        for value in obj.values():
+            found = _deep_audio(value, _depth + 1)
+            if found:
+                return found
+    if isinstance(obj, list):
+        for item in obj:
+            found = _deep_audio(item, _depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _envelope(resp):
+    """ACE-Step returns {"data": ..., "code": 200}. Unwrap one level."""
+    if isinstance(resp, dict) and "code" in resp and "data" in resp:
+        return resp["data"]
+    return resp
 
 
 def _find(resp, keys):
@@ -82,7 +120,7 @@ class AceStepEngine:
             raise EngineError(f"ACE-Step unreachable at {self.base_url}: {exc}") from exc
 
         self._dump(f"release_{params.get('task_type', 'x')}", body)
-        task_id = _find(body, ("task_id", "taskId", "id", "task", "uuid", "request_id"))
+        task_id = _find(_envelope(body), ("task_id", "taskId", "id", "task", "uuid", "request_id"))
         if not task_id:
             raise EngineError(f"no task id in ACE-Step response: {body!r}")
         return str(task_id)
@@ -101,13 +139,20 @@ class AceStepEngine:
             except requests.RequestException as exc:
                 raise EngineError(f"ACE-Step query failed: {exc}") from exc
 
-            ref = _find(body, ("file", "audio", "url", "audio_path", "output"))
-            if ref:
+            inner = _envelope(body)
+            # /query_result drains: a finished result is returned once and then
+            # the queue is empty. Never discard a non-empty payload unexamined.
+            if inner not in (None, [], {}):
                 self._dump("result", body)
+
+            ref = _deep_audio(inner)
+            if ref:
                 return self._download(str(ref), dest)
 
-            status = str(body.get("status") or body.get("state") or "pending").lower()
-            if status in ("failed", "error"):
+            err = body.get("error") if isinstance(body, dict) else None
+            status_src = inner if isinstance(inner, dict) else (body if isinstance(body, dict) else {})
+            status = str(status_src.get("status") or status_src.get("state") or "pending").lower()
+            if err or status in ("failed", "error"):
                 self._dump("failure", body)
                 raise EngineError(f"ACE-Step task failed: {body!r}")
             if report:
@@ -117,7 +162,14 @@ class AceStepEngine:
             time.sleep(POLL_S)
 
     def _download(self, ref: str, dest: Path) -> Path:
-        url = ref if ref.startswith("http") else f"{self.base_url}{ref}"
+        if ref.startswith("http"):
+            url = ref
+        elif ref.startswith("/v1/audio") or ref.startswith("?"):
+            url = f"{self.base_url}{ref}"
+        else:
+            # A server-side filesystem path: fetch it through the audio route.
+            from urllib.parse import quote
+            url = f"{self.base_url}/v1/audio?path={quote(str(ref), safe='')}"
         resp = requests.get(url, timeout=600)
         resp.raise_for_status()
         dest = Path(dest)
