@@ -42,8 +42,13 @@ def _deep_audio(obj, _depth=0):
     if _depth > 6:
         return None
     if isinstance(obj, str):
-        if AUDIO_RE.search(obj) or "/v1/audio" in obj:
-            return obj
+        text = obj.strip()
+        # A serialised list/dict also contains ".mp3"; matching it would send
+        # the whole JSON blob to /v1/audio as a path.
+        if text[:1] in ("[", "{") or len(text) > 2048:
+            return None
+        if text.startswith("/v1/audio") or AUDIO_RE.search(text):
+            return text
         return None
     if isinstance(obj, dict):
         for value in obj.values():
