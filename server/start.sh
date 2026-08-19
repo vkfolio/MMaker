@@ -53,6 +53,13 @@ else
     cd "$ACESTEP_DIR"
     # Bind to localhost: the model server is an internal dependency, not a
     # public surface. Only musicmaker's port is published.
+    #
+    # Call the venv binary directly. `uv run` re-syncs against uv.lock first,
+    # which re-downloads multi-GB CUDA wheels whenever the venv was populated
+    # any other way -- turning a start into another hour of downloading.
+    if [ -x .venv/bin/acestep-api ]; then
+      exec .venv/bin/acestep-api --host 127.0.0.1 --port "$ACESTEP_PORT"
+    fi
     exec uv run acestep-api --host 127.0.0.1 --port "$ACESTEP_PORT"
   ) &
   ACESTEP_PID=$!
