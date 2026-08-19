@@ -1,0 +1,27 @@
+{
+  "name": "musicmaker-engine",
+  "imageName": "<your-registry>/musicmaker:latest",
+  "containerDiskInGb": 20,
+  "volumeInGb": 100,
+  "volumeMountPath": "/workspace",
+  "ports": "8000/http",
+  "env": [
+    {
+      "key": "MUSICMAKER_MODELS_DIR",
+      "value": "/workspace/models"
+    },
+    {
+      "key": "MUSICMAKER_DATA_DIR",
+      "value": "/workspace/data"
+    },
+    {
+      "key": "ACESTEP_URL",
+      "value": "http://127.0.0.1:8001"
+    },
+    {
+      "key": "MUSICMAKER_API_TOKEN",
+      "value": "CHANGE-ME-long-random-string"
+    }
+  ],
+  "readme": "Starts ACE-Step on localhost:8001 and the musicmaker API+UI on 0.0.0.0:8000. First boot downloads model weights to the network volume and can take 10-30 minutes; poll /health for progress. Then open the pod's HTTP URL with ?token=<MUSICMAKER_API_TOKEN>. See RUNPOD.md."
+}

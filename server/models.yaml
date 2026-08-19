@@ -1,0 +1,43 @@
+# Model registry. Each entry is downloaded once to the network volume on first
+# boot; /health reports progress.
+#
+# IMPORTANT: only ACE-Step is confirmed and enabled. The other repo ids are
+# best-guess placeholders for later phases -- verify each one against Hugging
+# Face on the pod before enabling it, rather than trusting what is written here.
+
+models:
+  - name: acestep
+    label: ACE-Step 1.5
+    kind: huggingface
+    repo_id: ACE-Step/Ace-Step1.5
+    approx_gb: 12
+    enabled: true
+    phase: 2
+    purpose: generation, layering, repaint, extend, extract
+
+  - name: demucs
+    label: Demucs htdemucs_ft
+    kind: torchhub          # demucs fetches its own weights, not via HF
+    repo_id: htdemucs_ft
+    approx_gb: 1
+    enabled: false
+    phase: 3
+    purpose: deterministic stem separation and vocal isolation
+
+  - name: seedvc
+    label: Seed-VC
+    kind: huggingface
+    repo_id: Plachtaa/seed-vc          # TODO verify on pod
+    approx_gb: 2
+    enabled: false
+    phase: 5
+    purpose: singing voice conversion, voice library, cloning
+
+  - name: stableaudio
+    label: Stable Audio 3 (medium)
+    kind: huggingface
+    repo_id: stabilityai/stable-audio-3-medium   # TODO verify on pod
+    approx_gb: 8
+    enabled: false
+    phase: 6
+    purpose: sound effects and textures

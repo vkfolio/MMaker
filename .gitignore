@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+research/out/
+server/_models/
+server/_data/
+*.wav
+*.zip
+.env
