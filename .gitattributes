@@ -1,0 +1,9 @@
+# Normalise line endings on commit. Shell scripts and the Dockerfile MUST be
+# LF -- a CRLF install.sh dies on Linux with "invalid option name pipefail".
+* text=auto eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.png binary
+*.jpg binary
+*.wav binary
+*.zip binary
