@@ -118,7 +118,8 @@ export MUSICMAKER_DATA_DIR="$ROOT/data"
 export MUSICMAKER_PORT="$PORT"
 export MUSICMAKER_API_TOKEN="\${MUSICMAKER_API_TOKEN:-$TOKEN}"
 export ACESTEP_DIR="$ACESTEP_DIR"
-export ACESTEP_URL="\${ACESTEP_URL:-http://127.0.0.1:8001}"
+# ACESTEP_URL is deliberately not set here -- start.sh picks a free port and
+# derives it, so pinning 8001 would defeat the conflict check.
 $([ "$STUB" = "1" ] && printf 'export MUSICMAKER_ENGINE=stub
 export MUSICMAKER_STUB_MODELS=1')
 cd "$APP/server"
@@ -129,10 +130,20 @@ chmod +x "$APP/server/start.sh" 2>/dev/null || true
 info "wrote $ROOT/run-musicmaker.sh"
 
 POD_ID="${RUNPOD_POD_ID:-}"
-if [ -n "$POD_ID" ]; then
+PUBLIC_IP="${RUNPOD_PUBLIC_IP:-}"
+# Set only when the port is exposed as TCP rather than HTTP. The two are
+# different addresses, and printing the wrong one looks exactly like a dead app.
+eval "TCP_PORT=\${RUNPOD_TCP_PORT_${PORT}:-}"
+
+if [ -n "$TCP_PORT" ] && [ -n "$PUBLIC_IP" ]; then
+  URL="http://${PUBLIC_IP}:${TCP_PORT}/?token=${TOKEN}"
+  URL_KIND="tcp"
+elif [ -n "$POD_ID" ]; then
   URL="https://${POD_ID}-${PORT}.proxy.runpod.net/?token=${TOKEN}"
+  URL_KIND="http-proxy"
 else
   URL="http://localhost:${PORT}/?token=${TOKEN}"
+  URL_KIND="local"
 fi
 
 printf '\n\033[1mInstalled.\033[0m\n\n'
@@ -203,14 +214,20 @@ if [ "$READY" = "1" ]; then
   printf '  Restart: %s
 
 ' "$ROOT/run-musicmaker.sh"
-  if [ -n "$POD_ID" ]; then
-    printf '  If that link 404s, the port is not exposed: RunPod console -> your pod
+  if [ "$URL_KIND" = "http-proxy" ]; then
+    printf '  If that link 404s the port is not exposed: RunPod console -> your pod
 '
     printf '  -> Edit Pod -> Expose HTTP Ports -> add %s. The app itself is fine --
 ' "$PORT"
     printf '  "curl localhost:%s/health" from this terminal proves it.
 
 ' "$PORT"
+  elif [ "$URL_KIND" = "tcp" ]; then
+    printf '  (port %s is TCP-mapped, so this is the direct address --
+' "$PORT"
+    printf '   the proxy.runpod.net URL will NOT work for this pod)
+
+' 
   fi
 else
   printf '

@@ -9,7 +9,32 @@ set -euo pipefail
 
 ACESTEP_DIR="${ACESTEP_DIR:-/opt/ACE-Step-1.5}"
 ACESTEP_PORT="${ACESTEP_PORT:-8001}"
-export ACESTEP_URL="${ACESTEP_URL:-http://127.0.0.1:${ACESTEP_PORT}}"
+
+port_taken() {
+  (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -q ":$1[[:space:]]"
+}
+
+# RunPod images run their own nginx on 8001. Rather than fail with an opaque
+# "address already in use", step to the next free port -- ACESTEP_URL follows.
+PORT_MOVED=0
+if port_taken "$ACESTEP_PORT"; then
+  for candidate in 8801 8802 8803 8804 8805; do
+    if ! port_taken "$candidate"; then
+      echo "[start] port $ACESTEP_PORT is taken; using $candidate for ACE-Step"
+      ACESTEP_PORT="$candidate"
+      PORT_MOVED=1
+      break
+    fi
+  done
+fi
+
+# If we had to move, the port we just picked wins over any inherited
+# ACESTEP_URL -- otherwise the engine would keep calling the port we avoided.
+if [ "$PORT_MOVED" = "1" ]; then
+  export ACESTEP_URL="http://127.0.0.1:${ACESTEP_PORT}"
+else
+  export ACESTEP_URL="${ACESTEP_URL:-http://127.0.0.1:${ACESTEP_PORT}}"
+fi
 PORT="${MUSICMAKER_PORT:-8000}"
 
 log() { echo "[start] $*"; }
