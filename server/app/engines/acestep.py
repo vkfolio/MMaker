@@ -188,7 +188,36 @@ class AceStepEngine:
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(resp.content)
+
+        # ACE-Step returns MP3 regardless of the name we asked for, but the rest
+        # of the pipeline -- mixdown, separation, export -- reads WAV. Transcode
+        # once here so nothing downstream has to care.
+        head = resp.content[:3]
+        if dest.suffix.lower() == ".wav" and head in (b"ID3", b"ÿû", b"ÿó"):
+            self._to_wav(dest)
         return dest
+
+    @staticmethod
+    def _to_wav(path: Path) -> Path:
+        """Transcode in place via ffmpeg, which ships in the pod image."""
+        import shutil
+        import subprocess
+        if not shutil.which("ffmpeg"):
+            raise EngineError(
+                f"{path.name} is MP3 but ffmpeg is missing, so it cannot be "
+                "converted to the WAV the pipeline expects")
+        tmp = path.with_suffix(".mp3.tmp")
+        path.rename(tmp)
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(tmp),
+                 "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", str(path)],
+                capture_output=True, text=True, timeout=300)
+            if proc.returncode != 0 or not path.exists():
+                raise EngineError(f"ffmpeg failed: {proc.stderr.strip()[:300]}")
+        finally:
+            tmp.unlink(missing_ok=True)
+        return path
 
     def _grid_params(self, grid: Grid) -> dict:
         return {
