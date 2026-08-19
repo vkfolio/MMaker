@@ -116,7 +116,8 @@ export MUSICMAKER_PORT="$PORT"
 export MUSICMAKER_API_TOKEN="\${MUSICMAKER_API_TOKEN:-$TOKEN}"
 export ACESTEP_DIR="$ACESTEP_DIR"
 export ACESTEP_URL="\${ACESTEP_URL:-http://127.0.0.1:8001}"
-$([ "$STUB" = "1" ] && echo 'export MUSICMAKER_ENGINE=stub')
+$([ "$STUB" = "1" ] && printf 'export MUSICMAKER_ENGINE=stub
+export MUSICMAKER_STUB_MODELS=1')
 cd "$APP/server"
 exec ./start.sh
 LAUNCHER

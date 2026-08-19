@@ -32,9 +32,13 @@ class Settings:
     # a pod publicly.
     cors_origins = os.environ.get("MUSICMAKER_CORS_ORIGINS", "*").split(",")
 
-    # Skip real downloads and fake the progress. Used for local development and
-    # for the test suite -- never set this on a real pod.
-    stub_models = _bool("MUSICMAKER_STUB_MODELS", False)
+    # Which engine to use. "stub" is the synthetic one: no GPU, no weights.
+    engine = os.environ.get("MUSICMAKER_ENGINE", "").strip().lower()
+
+    # Skip real downloads and fake the progress. Asking for the stub engine
+    # implies this -- downloading weights the stub will never load is pure waste,
+    # and that is exactly what --stub exists to avoid.
+    stub_models = _bool("MUSICMAKER_STUB_MODELS", False) or engine == "stub"
 
     # RunPod proxy URLs are publicly reachable. When this is set, every request
     # must carry it (X-API-Token header, or ?token= for links the browser opens

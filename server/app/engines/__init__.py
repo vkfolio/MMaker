@@ -7,18 +7,15 @@ synthetic engine for local development regardless of what is installed.
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 
 from ..config import settings
 from .base import Engine, EngineError, NotSupported
 from .stub import StubEngine
 
-_FORCED = os.environ.get("MUSICMAKER_ENGINE", "").strip().lower()
-
 
 def _forced_stub() -> bool:
-    return _FORCED == "stub" or settings.stub_models
+    return settings.engine == "stub" or settings.stub_models
 
 
 @lru_cache(maxsize=1)
