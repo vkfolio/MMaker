@@ -193,7 +193,9 @@ class AceStepEngine:
         # of the pipeline -- mixdown, separation, export -- reads WAV. Transcode
         # once here so nothing downstream has to care.
         head = resp.content[:3]
-        if dest.suffix.lower() == ".wav" and head in (b"ID3", b"ÿû", b"ÿó"):
+        is_mp3 = head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF
+                                       and head[1] in (0xFB, 0xF3, 0xF2, 0xE3))
+        if dest.suffix.lower() == ".wav" and is_mp3:
             self._to_wav(dest)
         return dest
 
