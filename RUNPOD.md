@@ -66,7 +66,46 @@ ports, the proxy and the UI are all good, and anything that breaks later is the 
 
 ---
 
-## Path B — the real engine
+## Path B — start from the prebuilt image (fastest)
+
+An image built from a working pod already exists:
+
+    vignesh07021990/mmaker:latest      private, 34.77 GB, linux/amd64
+
+It contains ACE-Step, its venv, this app, the Python deps **and the model
+weights**, so a pod needs no install and no download.
+
+| Setting | Value |
+|---|---|
+| Image | `vignesh07021990/mmaker:latest` |
+| Registry auth | your Docker Hub credentials (RunPod → Settings → Registry) |
+| GPU | 24 GB+ (32 GB comfortable) |
+| Container disk | 60 GB+ (the image is 34.77 GB) |
+| Volume mount | **`/data`** — NOT `/workspace` |
+| Expose HTTP port | 8000 (do **not** also list 8000 as a TCP port) |
+
+**The volume path matters.** The image owns `/workspace`; mounting a volume
+there hides ACE-Step and the app, and the pod boots into an empty shell.
+
+**A start command is required.** `crane append` keeps the base image's config,
+so the image inherits RunPod's default command rather than `start.sh`. Set the
+pod's start command to:
+
+```
+bash -c 'cd /workspace/MMaker/server && MUSICMAKER_MODELS_DIR=/data/models MUSICMAKER_DATA_DIR=/data/data MUSICMAKER_API_TOKEN=<your-token> ./start.sh'
+```
+
+Or leave the default command and run that line yourself in the pod terminal.
+
+Rebuild the image after changing anything, from a pod that works:
+
+```bash
+BASE_IMAGE=runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404 bash tools/build-image.sh
+```
+
+---
+
+## Path C — build the engine from source
 
 ### B1. Get the image
 
