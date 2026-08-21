@@ -1,0 +1,14 @@
+{
+  "name": "musicx-studio",
+  "version": "0.1.0",
+  "description": "musicX Studio desktop app",
+  "dependencies": [
+    { "name": "skia", "default-features": true, "features": ["gl", "harfbuzz", "icu"] },
+    "yoga",
+    "sdl3",
+    "nlohmann-json",
+    "lunasvg",
+    "md4c",
+    "catch2"
+  ]
+}
