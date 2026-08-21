@@ -74,8 +74,14 @@ def generate_variations(project: Project, count: int, report=None) -> list[dict]
     engine = engines.music()
     prompt = presets.compose_prompt(project.prompt, project.style)
     lyrics = "" if project.instrumental else project.lyrics
-    if project.instrumental and "instrumental" not in prompt.lower():
-        prompt = f"{prompt}, instrumental, no vocals".lstrip(", ")
+    if project.instrumental:
+        if "instrumental" not in prompt.lower():
+            prompt = f"{prompt}, instrumental, no vocals".lstrip(", ")
+    elif not lyrics.strip():
+        # Empty lyrics alone yield an instrumental -- ACE-Step has nothing to
+        # sing. Ask for vocals in the prompt so its songwriter supplies words.
+        if "vocal" not in prompt.lower() and "sung" not in prompt.lower():
+            prompt = f"{prompt}, with lead vocals, sung".lstrip(", ")
     src = _abs(project, project.source_audio) if project.source_audio else None
 
     out_dir = storage.project_dir(project.id) / "variations"

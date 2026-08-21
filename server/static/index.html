@@ -374,7 +374,7 @@ section { margin-bottom: 30px; }
           <button type="button" class="seg-btn" id="modeSong" aria-pressed="true">Song with vocals</button>
           <button type="button" class="seg-btn" id="modeInst" aria-pressed="false">Instrumental</button>
         </div>
-        <span class="hint" id="modeHint">Leave lyrics blank and it writes its own.</span>
+        <span class="hint" id="modeHint">Type lyrics for a sung track.</span>
       </div>
       <textarea id="lyrics" placeholder="[verse]&#10;Slow light on the kitchen floor&#10;I am not in a hurry anymore&#10;&#10;[chorus]&#10;..."></textarea>
       <div class="idea-row">
@@ -605,7 +605,8 @@ function setMode(instrumental) {
   $("#lyrics").hidden = instrumental;
   $("#modeHint").textContent = instrumental
     ? "No vocals. Add them later per stem if you change your mind."
-    : "Leave lyrics blank and it writes its own.";
+    : "Type lyrics for a sung track. Blank asks the model to write its own, "
+      + "which is less reliable.";
 }
 $("#modeSong").addEventListener("click", () => setMode(false));
 $("#modeInst").addEventListener("click", () => setMode(true));
