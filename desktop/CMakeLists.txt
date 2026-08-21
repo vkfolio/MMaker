@@ -40,6 +40,8 @@ add_executable(musicx
     src/app_main.cpp
     src/audio/device.cpp
     src/media/bounce.cpp
+    src/app/document.cpp
+    src/app/settings.cpp
     src/net/api.cpp
     src/net/cache.cpp
     src/net/http.cpp
@@ -54,7 +56,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 target_link_libraries(musicx PRIVATE mx_audio vik_components
                       CURL::libcurl nlohmann_json::nlohmann_json)
 if(WIN32)
-    target_link_libraries(musicx PRIVATE ole32 winmm)
+    target_link_libraries(musicx PRIVATE ole32 winmm crypt32)
 endif()
 
 # --- the gate: audio correctness under editing ---------------------------

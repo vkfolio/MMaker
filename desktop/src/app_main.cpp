@@ -33,6 +33,8 @@
 #include "media/bounce.h"
 #include "net/api.h"
 #include "net/cache.h"
+#include "app/document.h"
+#include "app/settings.h"
 #include "media/decode.h"
 #include "session.h"
 #include "ui/arrangement.h"
@@ -188,10 +190,18 @@ struct Studio {
     int     loaded_sources = 0;
     float   meter          = 0.0f;
 
+    mx::Settings settings;
     bool  fitted      = false;
     float timeline_px = 1100.0f;   // last measured canvas width
 
     // --- network ------------------------------------------------------------
+    // The document is local and is the app's own. The pod is a render service
+    // configured in settings, not the place work lives.
+    std::filesystem::path document_path;
+    bool                  dirty = false;
+    bool                  show_settings = false;
+    std::string           doc_status;
+
     std::string pod_url;
     std::string pod_token;
     std::string net_status = "not connected";
@@ -314,6 +324,85 @@ struct Studio {
             // user happens to move the mouse.
             platform->wake();
         }).detach();
+    }
+
+    void mark_dirty() { dirty = true; }
+
+    void new_document() {
+        session = mx::Session{};
+        session.rate = g_device.running() ? g_device.rate() : 48000;
+        document_path.clear();
+        open_project_id.clear();
+        loaded_sources = stems_arrived = stems_expected = 0;
+        fitted = false;
+        dirty = false;
+        doc_status = "new project";
+        selection.clear();
+        publish();
+    }
+
+    /// Save, defaulting to Documents/MusicMaker when the project has no path.
+    void save_document_now() {
+        if (document_path.empty()) {
+            std::string name = session.title.empty() ? "Untitled" : session.title;
+            for (char& c : name)
+                if (std::strchr("\/:*?\"<>|", c)) c = '_';
+            document_path = mx::documents_root() / (name + ".mmproj");
+        }
+        std::string error;
+        if (mx::save_document(session, document_path, &error)) {
+            dirty = false;
+            doc_status = "saved " + document_path.filename().string();
+            settings.last_document = document_path.string();
+            settings.save();
+        } else {
+            doc_status = "save failed: " + error;
+        }
+        std::printf("%s\n", doc_status.c_str());
+        std::fflush(stdout);
+    }
+
+    /// Open a .mmproj and start decoding whatever audio it names.
+    void open_document(const std::filesystem::path& path, vik::App& app) {
+        const auto result = mx::load_document(session, path);
+        if (!result.ok) {
+            doc_status = result.error;
+            return;
+        }
+        document_path = path;
+        dirty = false;
+        fitted = false;
+        loaded_sources = 0;
+        // Provenance travels with the document, so a project opened here knows
+        // which pod project it came from without the server being consulted.
+        open_project_id.clear();
+        for (const auto& src : session.sources)
+            if (!src.project_id.empty()) { open_project_id = src.project_id; break; }
+
+        doc_status = result.missing_audio
+            ? std::to_string(result.missing_audio) + " missing from cache"
+            : "opened " + path.filename().string();
+
+        // Decode on workers, one per source, as the network path does.
+        for (auto& src : session.sources) {
+            if (src.local_path.empty() ||
+                !std::filesystem::exists(src.local_path)) continue;
+            spawn_decode(src.id, src.local_path, app);
+        }
+        settings.last_document = path.string();
+        settings.save();
+        publish();
+    }
+
+    std::vector<std::filesystem::path> local_documents() const {
+        std::vector<std::filesystem::path> found;
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(
+                 mx::documents_root(), ec))
+            if (e.is_regular_file() && e.path().extension() == ".mmproj")
+                found.push_back(e.path());
+        std::sort(found.begin(), found.end());
+        return found;
     }
 
     /// Connect and list what is on the pod. Runs on a worker.
@@ -1071,64 +1160,149 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     c.notify();
                 }));
 
-    // --- pod sidebar: real elements, because it is chrome ------------------
+    // --- sidebar: local projects ------------------------------------------
+    // The list here is the user's own documents, not the pod's. The pod renders
+    // audio; it does not hold work, and putting its project list in the primary
+    // navigation made it look like it did.
     auto row = [](std::string label, std::string value, uint32_t tint) {
         return vik::div().flex_col().gap_1().px_3().py_2()
             .child(vik::text(std::move(label)).text_xs().text_color(vik::rgb(0x6c7383)))
             .child(vik::text(std::move(value)).text_color(vik::rgb(tint)));
     };
 
-    auto sidebar = vik::div().flex_col().w_px(230.0f)
+    auto sidebar = vik::div().flex_col().w_px(220.0f)
         .bg(vik::rgb(0x1b1e27)).border_1().border_color(vik::rgb(0x2c313d))
-        .child(vik::div().flex_row().items_center().gap_2().px_3().py_2()
-            .child(vik::ui::phosphor("cloud", vik::ui::PhWeight::Fill)
-                       .size(14.0f).color(vik::rgb(pod_url.empty() ? 0x6c7383
-                                                                   : 0x56c08a)))
-            .child(vik::text("Pod").text_color(vik::rgb(0xe6e8ec))))
-        .child(row("status", net_status,
-                   net_error ? 0xe05c72 : (net_busy ? 0xd9903c : 0x8d94a3)));
+        .child(vik::div().flex_row().items_center().justify_between().px_3().py_2()
+            .child(vik::text("Projects").text_color(vik::rgb(0xe6e8ec)))
+            .child(vik::div().flex_row().gap_1()
+                .child(icon_button("new", "file-plus", false,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) { s.new_document(); c.notify(); }))
+                .child(icon_button("save", "floppy-disk", dirty,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) { s.save_document_now(); c.notify(); }))))
+        .child(row("document",
+                   document_path.empty()
+                       ? std::string(dirty ? "unsaved" : "no file")
+                       : document_path.filename().string() + (dirty ? " *" : ""),
+                   dirty ? 0xd9903c : 0x8d94a3));
 
-    if (!pod_url.empty())
-        sidebar = std::move(sidebar).child(row("url", pod_url, 0x6c7383));
+    if (!doc_status.empty())
+        sidebar = std::move(sidebar).child(row("", doc_status, 0x6c7383));
 
-    sidebar = std::move(sidebar).child(
-        vik::div().px_3().py_2()
-            .child(icon_button("connect", net_busy ? "hourglass" : "plugs-connected",
-                               false,
-                [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                   vik::Context<Studio>& c) {
-                    s.connect(c.app());
-                    c.notify();
-                })));
-
-    if (!projects.empty()) {
-        auto list = vik::div().flex_col().flex_1().overflow_hidden()
-            .child(vik::text("  Projects").text_xs().text_color(vik::rgb(0x6c7383)));
-        // Enough to choose from without turning the sidebar into a file
-        // browser; a proper browser with search is Phase 2's polish, not its
-        // gate.
-        const size_t shown = std::min<size_t>(projects.size(), 14);
-        for (size_t i = 0; i < shown; ++i) {
-            const auto& proj = projects[i];
-            const bool active = proj.id == open_project_id;
+    {
+        auto list = vik::div().flex_col().flex_1().overflow_hidden();
+        const auto documents = local_documents();
+        if (documents.empty()) {
             list = std::move(list).child(
-                vik::div().id("proj").px_3().py_1().cursor_pointer()
+                vik::div().px_3().py_2().child(
+                    vik::text("No saved projects yet")
+                        .text_xs().text_color(vik::rgb(0x565c6b))));
+        }
+        for (const auto& doc : documents) {
+            const bool active = doc == document_path;
+            list = std::move(list).child(
+                vik::div().id("doc").px_3().py_1().cursor_pointer()
                     .bg(vik::rgb(active ? 0x2c3446 : 0x1b1e27))
                     .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x242936)); })
-                    .on_click(cx.listener([id = proj.id](Studio& s,
-                                                         const vik::ClickEvent&,
-                                                         vik::Window&,
-                                                         vik::Context<Studio>& c) {
-                        s.open_project(id, c.app());
+                    .on_click(cx.listener([path = doc](Studio& s,
+                                                       const vik::ClickEvent&,
+                                                       vik::Window&,
+                                                       vik::Context<Studio>& c) {
+                        s.open_document(path, c.app());
                         c.notify();
                     }))
-                    .child(vik::text(proj.title.substr(0, 26))
+                    .child(vik::text(doc.stem().string().substr(0, 24))
                                .text_color(vik::rgb(active ? 0xffd58a : 0xc9cedb))));
         }
         sidebar = std::move(sidebar).child(std::move(list));
     }
 
-    return vik::div().size_full().flex_col().bg(vik::rgb(0x14161d))
+    // The pod lives at the bottom, as a service the app is configured to use.
+    sidebar = std::move(sidebar).child(
+        vik::div().flex_row().items_center().justify_between().px_3().py_2()
+            .border_1().border_color(vik::rgb(0x2c313d))
+            .child(vik::div().flex_row().items_center().gap_2()
+                .child(vik::ui::phosphor("circle", vik::ui::PhWeight::Fill).size(8.0f)
+                           .color(vik::rgb(pod_url.empty() ? 0x565c6b
+                                           : (net_error ? 0xe05c72 : 0x56c08a))))
+                .child(vik::text(pod_url.empty() ? "No pod" : net_status)
+                           .text_xs().text_color(vik::rgb(0x8d94a3))))
+            .child(icon_button("settings", "gear", show_settings,
+                [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                   vik::Context<Studio>& c) {
+                    s.show_settings = !s.show_settings;
+                    c.notify();
+                })));
+
+    // --- settings: the pod, and importing from it --------------------------
+    // A modal over the canvas, like the reference's tool dialogs. Importing is
+    // deliberately here rather than in the main navigation: pulling stems from
+    // a pod project is something you do once to start a local project, not the
+    // way you open your work.
+    vik::AnyElement overlay = vik::div().into_any();
+    if (show_settings) {
+        auto card = vik::div().flex_col().gap_3().p_4().w_px(460.0f)
+            .rounded_lg().bg(vik::rgb(0x232834))
+            .border_1().border_color(vik::rgb(0x3b4250))
+            .child(vik::div().flex_row().items_center().justify_between()
+                .child(vik::text("Settings").text_xl().text_color(vik::white()))
+                .child(icon_button("close", "x", false,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) {
+                        s.show_settings = false;
+                        c.notify();
+                    })))
+            .child(vik::text("Render pod").text_xs().text_color(vik::rgb(0x8d94a3)))
+            .child(vik::text(pod_url.empty() ? "not configured" : pod_url)
+                       .text_color(vik::rgb(0xc9cedb)))
+            .child(vik::text(pod_token.empty()
+                       ? "no token stored"
+                       : "token stored (encrypted for this Windows account)")
+                       .text_xs().text_color(vik::rgb(0x6c7383)))
+            .child(vik::text(net_status).text_xs()
+                       .text_color(vik::rgb(net_error ? 0xe05c72 : 0x8d94a3)))
+            .child(vik::div().flex_row().gap_2()
+                .child(icon_button("s-conn", "plugs-connected", false,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) { s.connect(c.app()); c.notify(); }))
+                .child(vik::text(projects.empty()
+                           ? "Connect to list pod projects"
+                           : std::to_string(projects.size()) +
+                             " pod projects -- pick one to import its stems")
+                           .text_xs().text_color(vik::rgb(0x8d94a3))));
+
+        // Import list: a pod project becomes a *new local project* whose audio
+        // is fetched once and then belongs to the document.
+        auto imports = vik::div().flex_col().max_h(220.0f).overflow_hidden();
+        const size_t shown = std::min<size_t>(projects.size(), 8);
+        for (size_t i = 0; i < shown; ++i) {
+            const auto& proj = projects[i];
+            imports = std::move(imports).child(
+                vik::div().id("imp").px_3().py_1().rounded_md().cursor_pointer()
+                    .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x2c3446)); })
+                    .on_click(cx.listener([id = proj.id](Studio& s,
+                                                          const vik::ClickEvent&,
+                                                          vik::Window&,
+                                                          vik::Context<Studio>& c) {
+                        s.open_project(id, c.app());
+                        s.show_settings = false;
+                        s.dirty = true;      // imported, not yet saved anywhere
+                        c.notify();
+                    }))
+                    .child(vik::text(proj.title.substr(0, 34))
+                               .text_color(vik::rgb(0xc9cedb))));
+        }
+        if (!projects.empty()) card = std::move(card).child(std::move(imports));
+
+        overlay = vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
+            .flex_row().items_center().justify_center()
+            .bg(vik::rgba(0x00000099))
+            .child(std::move(card))
+            .into_any();
+    }
+
+    return vik::div().size_full().flex_col().relative().bg(vik::rgb(0x14161d))
         .on_key_down(cx.listener(
             [](Studio& s, const vik::KeyDownEvent& e, vik::Window&,
                vik::Context<Studio>& c) {
@@ -1148,6 +1322,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                    .child(std::move(sidebar))
                    .child(std::move(headers))
                    .child(std::move(timeline)))
+        .child(std::move(overlay))
         .into_any();
 }
 
@@ -1349,12 +1524,57 @@ int connect_probe(const std::string& url, const std::string& token,
     return 0;
 }
 
+/// Save a session and read it back, so the document format is checkable
+/// without a window. A format that only round-trips by hand is one nobody
+/// notices breaking.
+int document_roundtrip(const fs::path& folder) {
+    Studio studio;
+    studio.session.rate = 48000;
+    if (!load_synchronously(studio, folder)) return 1;
+    studio.session.title = "roundtrip";
+
+    const auto path = fs::temp_directory_path() / "roundtrip.mmproj";
+    std::string error;
+    if (!mx::save_document(studio.session, path, &error)) {
+        std::printf("save failed: %s\n", error.c_str());
+        return 1;
+    }
+    std::printf("saved   %s (%ju bytes)\n", path.string().c_str(),
+                static_cast<uintmax_t>(fs::file_size(path)));
+    std::printf("  before: %zu tracks, %zu clips, %zu sources, %.2fs\n",
+                studio.session.tracks.size(), studio.session.clips.size(),
+                studio.session.sources.size(),
+                studio.session.length_frames() / 48000.0);
+
+    mx::Session reloaded;
+    const auto result = mx::load_document(reloaded, path);
+    if (!result.ok) {
+        std::printf("load failed: %s\n", result.error.c_str());
+        return 1;
+    }
+    std::printf("  after : %zu tracks, %zu clips, %zu sources, %.2fs\n",
+                reloaded.tracks.size(), reloaded.clips.size(),
+                reloaded.sources.size(), reloaded.length_frames() / 48000.0);
+
+    const bool same = reloaded.tracks.size() == studio.session.tracks.size() &&
+                      reloaded.clips.size() == studio.session.clips.size() &&
+                      reloaded.sources.size() == studio.session.sources.size() &&
+                      reloaded.title == studio.session.title &&
+                      reloaded.next_clip == studio.session.next_clip;
+    std::printf("  ids   : next_clip %u -> %u\n",
+                studio.session.next_clip, reloaded.next_clip);
+    std::printf("%s\n", same ? "PASS  document round-trips"
+                                : "FAIL  document changed across a round trip");
+    return same ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     fs::path folder;
     fs::path render_to;
     fs::path bounce_to;
     std::string pod_url, pod_token, pod_project;
     bool probe_only = false;
+    bool doctest = false;
     double regen_from = -1.0, regen_to = -1.0;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
@@ -1364,6 +1584,7 @@ int main(int argc, char** argv) {
         else if (arg == "--bounce" && i + 1 < argc) bounce_to = argv[++i];
         else if (arg == "--connect" && i + 1 < argc) pod_url = argv[++i];
         else if (arg == "--probe") probe_only = true;
+        else if (arg == "--doctest") doctest = true;
         else if (arg == "--regen" && i + 1 < argc) {
             const std::string spec = argv[++i];
             const size_t colon = spec.find(':');
@@ -1378,6 +1599,7 @@ int main(int argc, char** argv) {
     }
 
     if (!render_to.empty()) return render_png(folder, render_to, 1600, 900);
+    if (doctest) return document_roundtrip(folder);
     if (!bounce_to.empty()) return bounce_offline(folder, bounce_to);
     if (!pod_url.empty() && probe_only)
         return connect_probe(pod_url, pod_token, pod_project);
@@ -1392,8 +1614,16 @@ int main(int argc, char** argv) {
                 auto handle = app.add_entity<Studio>();
                 app.update_entity(handle, [&](Studio& s, vik::Context<Studio>& c) {
                     s.selftest = selftest;
-                    s.pod_url = pod_url;
-                    s.pod_token = pod_token;
+                    s.settings = mx::Settings::load();
+                    // Flags win over stored settings: a scripted run must be
+                    // reproducible regardless of what this machine remembers.
+                    s.pod_url = pod_url.empty() ? s.settings.pod_url : pod_url;
+                    s.pod_token = pod_token.empty() ? s.settings.pod_token : pod_token;
+                    if (!pod_url.empty()) {
+                        s.settings.pod_url = pod_url;
+                        s.settings.pod_token = pod_token;
+                        s.settings.save();
+                    }
                     s.regen_from = regen_from;
                     s.regen_to = regen_to;
                     // The device decides the rate; the session follows it,
