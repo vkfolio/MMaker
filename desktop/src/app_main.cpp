@@ -1706,6 +1706,11 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 vik::div().flex_row().items_center().gap_3().px_3().py_2()
                     .rounded_md().bg(vik::rgb(0x232834))
                     .border_1().border_color(vik::rgb(0x3b4250))
+                    .occlude()
+                    .on_mouse_down(vik::MouseButton::Left,
+                        [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
+                            w.stop_propagation();
+                        })
                     .child(vik::ui::phosphor("circle-notch", vik::ui::PhWeight::Bold)
                                .size(13.0f).color(vik::rgb(0xd9903c)))
                     .child(vik::text(job.kind).text_color(vik::rgb(0xe6e8ec)))
@@ -1758,6 +1763,15 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
         .child(vik::div().flex_row().items_center().gap_1().px_2().py_1()
             .rounded_lg().bg(vik::rgb(0x232834))
             .border_1().border_color(vik::rgb(0x3b4250))
+            // The dock floats inside the timeline, so its clicks bubble to the
+            // timeline's handler and moved the playhead behind it. Bubbling
+            // runs leaf to root: a child handling a click does not stop an
+            // ancestor from also handling it.
+            .occlude()
+            .on_mouse_down(vik::MouseButton::Left,
+                [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
+                    w.stop_propagation();
+                })
             .child(tool("t-gen", "sparkle",
                         pod_url.empty() ? "Set a pod first (gear, bottom left)"
                                         : "Generate  (G)",
