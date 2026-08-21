@@ -77,6 +77,8 @@ button { cursor: pointer; }
 /* A derived value shown beside the control it follows from -- quieter than a
    label, because it is a consequence rather than something to fill in. */
 .sub { font-size: 10px; color: var(--ink-faint); margin-top: 3px; display: block; }
+.take-engine { font-size: 10px; color: var(--ink-faint); margin-left: auto;
+               padding-right: 8px; letter-spacing: .02em; }
 
 /* ── shell ─────────────────────────────────────────────────────────────── */
 .shell { max-width: 1180px; margin: 0 auto; padding: 0 20px 80px; }
@@ -419,10 +421,10 @@ section { margin-bottom: 30px; }
           <input type="number" id="takes" value="4" min="1" max="8"></div>
         <div class="field">
           <label class="chan" for="quality">Quality</label>
-          <select id="quality" title="Bigger model and more diffusion steps take longer">
+          <select id="quality" title="Fast: 0.6B, 8 steps. High: 4B, 8 steps. Ultra: 4B, 50 steps with guidance -- slowest and best.">
             <option value="fast">Fast</option>
-            <option value="high" selected>High</option>
-            <option value="ultra">Ultra</option>
+            <option value="high">High</option>
+            <option value="ultra" selected>Ultra</option>
           </select>
         </div>
         <label class="drop" id="drop">
@@ -861,6 +863,16 @@ function render() {
 
     const top = el("div", "take-top");
     const pick = el("button", "take-pick", `Take ${String(i + 1).padStart(2, "0")}`);
+    // Say which model made this take. Tiers can fall back silently on a pod
+    // that lacks a checkpoint, and a fallback sounds like a disappointment
+    // rather than an error -- so the answer belongs on the take itself.
+    const eng = v.engine || {};
+    if (eng.requested_model) {
+      const tag = el("span", "take-engine num",
+        `${eng.requested_model.replace("acestep-v15-", "")} · ${eng.inference_steps} steps`);
+      tag.title = eng.tier ? `Quality: ${eng.tier}` : "";
+      top.append(tag);
+    }
     pick.title = "Select this take";
     pick.addEventListener("click", () => {
       state.selectedTake = v.id;

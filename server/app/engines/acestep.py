@@ -268,7 +268,10 @@ class AceStepEngine:
         """
         found = _deep_meta(inner)
         if found:
-            self.last_meta = found
+            # Merge, do not replace. What we asked for was recorded at request
+            # time and is the half that identifies the model; the reply only
+            # adds timing. Overwriting would throw away the useful half.
+            self.last_meta = {**self.last_meta, **found}
 
     def _download(self, ref: str, dest: Path) -> Path:
         if ref.startswith("http"):
@@ -326,7 +329,22 @@ class AceStepEngine:
         }
 
     def _quality_params(self, quality: str | None = None) -> dict:
-        tier = QUALITY.get((quality or DEFAULT_QUALITY), QUALITY["high"])
+        name = (quality or DEFAULT_QUALITY)
+        tier = QUALITY.get(name, QUALITY["high"])
+
+        # Record what was asked for, now, rather than hoping the response says.
+        # It does not: ACE-Step reports only timing back, so scraping the reply
+        # can never answer "which model made this take". Without that written
+        # down, a silent fallback is indistinguishable from a subtle one -- the
+        # exact confusion that made three identical tiers hard to spot.
+        self.last_meta = {
+            "tier": name,
+            "requested_model": tier["model"],
+            "requested_lm": tier["lm"],
+            "inference_steps": tier["inference_steps"],
+            "guidance_scale": tier["guidance_scale"],
+        }
+
         params = {
             "model": tier["model"],
             "lm_model_path": tier["lm"],
