@@ -1268,8 +1268,26 @@ vik::AnyElement Studio::settings_modal(vik::Context<Studio>& cx) {
         // look like a document store.
         return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
             .flex_row().items_center().justify_center()
+            // Swallow mouse input. Without this a modal is only visually on
+            // top: clicks land on the timeline behind it, so opening Generate
+            // moved the playhead. Dimming the background is not the same as
+            // blocking it.
+            .occlude()
+            // A click on the dimmed area dismisses, as modals do. The card
+            // below stops propagation so clicking its contents does not.
+            .on_mouse_down(vik::MouseButton::Left, cx.listener(
+                [](Studio& s, const vik::MouseDownEvent&, vik::Window&,
+                   vik::Context<Studio>& c) {
+                    s.show_generate = s.show_layers = s.show_settings = false;
+                    c.notify();
+                }))
             .bg(vik::rgba(0x00000099))
             .child(vik::div().flex_col().gap_3().p_4().w_px(460.0f)
+                .occlude()
+                .on_mouse_down(vik::MouseButton::Left,
+                    [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
+                        w.stop_propagation();
+                    })
                 .rounded_lg().bg(vik::rgb(0x232834))
                 .border_1().border_color(vik::rgb(0x3b4250))
                 .child(vik::div().flex_row().items_center().justify_between()
@@ -1328,8 +1346,26 @@ vik::AnyElement Studio::layer_modal(vik::Context<Studio>& cx) {
 
         return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
             .flex_row().items_center().justify_center()
+            // Swallow mouse input. Without this a modal is only visually on
+            // top: clicks land on the timeline behind it, so opening Generate
+            // moved the playhead. Dimming the background is not the same as
+            // blocking it.
+            .occlude()
+            // A click on the dimmed area dismisses, as modals do. The card
+            // below stops propagation so clicking its contents does not.
+            .on_mouse_down(vik::MouseButton::Left, cx.listener(
+                [](Studio& s, const vik::MouseDownEvent&, vik::Window&,
+                   vik::Context<Studio>& c) {
+                    s.show_generate = s.show_layers = s.show_settings = false;
+                    c.notify();
+                }))
             .bg(vik::rgba(0x00000099))
             .child(vik::div().flex_col().gap_3().p_4().w_px(480.0f)
+                .occlude()
+                .on_mouse_down(vik::MouseButton::Left,
+                    [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
+                        w.stop_propagation();
+                    })
                 .rounded_lg().bg(vik::rgb(0x232834))
                 .border_1().border_color(vik::rgb(0x3b4250))
                 .child(vik::div().flex_row().items_center().justify_between()
@@ -1376,8 +1412,26 @@ vik::AnyElement Studio::generate_modal(vik::Context<Studio>& cx) {
 
     return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
             .flex_row().items_center().justify_center()
+            // Swallow mouse input. Without this a modal is only visually on
+            // top: clicks land on the timeline behind it, so opening Generate
+            // moved the playhead. Dimming the background is not the same as
+            // blocking it.
+            .occlude()
+            // A click on the dimmed area dismisses, as modals do. The card
+            // below stops propagation so clicking its contents does not.
+            .on_mouse_down(vik::MouseButton::Left, cx.listener(
+                [](Studio& s, const vik::MouseDownEvent&, vik::Window&,
+                   vik::Context<Studio>& c) {
+                    s.show_generate = s.show_layers = s.show_settings = false;
+                    c.notify();
+                }))
             .bg(vik::rgba(0x000000aa))
             .child(vik::div().flex_col().gap_3().p_4().w_px(560.0f)
+                .occlude()
+                .on_mouse_down(vik::MouseButton::Left,
+                    [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
+                        w.stop_propagation();
+                    })
                 .rounded_lg().bg(vik::rgb(0x232834))
                 .border_1().border_color(vik::rgb(0x3b4250))
                 .child(vik::div().flex_row().items_center().justify_between()
@@ -1981,6 +2035,17 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
         .on_key_down(cx.listener(
             [](Studio& s, const vik::KeyDownEvent& e, vik::Window&,
                vik::Context<Studio>& c) {
+                // A modal owns the keyboard while it is open. Firing
+                // timeline shortcuts underneath one is the keyboard version of
+                // the click falling through.
+                if (s.show_generate || s.show_layers || s.show_settings) {
+                    if (e.key == "escape") {
+                        s.show_generate = s.show_layers = s.show_settings = false;
+                        c.notify();
+                    }
+                    return;
+                }
+
                 if (e.key == "space") s.toggle_play();
                 else if (e.key == "r") s.regenerate(c.app());
                 else if (e.key == "e") s.export_mix();
