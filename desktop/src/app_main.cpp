@@ -238,6 +238,7 @@ struct Studio {
     std::filesystem::path document_path;
     bool                  dirty = false;
     bool                  show_settings = false;
+    bool                  show_layers = false;
     std::string           doc_status;
 
     std::string pod_url;
@@ -274,6 +275,7 @@ struct Studio {
     bool   regen_fired = false;
     bool   regen_done = false;
     double cancel_after = -1.0;   // scripted cancel, for testing the path
+    std::string scripted_layer;   // scripted add-a-layer, likewise
 
     // -- content ------------------------------------------------------------
 
@@ -689,6 +691,128 @@ struct Studio {
         }).detach();
     }
 
+    /// The set of instruments the server will actually condition on.
+    ///
+    /// Fixed, not free text: the model takes a track class, so anything else is
+    /// a rejected request rather than a creative prompt. Chips, as in the
+    /// reference, because a list you pick from cannot be typed wrong.
+    static constexpr const char* kTrackClasses[] = {
+        "drums", "bass", "guitar", "keyboard", "strings", "synth",
+        "brass", "woodwinds", "percussion", "fx", "backing_vocals", "vocals",
+    };
+
+    /// Generate a new part against what the project already has.
+    ///
+    /// The selection is optional here, unlike regenerate: with a range the
+    /// layer covers that span, without one it covers the arrangement. Both are
+    /// useful, so neither is forced.
+    void add_layer(const std::string& track_class, vik::App& app) {
+        if (net_busy || open_project_id.empty()) return;
+
+        double start_s = -1.0, end_s = -1.0;
+        if (selection.active()) {
+            start_s = static_cast<double>(selection.begin()) / session.rate;
+            end_s = static_cast<double>(selection.end()) / session.rate;
+        }
+
+        // Which stems exist already, so the new one can be told apart. The
+        // server returns a job, not a stem id, and a layer is simply the stem
+        // that was not there before.
+        std::vector<std::string> known;
+        for (const auto& src : session.sources)
+            if (!src.stem_id.empty()) known.push_back(src.stem_id);
+
+        net_busy = true;
+        net_error = false;
+        net_status = "adding " + track_class + "…";
+        show_layers = false;
+
+        auto* platform = &app.platform();
+        std::thread([url = pod_url, token = pod_token, project = open_project_id,
+                     track_class, start_s, end_s, known = std::move(known),
+                     ordinal = static_cast<int>(session.tracks.size()),
+                     rate = session.rate, platform] {
+            WorkerScope scope;
+            mx::net::ApiClient api;
+            api.set_base(url);
+            api.set_token(token);
+
+            const std::string key = project + ":layer:" + track_class + ":" +
+                                    std::to_string(static_cast<int64_t>(start_s * 1000));
+            auto job = api.add_layer(project, track_class, {}, start_s, end_s, key);
+            if (!job) {
+                g_inbox.push(MsgStatus{"layer refused: " + api.last_error(), true});
+                wake_ui(platform);
+                return;
+            }
+            g_inbox.push(MsgJob{job->id, "layer", job->status, job->message,
+                                job->queue_position, false});
+            wake_ui(platform);
+
+            const auto finished = api.follow(job->id, [&](const mx::net::JobRef& j) {
+                g_inbox.push(MsgJob{j.id, "layer", j.status, j.message,
+                                    j.queue_position, false});
+                wake_ui(platform);
+                return true;
+            });
+            g_inbox.push(MsgJob{finished.id, "layer", finished.status,
+                                finished.message, 0, true});
+            wake_ui(platform);
+
+            if (finished.status != "done") {
+                g_inbox.push(MsgStatus{
+                    "layer " + finished.status +
+                        (finished.error.empty() ? "" : ": " + finished.error),
+                    finished.status != "cancelled"});
+                wake_ui(platform);
+                return;
+            }
+
+            auto detail = api.project(project);
+            if (!detail) {
+                g_inbox.push(MsgStatus{"layered, but cannot re-read the project: " +
+                                       api.last_error(), true});
+                wake_ui(platform);
+                return;
+            }
+
+            const mx::net::StemRef* fresh = nullptr;
+            for (const auto& stem : detail->stems)
+                if (std::find(known.begin(), known.end(), stem.id) == known.end())
+                    fresh = &stem;
+            if (!fresh || !fresh->version()) {
+                g_inbox.push(MsgStatus{"layered, but no new stem appeared", true});
+                wake_ui(platform);
+                return;
+            }
+
+            const auto* version = fresh->version();
+            const uint64_t ckey = mx::net::cache_key(project, version->id, version->audio);
+            const auto cached = mx::net::cache_path(ckey);
+            if (!std::filesystem::exists(cached) &&
+                !api.fetch_audio(project, version->audio, cached.string())) {
+                g_inbox.push(MsgStatus{"cannot fetch the new layer: " + api.last_error(),
+                                       true});
+                wake_ui(platform);
+                return;
+            }
+            mx::Media media = mx::decode_file(cached, rate);
+            if (!media.ok()) {
+                std::error_code ec;
+                std::filesystem::remove(cached, ec);
+                g_inbox.push(MsgStatus{"new layer will not decode: " + media.error, true});
+                wake_ui(platform);
+                return;
+            }
+
+            g_inbox.push(MsgStemArrived{
+                fresh->label.empty() ? fresh->track_class : fresh->label,
+                fresh->id, version->id, ordinal, std::move(media), 0.0, false});
+            g_inbox.push(MsgStatus{"added " + track_class, false});
+            wake_ui(platform);
+        }).detach();
+    }
+
     void cancel_job(const std::string& id, vik::App& app) {
         for (auto& job : jobs)
             if (job.id == id) job.cancelling = true;
@@ -823,6 +947,8 @@ struct Studio {
                 } else if constexpr (std::is_same_v<T, MsgStemArrived>) {
                     place_stem(m);
                     last_decode_ms = m.fetch_ms;
+                    if (selftest && !scripted_layer.empty() && regen_fired)
+                        regen_done = true;
                     net_status = "loaded " + std::to_string(stems_arrived) + "/" +
                                  std::to_string(std::max(stems_expected, stems_arrived));
                     changed = true;
@@ -1204,9 +1330,16 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                         armed,
                         [](Studio& s, const vik::ClickEvent&, vik::Window&,
                            vik::Context<Studio>& c) { s.regenerate(c.app()); c.notify(); }))
-            .child(tool("t-layer", "stack-plus", "Add a layer (not yet)", false,
-                        [](Studio&, const vik::ClickEvent&, vik::Window&,
-                           vik::Context<Studio>&) {}))
+            .child(tool("t-layer", "stack-plus",
+                        open_project_id.empty()
+                            ? "Import a pod project first"
+                            : "Add a layer  (L)",
+                        !open_project_id.empty() && !net_busy,
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) {
+                            s.show_layers = true;
+                            c.notify();
+                        }))
             .child(tool("t-split", "scissors", "Stem splitter (not yet)", false,
                         [](Studio&, const vik::ClickEvent&, vik::Window&,
                            vik::Context<Studio>&) {}))
@@ -1393,13 +1526,59 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     c.notify();
                 })));
 
+    vik::AnyElement overlay = vik::div().into_any();
+
+    // --- add a layer: instrument chips -------------------------------------
+    if (show_layers) {
+        auto chips = vik::div().flex_row().wrap().gap_2();
+        for (const char* name : kTrackClasses) {
+            chips = std::move(chips).child(
+                vik::div().id("chip").px_3().py_2().rounded_md().cursor_pointer()
+                    .bg(vik::rgb(0x2c313d))
+                    .border_1().border_color(vik::rgb(0x3b4250))
+                    .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x3a4a68)); })
+                    .on_click(cx.listener([name](Studio& s, const vik::ClickEvent&,
+                                                 vik::Window&,
+                                                 vik::Context<Studio>& c) {
+                        s.add_layer(name, c.app());
+                        c.notify();
+                    }))
+                    .child(vik::text(name).text_color(vik::rgb(0xe6e8ec))));
+        }
+
+        overlay = vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
+            .flex_row().items_center().justify_center()
+            .bg(vik::rgba(0x00000099))
+            .child(vik::div().flex_col().gap_3().p_4().w_px(480.0f)
+                .rounded_lg().bg(vik::rgb(0x232834))
+                .border_1().border_color(vik::rgb(0x3b4250))
+                .child(vik::div().flex_row().items_center().justify_between()
+                    .child(vik::text("Add a Layer").text_xl().text_color(vik::white()))
+                    .child(icon_button("lclose", "x", false,
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) {
+                            s.show_layers = false;
+                            c.notify();
+                        })))
+                // Say what it will act on. A tool whose scope is invisible is a
+                // tool people use once and then stop trusting.
+                .child(vik::text(selection.active()
+                        ? std::format("Over the selection, {:.2f}-{:.2f}s",
+                                      static_cast<double>(selection.begin()) / session.rate,
+                                      static_cast<double>(selection.end()) / session.rate)
+                        : std::string("Over the whole arrangement "
+                                      "-- shift-drag a range first to narrow it"))
+                    .text_xs().text_color(vik::rgb(0x8d94a3)))
+                .child(std::move(chips)))
+            .into_any();
+    }
+
     // --- settings: the pod, and importing from it --------------------------
     // A modal over the canvas, like the reference's tool dialogs. Importing is
     // deliberately here rather than in the main navigation: pulling stems from
     // a pod project is something you do once to start a local project, not the
     // way you open your work.
-    vik::AnyElement overlay = vik::div().into_any();
-    if (show_settings) {
+    if (show_settings && !show_layers) {
         auto card = vik::div().flex_col().gap_3().p_4().w_px(460.0f)
             .rounded_lg().bg(vik::rgb(0x232834))
             .border_1().border_color(vik::rgb(0x3b4250))
@@ -1467,6 +1646,8 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 if (e.key == "space") s.toggle_play();
                 else if (e.key == "r") s.regenerate(c.app());
                 else if (e.key == "e") s.export_mix();
+                else if (e.key == "l" && !s.open_project_id.empty())
+                    s.show_layers = !s.show_layers;
                 else if (e.key == "escape") s.selection.clear();
                 else if (e.key == "home") s.seek(0);
                 else if (e.key == "l") {
@@ -1734,6 +1915,7 @@ int main(int argc, char** argv) {
     bool probe_only = false;
     bool doctest = false;
     double cancel_after = -1.0;
+    std::string layer_class;
     double regen_from = -1.0, regen_to = -1.0;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
@@ -1746,6 +1928,7 @@ int main(int argc, char** argv) {
         else if (arg == "--doctest") doctest = true;
         else if (arg == "--cancel-after" && i + 1 < argc)
             cancel_after = std::stod(argv[++i]);
+        else if (arg == "--layer" && i + 1 < argc) layer_class = argv[++i];
         else if (arg == "--regen" && i + 1 < argc) {
             const std::string spec = argv[++i];
             const size_t colon = spec.find(':');
@@ -1788,6 +1971,7 @@ int main(int argc, char** argv) {
                     s.regen_from = regen_from;
                     s.regen_to = regen_to;
                     s.cancel_after = cancel_after;
+                    s.scripted_layer = layer_class;
                     // The device decides the rate; the session follows it,
                     // because everything decoded is resampled to it once.
                     if (g_device.running()) s.session.rate = g_device.rate();
@@ -1812,6 +1996,15 @@ int main(int argc, char** argv) {
                 app.set_interval(std::chrono::milliseconds(16), [handle](vik::App& a) {
                     a.update_entity(handle, [](Studio& s, vik::Context<Studio>& c) {
                         const bool landed = s.pump();
+
+                        if (!s.scripted_layer.empty() && !s.regen_fired &&
+                            !s.net_busy && s.stems_arrived > 0) {
+                            s.regen_fired = true;
+                            std::printf("LAYER adding %s\n",
+                                        s.scripted_layer.c_str());
+                            std::fflush(stdout);
+                            s.add_layer(s.scripted_layer, c.app());
+                        }
 
                         // Fire the scripted regenerate once, once content is
                         // actually present -- doing it earlier would test the

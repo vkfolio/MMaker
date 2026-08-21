@@ -116,6 +116,18 @@ public:
                                   const std::string& prompt = {},
                                   const std::string& idempotency_key = {});
 
+    /// Generate a new part against what the project already has.
+    ///
+    /// `track_class` is one of the server's fixed set (vocals, drums, bass,
+    /// guitar, keyboard, strings, synth, fx, brass, woodwinds, percussion,
+    /// backing_vocals) -- the model conditions on the class, so an arbitrary
+    /// string is not a description, it is a rejected request.
+    std::optional<JobRef> add_layer(const std::string& project_id,
+                                    const std::string& track_class,
+                                    const std::string& prompt = {},
+                                    double start_s = -1.0, double end_s = -1.0,
+                                    const std::string& idempotency_key = {});
+
     std::optional<JobRef> job(const std::string& job_id);
     bool cancel(const std::string& job_id);
 

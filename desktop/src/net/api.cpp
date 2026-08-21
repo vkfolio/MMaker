@@ -230,6 +230,36 @@ std::optional<JobRef> ApiClient::repaint(const std::string& project_id,
     return read_job(*it);
 }
 
+std::optional<JobRef> ApiClient::add_layer(const std::string& project_id,
+                                           const std::string& track_class,
+                                           const std::string& prompt,
+                                           double start_s, double end_s,
+                                           const std::string& idempotency_key) {
+    json body;
+    body["track_class"] = track_class;
+    if (!prompt.empty()) body["prompt"] = prompt;
+    // Omitted rather than sent as null: without a range the server layers over
+    // the whole arrangement, which is the sensible default and the only thing
+    // the API could express before ranges existed.
+    if (start_s >= 0.0 && end_s > start_s) {
+        body["start_s"] = start_s;
+        body["end_s"] = end_s;
+    }
+
+    const Response r = http_.post(
+        url("/api/projects/" + url_escape(project_id) + "/layers"),
+        body.dump(), idempotency_key);
+    auto parsed = parse(r, last_error_);
+    if (!parsed) return std::nullopt;
+
+    auto it = parsed->find("job");
+    if (it == parsed->end() || !it->is_object()) {
+        last_error_ = "the server accepted the layer but named no job";
+        return std::nullopt;
+    }
+    return read_job(*it);
+}
+
 std::optional<JobRef> ApiClient::job(const std::string& job_id) {
     const Response r = http_.get(url("/api/jobs/" + url_escape(job_id)));
     auto body = parse(r, last_error_);
