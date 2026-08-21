@@ -93,6 +93,35 @@ def _seed_params(seed) -> dict:
     return {"seed": int(seed), "use_random_seed": False}
 
 
+META_KEYS = ("model", "lm_model_path", "inference_steps", "guidance_scale",
+             "generation_info", "infer_step")
+
+
+def _deep_meta(obj, _depth=0) -> dict:
+    """Pull whatever the server reports about how it rendered."""
+    if _depth > 6:
+        return {}
+    if isinstance(obj, str):
+        text = obj.strip()
+        if text[:1] in ("[", "{"):
+            try:
+                return _deep_meta(json.loads(text), _depth + 1)
+            except (ValueError, TypeError):
+                return {}
+        return {}
+    found = {}
+    if isinstance(obj, dict):
+        for key in META_KEYS:
+            if key in obj and obj[key] not in (None, ""):
+                found[key] = obj[key]
+        for value in obj.values():
+            found = {**_deep_meta(value, _depth + 1), **found}
+    if isinstance(obj, list):
+        for item in obj:
+            found = {**_deep_meta(item, _depth + 1), **found}
+    return found
+
+
 def _envelope(resp):
     """ACE-Step returns {"data": ..., "code": 200}. Unwrap one level."""
     if isinstance(resp, dict) and "code" in resp and "data" in resp:
@@ -128,6 +157,7 @@ class AceStepEngine:
     def __init__(self, base_url: str = DEFAULT_URL, debug_dir: Path | None = None):
         self.base_url = base_url.rstrip("/")
         self.debug_dir = Path(debug_dir) if debug_dir else None
+        self.last_meta: dict = {}
 
     # -- plumbing ----------------------------------------------------------
 
@@ -178,6 +208,7 @@ class AceStepEngine:
                 raise EngineError(f"ACE-Step query failed: {exc}") from exc
 
             inner = _envelope(body)
+            self._note_engine_meta(inner)
             # /query_result drains: a finished result is returned once and then
             # the queue is empty. Never discard a non-empty payload unexamined.
             if inner not in (None, [], {}):
@@ -198,6 +229,17 @@ class AceStepEngine:
                 # information and was not; report indeterminate and show time.
                 report(-1, f"rendering ({int(elapsed)}s)")
             time.sleep(POLL_S)
+
+    def _note_engine_meta(self, inner):
+        """Remember what the server reported rendering with.
+
+        Asking for a model the pod does not have makes ACE-Step fall back
+        silently, which shows up only as a suspiciously fast render. Recording
+        the reported model and step count turns that into visible data.
+        """
+        found = _deep_meta(inner)
+        if found:
+            self.last_meta = found
 
     def _download(self, ref: str, dest: Path) -> Path:
         if ref.startswith("http"):

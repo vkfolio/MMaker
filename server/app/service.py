@@ -39,6 +39,17 @@ def _quality(project: Project) -> dict:
     return {"quality": project.quality} if engines.music().name == "acestep" else {}
 
 
+def _engine_meta() -> dict:
+    """What the engine reported rendering with, if it said anything.
+
+    Asking for a model the pod lacks makes ACE-Step fall back silently; this
+    is how that becomes visible instead of just looking fast.
+    """
+    engine = engines.music()
+    meta = getattr(engine, "last_meta", None)
+    return {"engine": dict(meta)} if meta else {}
+
+
 def _verify(path: Path, grid: Grid, auto_nudge: bool = True) -> SyncReport:
     """Beat-check a generated stem and correct small, consistent latency.
 
@@ -106,7 +117,8 @@ def generate_variations(project: Project, count: int, report=None) -> list[dict]
         engine.generate(dest, prompt=prompt, grid=project.grid, seed=seed,
                         lyrics=lyrics, vocal_language=project.vocal_language,
                         src_audio=src, report=report, **_quality(project))
-        variation = Variation(seed=seed, audio=_rel(project, dest), prompt=prompt)
+        variation = Variation(seed=seed, audio=_rel(project, dest), prompt=prompt,
+                              engine=_engine_meta().get("engine", {}))
         project.variations.append(variation)
         made.append(variation.model_dump())
 

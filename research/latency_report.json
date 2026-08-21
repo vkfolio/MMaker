@@ -1,0 +1,206 @@
+{
+  "base": "https://fx3hkpe8yqxcvc-8000.proxy.runpod.net",
+  "gpu": {
+    "available": true,
+    "name": "NVIDIA RTX A6000",
+    "count": 1,
+    "total_gb": 51.0
+  },
+  "results": [
+    {
+      "op": "generate 1 variation",
+      "seconds": 3.03,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "split into stems",
+      "seconds": 3.0,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "repaint a 4s region",
+      "seconds": 3.37,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "add a layer (strings)",
+      "seconds": 6.17,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "another take of a stem",
+      "seconds": 5.71,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "extend by 8 bars",
+      "seconds": 3.39,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "export stems",
+      "seconds": 3.38,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "download export",
+      "seconds": 1.97,
+      "band": "interactive",
+      "advice": "",
+      "ok": true,
+      "error": "",
+      "mb": 16.7
+    },
+    {
+      "op": "generate 1 variation",
+      "seconds": 3.11,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "split into stems",
+      "seconds": 6.02,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "repaint a 4s region",
+      "seconds": 6.53,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "add a layer (strings)",
+      "seconds": 6.09,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "another take of a stem",
+      "seconds": 5.94,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "extend by 8 bars",
+      "seconds": 5.58,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "export stems",
+      "seconds": 3.52,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "download export",
+      "seconds": 2.33,
+      "band": "interactive",
+      "advice": "",
+      "ok": true,
+      "error": "",
+      "mb": 16.7
+    },
+    {
+      "op": "generate 1 variation",
+      "seconds": 3.14,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "split into stems",
+      "seconds": 3.02,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "repaint a 4s region",
+      "seconds": 3.41,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "add a layer (strings)",
+      "seconds": 6.65,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "another take of a stem",
+      "seconds": 5.7,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "extend by 8 bars",
+      "seconds": 5.61,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "export stems",
+      "seconds": 3.38,
+      "band": "interactive",
+      "advice": "put it in the direct loop",
+      "ok": true,
+      "error": ""
+    },
+    {
+      "op": "download export",
+      "seconds": 2.72,
+      "band": "interactive",
+      "advice": "",
+      "ok": true,
+      "error": "",
+      "mb": 17.2
+    }
+  ]
+}

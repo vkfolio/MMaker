@@ -99,6 +99,9 @@ class Variation(BaseModel):
     seed: int
     audio: str
     prompt: str = ""
+    # What the engine said it rendered with, so a silent model fallback is
+    # visible in the data rather than only as an oddly fast render.
+    engine: dict = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
 
 
