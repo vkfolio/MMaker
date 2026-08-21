@@ -24,8 +24,15 @@
 #     tries will fail and restart-loop the container.
 #
 # WHAT STAYS OUT:
-#   - model weights. They pull from HF at ~1 GB/s on RunPod; a Docker Hub pull
-#     is far slower, so baking them in would make cold start WORSE.
+#   - project data, logs, and every token file. Baking a credential into an
+#     image ships it to anyone who can pull it.
+#
+# NOTE ON WEIGHTS: they are NOT excluded, because ACE-Step keeps its
+# checkpoints inside ACESTEP_DIR, which is inside the tree we tar. That makes
+# the image ~35 GB and fully self-contained -- no HF fetch on a new pod. It was
+# not the original plan (HF was measured at 17.9 MB/s here, not the 1 GB/s
+# assumed), but self-contained turned out to be the better trade. To build a
+# lean image instead, add:  --exclude="$ROOT/ACE-Step-1.5/checkpoints"
 #
 # CONSEQUENCE: a pod using this image must mount its volume somewhere OTHER
 # than /workspace -- /data is the convention here -- or the mount hides the
