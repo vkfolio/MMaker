@@ -174,6 +174,67 @@ def test_split_produces_stems():
         assert (storage.project_dir(pid) / stem["versions"][0]["audio"]).exists()
 
 
+def test_second_split_does_not_destroy_the_first():
+    """Splitting twice must keep both sets, their ids, and their audio.
+
+    The old code did `project.stems = []` and wrote flat stems/bass.wav, so a
+    re-split silently invalidated every stem id a client had saved and
+    overwrote the audio underneath it.
+    """
+    pid = make_project(variations=2)
+    first = split(pid)
+    first_ids = {s["id"] for s in first}
+    first_audio = {s["id"]: storage.project_dir(pid) / s["versions"][0]["audio"]
+                   for s in first}
+    first_bytes = {i: p.read_bytes() for i, p in first_audio.items()}
+    assert all(p.exists() for p in first_audio.values())
+
+    # split a different variation
+    project = client.get(f"/api/projects/{pid}").json()["project"]
+    other = project["variations"][1]["id"]
+    job = client.post(f"/api/projects/{pid}/split",
+                      json={"variation_id": other, "method": "demucs"}).json()["job"]
+    wait_job(job["id"])
+
+    after = client.get(f"/api/projects/{pid}/stems").json()["stems"]
+    after_ids = {s["id"] for s in after}
+
+    # every original stem still exists, by id, with its audio untouched
+    assert first_ids <= after_ids, "a re-split destroyed the earlier stem ids"
+    for sid, path in first_audio.items():
+        assert path.exists(), f"audio for {sid} was deleted by the second split"
+        assert path.read_bytes() == first_bytes[sid],             f"audio for {sid} was overwritten in place by the second split"
+
+    # the two sets are distinct, and only the newest is active
+    project = storage.load(pid)
+    splits = {s.split_id for s in project.stems}
+    assert len(splits) == 2, f"expected two split sets, got {splits}"
+    assert project.active_split in splits
+    active = project.active_stems()
+    assert active and all(s.split_id == project.active_split for s in active)
+    assert len(active) < len(project.stems), "active set should be a subset"
+
+
+def test_export_uses_only_the_active_split():
+    import zipfile
+    pid = make_project(variations=2)
+    split(pid)
+    project = client.get(f"/api/projects/{pid}").json()["project"]
+    job = client.post(f"/api/projects/{pid}/split",
+                      json={"variation_id": project["variations"][1]["id"],
+                            "method": "demucs"}).json()["job"]
+    wait_job(job["id"])
+
+    job = client.post(f"/api/projects/{pid}/export").json()["job"]
+    wait_job(job["id"])
+    out = _TMP / "split_export.zip"
+    out.write_bytes(client.get(f"/api/projects/{pid}/export/download").content)
+    with zipfile.ZipFile(out) as zf:
+        wavs = [n for n in zf.namelist() if n.endswith(".wav") and n != "_mixdown.wav"]
+    active = storage.load(pid).active_stems()
+    assert len(wavs) == len(active),         f"export packed {len(wavs)} stems but the active split has {len(active)}"
+
+
 def test_mixdown_respects_mute_and_solo():
     pid = make_project()
     stems = split(pid)

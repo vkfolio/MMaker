@@ -8,6 +8,7 @@ Nothing is ever overwritten.
 from __future__ import annotations
 
 import random
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -119,12 +120,20 @@ def generate_variations(project: Project, count: int, report=None) -> list[dict]
 
 def split_variation(project: Project, variation_id: str, method: str = "demucs",
                     report=None) -> list[dict]:
+    """Separate a variation into stems, appending a new set.
+
+    Splitting used to clear project.stems and write flat filenames like
+    stems/bass.wav, so a second split destroyed every stem id and overwrote the
+    audio a saved client project referenced. Each run now gets its own id and
+    its own directory, and older sets are kept.
+    """
     variation = project.variation(variation_id)
     if not variation:
         raise NotReady(f"no such variation: {variation_id}")
 
+    split_id = f"split_{uuid.uuid4().hex[:8]}"
     src = _abs(project, variation.audio)
-    out_dir = storage.project_dir(project.id) / "stems"
+    out_dir = storage.project_dir(project.id) / "stems" / split_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if report:
@@ -145,18 +154,19 @@ def split_variation(project: Project, variation_id: str, method: str = "demucs",
     # Demucs calls its catch-all "other"; the rest of the app speaks track classes.
     rename = {"other": "keyboard", "piano": "keyboard", "guitar": "guitar"}
     project.chosen_variation = variation_id
-    project.stems = []
+    project.active_split = split_id
 
     made = []
     for name, path in parts.items():
         track_class = rename.get(name, name)
         if track_class not in TrackClass.__args__:
             track_class = "keyboard"
-        stem = Stem(track_class=track_class, label=name.title(),
-                    prompt=project.prompt)
+        stem = Stem(split_id=split_id, track_class=track_class,
+                    label=name.title(), prompt=project.prompt)
         stem.add(StemVersion(
             audio=_rel(project, Path(path)), op="import",
-            params={"from": variation_id, "method": method},
+            params={"from": variation_id, "method": method,
+                    "split_id": split_id},
             sync=analysis.sync_report(path, project.grid.bpm),
         ))
         project.stems.append(stem)
@@ -199,12 +209,13 @@ def export_zip(project: Project, report=None) -> Path:
         "stems:",
     ]
 
+    stems = project.active_stems()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-        for i, stem in enumerate(project.stems):
+        for i, stem in enumerate(stems):
             if not stem.version:
                 continue
             if report:
-                report(i / max(len(project.stems), 1), f"packing {stem.label}")
+                report(i / max(len(stems), 1), f"packing {stem.label}")
             src = _abs(project, stem.version.audio)
             name = f"{stem.track_class}_{stem.id[-4:]}.wav"
             zf.write(src, name)
@@ -369,7 +380,9 @@ def add_layer(project: Project, track_class: str, prompt: str = "",
     """Generate a new stem that fits everything already in the project."""
     _require_confirmed(project)
     seed = _seed(seed)
-    stem = Stem(track_class=track_class, label=track_class.replace("_", " ").title(),
+    stem = Stem(split_id=project.active_split or "",
+                track_class=track_class,
+                label=track_class.replace("_", " ").title(),
                 prompt=prompt or project.prompt)
 
     if report:

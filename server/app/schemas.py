@@ -67,6 +67,10 @@ class StemVersion(BaseModel):
 
 class Stem(BaseModel):
     id: str = Field(default_factory=lambda: _id("stem"))
+    # Which separation run produced this stem. Splitting again appends a new
+    # set rather than destroying the old one, so ids stay valid forever and a
+    # client that saved a reference to this stem can still resolve it.
+    split_id: str = ""
     track_class: TrackClass
     label: str = ""
     prompt: str = ""
@@ -113,6 +117,8 @@ class Project(BaseModel):
     variations: list[Variation] = Field(default_factory=list)
     chosen_variation: str | None = None
     stems: list[Stem] = Field(default_factory=list)
+    # The split set currently shown and mixed. Older sets stay in `stems`.
+    active_split: str | None = None
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
 
@@ -122,10 +128,17 @@ class Project(BaseModel):
     def variation(self, var_id: str) -> Variation | None:
         return next((v for v in self.variations if v.id == var_id), None)
 
+    def active_stems(self) -> list[Stem]:
+        """Stems from the current split set (all of them if none is marked)."""
+        if not self.active_split:
+            return list(self.stems)
+        return [s for s in self.stems if s.split_id == self.active_split]
+
     def audible_stems(self) -> list[Stem]:
         """Solo wins over mute, as in every DAW."""
-        soloed = [s for s in self.stems if s.soloed]
-        pool = soloed or [s for s in self.stems if not s.muted]
+        active = self.active_stems()
+        soloed = [s for s in active if s.soloed]
+        pool = soloed or [s for s in active if not s.muted]
         return [s for s in pool if s.version]
 
 
