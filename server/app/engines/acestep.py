@@ -371,8 +371,11 @@ class AceStepEngine:
             base = os.environ.get("ACESTEP_DIR", "/workspace/ACE-Step-1.5")
             root = os.path.join(base, "checkpoints")
         try:
+            # Skip dot-directories: .cache sits alongside the checkpoints and
+            # is not one, and listing it invites someone to read it as a model.
             return sorted(name for name in os.listdir(root)
-                          if os.path.isdir(os.path.join(root, name)))
+                          if not name.startswith(".")
+                          and os.path.isdir(os.path.join(root, name)))
         except OSError:
             return []
 
@@ -589,9 +592,12 @@ class AceStepEngine:
             except (requests.RequestException, ValueError):
                 continue
         info.setdefault("available", None)
-        if info["available"]:
+        # Judged against what is on disk, not against what happens to be loaded.
+        # Gating this on the loaded list meant a fresh pod reported no problems
+        # right up until it rendered something at the wrong quality.
+        if installed:
             missing = {tier: model for tier, model in info["requested_tiers"].items()
-                       if installed and model not in installed}
+                       if model not in installed}
             info["tiers_that_would_fall_back"] = missing
             if missing:
                 info["note"] = (
