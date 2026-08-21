@@ -144,7 +144,13 @@ class StubEngine:
             tail = np.repeat(tail[:, :1], data.shape[1], axis=1)
         return audio.write(dest, np.vstack([data, tail]), sr)
 
-    def separate(self, src_audio, out_dir):
+    TIER_STEMS = {
+        "basic": ("vocals", "instrumental"),
+        "professional": ("drums", "bass", "keyboard", "vocals", "guitar", "piano"),
+        "advanced": ("drums", "bass", "keyboard", "vocals", "guitar", "piano"),
+    }
+
+    def separate(self, src_audio, out_dir, tier: str = "professional"):
         """Fake demix: deterministic per-stem renders of the same length."""
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -152,7 +158,7 @@ class StubEngine:
         duration = len(data) / sr
         grid = Grid(bpm=96)
         result = {}
-        for i, name in enumerate(("drums", "bass", "keyboard", "vocals")):
+        for i, name in enumerate(self.TIER_STEMS.get(tier, self.TIER_STEMS["professional"])):
             path = out_dir / f"{name}.wav"
             audio.write(path, _render(name, grid, 1000 + i, duration), SR)
             result[name] = path

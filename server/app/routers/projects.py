@@ -177,7 +177,8 @@ def split(project_id: str, body: SplitRequest,
     job = jobs.queue.submit(
         "split",
         lambda report: service.split_variation(
-            _get(project_id), body.variation_id, body.method, report),
+            _get(project_id), body.variation_id, body.method, report,
+            tier=body.tier, remove_reverb=body.remove_reverb),
         project_id=project_id,
         idempotency_key=idempotency_key,
     )

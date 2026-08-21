@@ -169,6 +169,13 @@ class ConfirmGrid(BaseModel):
 class SplitRequest(BaseModel):
     variation_id: str
     method: Literal["demucs", "extract"] = "demucs"
+    # basic        -> vocals + instrumental (2)
+    # professional -> 6 stems (adds guitar and piano)
+    # advanced     -> everything the separator detects
+    tier: Literal["basic", "professional", "advanced"] = "professional"
+    # Not supported yet: it needs a de-reverb model we do not host. Asking for
+    # it is accepted and reported back as unfulfilled rather than ignored.
+    remove_reverb: bool = False
 
 
 class RepaintRequest(BaseModel):

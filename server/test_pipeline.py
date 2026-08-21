@@ -235,6 +235,37 @@ def test_export_uses_only_the_active_split():
     assert len(wavs) == len(active),         f"export packed {len(wavs)} stems but the active split has {len(active)}"
 
 
+def test_split_tiers_produce_different_stem_counts():
+    """Basic is vocals + instrumental; professional adds guitar and piano."""
+    pid = make_project(variations=2)
+    project = client.get(f"/api/projects/{pid}").json()["project"]
+
+    job = client.post(f"/api/projects/{pid}/split",
+                      json={"variation_id": project["variations"][0]["id"],
+                            "tier": "basic"}).json()["job"]
+    wait_job(job["id"])
+    basic = storage.load(pid).active_stems()
+    assert len(basic) == 2, f"basic should give 2 stems, got {len(basic)}"
+
+    job = client.post(f"/api/projects/{pid}/split",
+                      json={"variation_id": project["variations"][1]["id"],
+                            "tier": "professional"}).json()["job"]
+    wait_job(job["id"])
+    pro = storage.load(pid).active_stems()
+    assert len(pro) > len(basic), "professional should give more stems than basic"
+
+
+def test_unsupported_split_option_is_reported_not_ignored():
+    """We host no de-reverb model. Saying so beats silently dropping the flag."""
+    pid = make_project()
+    project = client.get(f"/api/projects/{pid}").json()["project"]
+    job = client.post(f"/api/projects/{pid}/split",
+                      json={"variation_id": project["variations"][0]["id"],
+                            "remove_reverb": True}).json()["job"]
+    stems = wait_job(job["id"])["result"]
+    assert "remove_reverb" in stems[0]["versions"][0]["params"]["unfulfilled"]
+
+
 def test_mixdown_respects_mute_and_solo():
     pid = make_project()
     stems = split(pid)

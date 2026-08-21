@@ -21,11 +21,19 @@ class DemucsEngine:
 
     name = "demucs"
 
+    # htdemucs_ft is the strongest 4-stem model; htdemucs_6s adds guitar and
+    # piano at some cost to the others.
+    MODEL_FOR_TIER = {
+        "basic": "htdemucs_ft",
+        "professional": "htdemucs_6s",
+        "advanced": "htdemucs_6s",
+    }
+
     def __init__(self, model: str = "htdemucs_ft", device: str | None = None):
         self.model = model
         self.device = device
 
-    def separate(self, src_audio, out_dir) -> dict[str, Path]:
+    def separate(self, src_audio, out_dir, tier: str = "professional") -> dict[str, Path]:
         try:
             import torch
             from demucs.apply import apply_model
@@ -42,7 +50,7 @@ class DemucsEngine:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        model = get_model(self.model)
+        model = get_model(self.MODEL_FOR_TIER.get(tier, self.model))
         device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device).eval()
 

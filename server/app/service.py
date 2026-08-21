@@ -121,7 +121,8 @@ def generate_variations(project: Project, count: int, report=None) -> list[dict]
 # ---------------------------------------------------------------------------
 
 def split_variation(project: Project, variation_id: str, method: str = "demucs",
-                    report=None) -> list[dict]:
+                    report=None, tier: str = "professional",
+                    remove_reverb: bool = False) -> list[dict]:
     """Separate a variation into stems, appending a new set.
 
     Splitting used to clear project.stems and write flat filenames like
@@ -143,7 +144,8 @@ def split_variation(project: Project, variation_id: str, method: str = "demucs",
 
     if method == "extract":
         engine = engines.music()
-        wanted = ["vocals", "drums", "bass", "keyboard"]
+        wanted = (["vocals", "keyboard"] if tier == "basic"
+                  else ["vocals", "drums", "bass", "keyboard"])
         parts = {}
         for i, track in enumerate(wanted):
             if report:
@@ -151,12 +153,19 @@ def split_variation(project: Project, variation_id: str, method: str = "demucs",
             dest = out_dir / f"{track}.wav"
             parts[track] = engine.extract(dest, src, track, project.grid)
     else:
-        parts = engines.separator().separate(src, out_dir)
+        parts = engines.separator().separate(src, out_dir, tier=tier)
+        if tier == "basic":
+            parts = _fold_to_basic(parts, out_dir)
 
     # Demucs calls its catch-all "other"; the rest of the app speaks track classes.
     rename = {"other": "keyboard", "piano": "keyboard", "guitar": "guitar"}
     project.chosen_variation = variation_id
     project.active_split = split_id
+
+    unfulfilled = []
+    if remove_reverb:
+        # Say so rather than silently ignoring it: we host no de-reverb model.
+        unfulfilled.append("remove_reverb")
 
     made = []
     for name, path in parts.items():
@@ -168,7 +177,8 @@ def split_variation(project: Project, variation_id: str, method: str = "demucs",
         stem.add(StemVersion(
             audio=_rel(project, Path(path)), op="import",
             params={"from": variation_id, "method": method,
-                    "split_id": split_id},
+                    "split_id": split_id, "tier": tier,
+                    "unfulfilled": unfulfilled},
             sync=analysis.sync_report(path, project.grid.bpm),
         ))
         project.stems.append(stem)
@@ -178,6 +188,19 @@ def split_variation(project: Project, variation_id: str, method: str = "demucs",
     if report:
         report(1.0, f"{len(made)} stems")
     return made
+
+
+def _fold_to_basic(parts: dict, out_dir: Path) -> dict:
+    """Basic is vocals + everything else, which we sum rather than re-separate."""
+    vocals = parts.get("vocals")
+    others = [(name, p) for name, p in parts.items() if name != "vocals"]
+    if not vocals or not others:
+        return parts
+    inst = out_dir / "instrumental.wav"
+    audio.mix([(p, 0.0, 0.0) for _, p in others], inst)
+    for name, p in others:
+        Path(p).unlink(missing_ok=True)
+    return {"vocals": vocals, "keyboard": inst}
 
 
 def mixdown(project: Project, dest: Path | None = None,
