@@ -41,6 +41,7 @@
 #include "ui/arrangement.h"
 
 #include "vikui/vikui.h"
+#include "vikui/theme.h"
 #include "vikui/elements/canvas.h"
 #include "components/phosphor.h"
 
@@ -286,6 +287,7 @@ struct Studio {
     std::string scripted_layer;   // scripted add-a-layer, likewise
     std::string scripted_prompt;  // scripted generate, likewise
     bool        stress = false;   // cycle panels hard, to shake out frame limits
+    bool        theme_ok = false;
 
     // -- content ------------------------------------------------------------
 
@@ -1195,14 +1197,15 @@ struct Studio {
         std::printf(
             "STUDIO device=%s rate=%u latency_ms=%.1f | sources=%d pending=%d "
             "decode_ms=%.0f | tracks=%zu clips=%zu | playhead=%.2fs xruns=%u "
-            "| net=%s stems=%d/%d cached=%d jobs=%zu%s | paint_ms=%.2f (build %.2f skia %.2f) worst=%.2f frames=%d columns=%lld\n",
+            "| theme=%d net=%s stems=%d/%d cached=%d jobs=%zu%s | paint_ms=%.2f (build %.2f skia %.2f) worst=%.2f frames=%d columns=%lld\n",
             g_device.running() ? g_device.backend().c_str() : "NONE",
             g_device.rate(), 1000.0 * g_device.latency_frames() /
                 std::max(1u, g_device.rate()),
             loaded_sources, g_pending.load(), last_decode_ms,
             session.tracks.size(), session.clips.size(),
             static_cast<double>(playhead()) / std::max(1u, session.rate),
-            g_mixer.xruns(), net_status.c_str(), stems_arrived, stems_expected,
+            g_mixer.xruns(), theme_ok ? 1 : 0,
+            net_status.c_str(), stems_arrived, stems_expected,
             cache_hits, jobs.size(), job_note.c_str(),
             last_paint_ms, build_ms, submit_ms, worst_paint_ms, frames,
             static_cast<long long>(columns));
@@ -1436,6 +1439,12 @@ vik::AnyElement Studio::generate_modal(vik::Context<Studio>& cx) {
                                      "so each part is editable.")
                         .text_xs().text_color(vik::rgb(0x565c6b)))))
             .into_any();
+}
+
+/// Is a Theme global installed? Tooltips read it during paint, so its absence
+/// is a crash waiting for a hover rather than an error at startup.
+bool a_theme_present(vik::App& app) {
+    return app.try_global<vik::Theme>() != nullptr;
 }
 
 vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
@@ -2225,6 +2234,16 @@ int main(int argc, char** argv) {
         std::printf("audio: %s\n", g_device.error().c_str());
 
     vik::App::run([&](vik::App& app) {
+        // Install the theme globals before any window exists.
+        //
+        // Tooltips are painted by vikui itself and read active_theme(app),
+        // which is app.global<Theme>() -- with no theme registered that is a
+        // null dereference inside Div::paint. Nothing in this app reads the
+        // theme directly, so the omission was invisible until a tooltip was
+        // shown, and then it crashed on hovering a dock button rather than on
+        // startup.
+        vik::init_themes(app);
+
         app.open_window(
             vik::WindowOptions{.title = "musicX Studio", .size = {1200.0f, 720.0f}},
             [&](vik::Window&, vik::App& app) {
@@ -2260,6 +2279,10 @@ int main(int argc, char** argv) {
                     s.show_layers   = (open_panel == "layers");
                     s.show_settings = (open_panel == "settings");
                     s.stress = stress;
+                    // Read the theme once at startup. It is what tooltips
+                    // dereference, and a missing one used to surface only when
+                    // somebody hovered a button.
+                    s.theme_ok = a_theme_present(c.app());
                     // The device decides the rate; the session follows it,
                     // because everything decoded is resampled to it once.
                     if (g_device.running()) s.session.rate = g_device.rate();
