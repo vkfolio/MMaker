@@ -101,13 +101,26 @@ struct MsgStemUpdated {
     mx::Media    media;
 };
 
+/// Progress for one server-side job. Named separately from MsgStatus because
+/// a job has identity and a lifetime -- it can be cancelled, and it has to
+/// survive several updates without being confused with a passing message.
+struct MsgJob {
+    std::string id;
+    std::string kind;
+    std::string status;
+    std::string message;
+    int         queue_position = 0;
+    bool        finished = false;
+};
+
 struct MsgStatus {
     std::string text;
     bool        error = false;
 };
 
 using UiMessage = std::variant<MsgDecoded, MsgProjects, MsgProjectOpened,
-                               MsgStemArrived, MsgStemUpdated, MsgStatus>;
+                               MsgStemArrived, MsgStemUpdated, MsgJob,
+                               MsgStatus>;
 
 class Inbox {
 public:
@@ -133,6 +146,31 @@ mx::Mixer  g_mixer;
 mx::Device g_device;
 
 std::atomic<int> g_pending{0};
+
+/// Worker lifetime, because the framework has no hook for it.
+///
+/// App::run destroys the platform and calls SDL_Quit on its way out, and
+/// nothing joins detached workers first -- so a render that finishes during
+/// teardown calls wake() on a torn-down SDL and takes the process with it.
+/// This was not theoretical: cancelling a job crashed on exit every time.
+///
+/// Two halves. `g_ui_alive` is cleared before quitting so no worker wakes a
+/// platform that is going away, and `g_workers` is waited on after run()
+/// returns so no thread is still touching the inbox during static destruction.
+std::atomic<bool> g_ui_alive{true};
+std::atomic<int>  g_workers{0};
+
+/// Wake the UI, unless it is on its way out.
+void wake_ui(vik::Platform* platform) {
+    if (platform && g_ui_alive.load(std::memory_order_acquire)) platform->wake();
+}
+
+/// Scoped worker registration -- correct even when a worker returns early,
+/// which several of them do on the error paths.
+struct WorkerScope {
+    WorkerScope() { g_workers.fetch_add(1, std::memory_order_acq_rel); }
+    ~WorkerScope() { g_workers.fetch_sub(1, std::memory_order_acq_rel); }
+};
 
 // ---------------------------------------------------------------------------
 // Demo content, so the app runs with nothing to point it at
@@ -205,6 +243,21 @@ struct Studio {
     std::string pod_url;
     std::string pod_token;
     std::string net_status = "not connected";
+
+    /// What the pod is doing for us right now.
+    ///
+    /// The plan asks for real queue position, elapsed time and cancel -- and
+    /// specifically not a percentage, because the engine reports no progress
+    /// signal and a bar would be inventing one. Elapsed seconds are true.
+    struct ActiveJob {
+        std::string id;
+        std::string kind;
+        std::string message;
+        int         queue_position = 0;
+        std::chrono::steady_clock::time_point started;
+        bool        cancelling = false;
+    };
+    std::vector<ActiveJob> jobs;
     bool        net_busy = false;
     bool        net_error = false;
     std::vector<mx::net::ProjectSummary> projects;
@@ -220,6 +273,7 @@ struct Studio {
     double regen_from = -1.0, regen_to = -1.0;
     bool   regen_fired = false;
     bool   regen_done = false;
+    double cancel_after = -1.0;   // scripted cancel, for testing the path
 
     // -- content ------------------------------------------------------------
 
@@ -314,6 +368,7 @@ struct Studio {
         const uint32_t rate = session.rate;
         // Plain data only: an id and a path. No handle, no App, no entity.
         std::thread([id, file = std::move(file), rate, platform] {
+            WorkerScope scope;
             const auto t0 = std::chrono::steady_clock::now();
             mx::Media media = mx::decode_file(file, rate);
             const auto t1 = std::chrono::steady_clock::now();
@@ -322,7 +377,7 @@ struct Studio {
                 std::chrono::duration<double, std::milli>(t1 - t0).count()});
             // Without this the UI can sit in SDL_WaitEventTimeout until the
             // user happens to move the mouse.
-            platform->wake();
+            wake_ui(platform);
         }).detach();
     }
 
@@ -413,23 +468,24 @@ struct Studio {
         net_error = false;
         auto* platform = &app.platform();
         std::thread([url = pod_url, token = pod_token, platform] {
+            WorkerScope scope;
             mx::net::ApiClient api;
             api.set_base(url);
             api.set_token(token);
             const auto health = api.health();
             if (!health.reachable) {
                 g_inbox.push(MsgStatus{"cannot reach the pod: " + api.last_error(), true});
-                platform->wake();
+                wake_ui(platform);
                 return;
             }
             auto list = api.projects();
             if (list.empty() && !api.last_error().empty()) {
                 g_inbox.push(MsgStatus{api.last_error(), true});
-                platform->wake();
+                wake_ui(platform);
                 return;
             }
             g_inbox.push(MsgProjects{std::move(list)});
-            platform->wake();
+            wake_ui(platform);
         }).detach();
     }
 
@@ -450,6 +506,7 @@ struct Studio {
         const uint32_t rate = session.rate;
 
         std::thread([url = pod_url, token = pod_token, id, rate, platform] {
+            WorkerScope scope;
             mx::net::ApiClient api;
             api.set_base(url);
             api.set_token(token);
@@ -457,13 +514,13 @@ struct Studio {
             auto detail = api.project(id);
             if (!detail) {
                 g_inbox.push(MsgStatus{"cannot open project: " + api.last_error(), true});
-                platform->wake();
+                wake_ui(platform);
                 return;
             }
             g_inbox.push(MsgProjectOpened{detail->summary.id, detail->summary.title,
                                           detail->summary.bpm, detail->summary.bars,
                                           static_cast<int>(detail->stems.size())});
-            platform->wake();
+            wake_ui(platform);
 
             int ordinal = 0;
             for (const auto& stem : detail->stems) {
@@ -480,7 +537,7 @@ struct Studio {
                     !api.fetch_audio(detail->summary.id, version->audio,
                                      cached.string())) {
                     g_inbox.push(MsgStatus{stem.track_class + ": " + api.last_error(), true});
-                    platform->wake();
+                    wake_ui(platform);
                     continue;
                 }
 
@@ -492,7 +549,7 @@ struct Studio {
                     std::error_code ec;
                     std::filesystem::remove(cached, ec);
                     g_inbox.push(MsgStatus{stem.track_class + ": " + media.error, true});
-                    platform->wake();
+                    wake_ui(platform);
                     continue;
                 }
 
@@ -501,10 +558,10 @@ struct Studio {
                 g_inbox.push(MsgStemArrived{
                     stem.label.empty() ? stem.track_class : stem.label,
                     stem.id, version->id, ordinal++, std::move(media), ms, hit});
-                platform->wake();
+                wake_ui(platform);
             }
             g_inbox.push(MsgStatus{"", false});
-            platform->wake();
+            wake_ui(platform);
         }).detach();
     }
 
@@ -543,6 +600,7 @@ struct Studio {
                      stem = source->stem_id, source_id = source->id,
                      track_id = selection.track, start_s, end_s,
                      rate = session.rate, platform] {
+            WorkerScope scope;
             mx::net::ApiClient api;
             api.set_base(url);
             api.set_token(token);
@@ -557,23 +615,36 @@ struct Studio {
             auto job = api.repaint(project, stem, start_s, end_s, {}, key);
             if (!job) {
                 g_inbox.push(MsgStatus{"repaint refused: " + api.last_error(), true});
-                platform->wake();
+                wake_ui(platform);
                 return;
             }
 
+            g_inbox.push(MsgJob{job->id, "regenerate", job->status, job->message,
+                                job->queue_position, false});
+            wake_ui(platform);
+
             const auto finished = api.follow(job->id, [&](const mx::net::JobRef& j) {
-                std::string note = j.queue_position > 1
-                    ? ("queued #" + std::to_string(j.queue_position))
-                    : (j.message.empty() ? j.status : j.message);
-                g_inbox.push(MsgStatus{note, false});
-                platform->wake();
+                g_inbox.push(MsgJob{j.id, "regenerate", j.status, j.message,
+                                    j.queue_position, false});
+                wake_ui(platform);
                 return true;
             });
+            g_inbox.push(MsgJob{finished.id, "regenerate", finished.status,
+                                finished.message, 0, true});
+            wake_ui(platform);
+
+            if (finished.status == "cancelled") {
+                // Terminal, like success: a scripted run must not sit waiting
+                // for audio that is never coming.
+                g_inbox.push(MsgStatus{"cancelled", false});
+                wake_ui(platform);
+                return;
+            }
             if (finished.status != "done") {
                 g_inbox.push(MsgStatus{
                     "repaint " + finished.status +
                         (finished.error.empty() ? "" : ": " + finished.error), true});
-                platform->wake();
+                wake_ui(platform);
                 return;
             }
 
@@ -585,7 +656,7 @@ struct Studio {
             if (!detail) {
                 g_inbox.push(MsgStatus{"rendered, but cannot re-read the project: " +
                                        api.last_error(), true});
-                platform->wake();
+                wake_ui(platform);
                 return;
             }
             const mx::net::VersionRef* version = nullptr;
@@ -593,7 +664,7 @@ struct Studio {
                 if (st.id == stem) version = st.version();
             if (!version || version->audio.empty()) {
                 g_inbox.push(MsgStatus{"rendered, but the stem has no current version", true});
-                platform->wake();
+                wake_ui(platform);
                 return;
             }
 
@@ -602,7 +673,7 @@ struct Studio {
             if (!std::filesystem::exists(cached) &&
                 !api.fetch_audio(project, version->audio, cached.string())) {
                 g_inbox.push(MsgStatus{"cannot fetch the new take: " + api.last_error(), true});
-                platform->wake();
+                wake_ui(platform);
                 return;
             }
             mx::Media media = mx::decode_file(cached, rate);
@@ -610,11 +681,28 @@ struct Studio {
                 std::error_code ec;
                 std::filesystem::remove(cached, ec);
                 g_inbox.push(MsgStatus{"new take will not decode: " + media.error, true});
-                platform->wake();
+                wake_ui(platform);
                 return;
             }
             g_inbox.push(MsgStemUpdated{track_id, source_id, version->id, std::move(media)});
-            platform->wake();
+            wake_ui(platform);
+        }).detach();
+    }
+
+    void cancel_job(const std::string& id, vik::App& app) {
+        for (auto& job : jobs)
+            if (job.id == id) job.cancelling = true;
+        auto* platform = &app.platform();
+        std::thread([url = pod_url, token = pod_token, id, platform] {
+            WorkerScope scope;
+            mx::net::ApiClient api;
+            api.set_base(url);
+            api.set_token(token);
+            // Best effort. The follow loop is what actually notices the job
+            // ending, so nothing here needs to report success -- and a cancel
+            // that races a job finishing is not an error worth surfacing.
+            api.cancel(id);
+            wake_ui(platform);
         }).detach();
     }
 
@@ -757,11 +845,27 @@ struct Studio {
                     if (selftest) regen_done = true;
                     changed = true;
 
+                } else if constexpr (std::is_same_v<T, MsgJob>) {
+                    auto it = std::find_if(jobs.begin(), jobs.end(),
+                                           [&](const ActiveJob& j) { return j.id == m.id; });
+                    if (m.finished) {
+                        if (it != jobs.end()) jobs.erase(it);
+                    } else if (it != jobs.end()) {
+                        it->message = m.message.empty() ? m.status : m.message;
+                        it->queue_position = m.queue_position;
+                    } else {
+                        jobs.push_back(ActiveJob{
+                            m.id, m.kind,
+                            m.message.empty() ? m.status : m.message,
+                            m.queue_position, std::chrono::steady_clock::now(), false});
+                    }
+
                 } else if constexpr (std::is_same_v<T, MsgStatus>) {
                     net_busy = false;
                     if (!m.text.empty()) {
                         net_status = m.text;
                         net_error = m.error;
+                        if (selftest && m.text == "cancelled") regen_done = true;
                     } else if (stems_arrived > 0) {
                         net_status = std::to_string(stems_arrived) + " stems" +
                                      (cache_hits ? " (" + std::to_string(cache_hits) +
@@ -817,10 +921,19 @@ struct Studio {
     }
 
     void report() {
+        // Built first, not inlined into the argument list: a temporary string's
+        // c_str() in a variadic call is the kind of lifetime question nobody
+        // should have to re-derive when reading a log line.
+        std::string job_note;
+        if (!jobs.empty()) {
+            const int secs = static_cast<int>(std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - jobs.front().started).count());
+            job_note = " [" + jobs.front().kind + " " + std::to_string(secs) + "s]";
+        }
         std::printf(
             "STUDIO device=%s rate=%u latency_ms=%.1f | sources=%d pending=%d "
             "decode_ms=%.0f | tracks=%zu clips=%zu | playhead=%.2fs xruns=%u "
-            "| net=%s stems=%d/%d cached=%d | paint_ms=%.2f (build %.2f skia %.2f) worst=%.2f frames=%d columns=%lld\n",
+            "| net=%s stems=%d/%d cached=%d jobs=%zu%s | paint_ms=%.2f (build %.2f skia %.2f) worst=%.2f frames=%d columns=%lld\n",
             g_device.running() ? g_device.backend().c_str() : "NONE",
             g_device.rate(), 1000.0 * g_device.latency_frames() /
                 std::max(1u, g_device.rate()),
@@ -828,7 +941,8 @@ struct Studio {
             session.tracks.size(), session.clips.size(),
             static_cast<double>(playhead()) / std::max(1u, session.rate),
             g_mixer.xruns(), net_status.c_str(), stems_arrived, stems_expected,
-            cache_hits, last_paint_ms, build_ms, submit_ms, worst_paint_ms, frames,
+            cache_hits, jobs.size(), job_note.c_str(),
+            last_paint_ms, build_ms, submit_ms, worst_paint_ms, frames,
             static_cast<long long>(columns));
         std::fflush(stdout);
     }
@@ -1007,6 +1121,49 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
         });
     }).size_full();
 
+    // --- job strip ---------------------------------------------------------
+    // Above the dock, and only when something is running. Elapsed seconds and
+    // queue position are facts; a progress bar would be a number we invented,
+    // since the engine reports none.
+    vik::AnyElement job_strip = vik::div().into_any();
+    if (!jobs.empty()) {
+        auto strip = vik::div().flex_col().gap_1();
+        for (const auto& job : jobs) {
+            const int secs = static_cast<int>(
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - job.started).count());
+            const std::string label = job.queue_position > 1
+                ? ("queued #" + std::to_string(job.queue_position))
+                : job.message;
+            strip = std::move(strip).child(
+                vik::div().flex_row().items_center().gap_3().px_3().py_2()
+                    .rounded_md().bg(vik::rgb(0x232834))
+                    .border_1().border_color(vik::rgb(0x3b4250))
+                    .child(vik::ui::phosphor("circle-notch", vik::ui::PhWeight::Bold)
+                               .size(13.0f).color(vik::rgb(0xd9903c)))
+                    .child(vik::text(job.kind).text_color(vik::rgb(0xe6e8ec)))
+                    .child(vik::text(label).text_xs().text_color(vik::rgb(0x8d94a3)))
+                    .child(vik::text(std::format("{}s", secs))
+                               .text_xs().text_color(vik::rgb(0xc9cedb)))
+                    .child(vik::div().id("cancel").px_2().py_1().rounded_sm()
+                        .cursor_pointer().bg(vik::rgb(0x2c313d))
+                        .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x8a3a3a)); })
+                        .on_click(cx.listener([id = job.id](Studio& s,
+                                                            const vik::ClickEvent&,
+                                                            vik::Window&,
+                                                            vik::Context<Studio>& c) {
+                            s.cancel_job(id, c.app());
+                            c.notify();
+                        }))
+                        .child(vik::text(job.cancelling ? "stopping…" : "Cancel")
+                                   .text_xs().text_color(vik::rgb(0xe6e8ec)))));
+        }
+        job_strip = vik::div().absolute().bottom(72.0f).left(0.0f).right(0.0f)
+            .flex_row().justify_center()
+            .child(std::move(strip))
+            .into_any();
+    }
+
     // The bottom dock, which is the piece of ACE Studio's layout people
     // recognise: a floating pill of icon groups over the canvas rather than a
     // toolbar bolted to an edge. Grouped as in the reference --
@@ -1067,6 +1224,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
     auto timeline =
         vik::div().flex_1().relative().overflow_hidden()
             .child(std::move(surface))
+            .child(std::move(job_strip))
             .child(std::move(dock))
             .on_mouse_down(vik::MouseButton::Left, cx.listener(
                 [](Studio& s, const vik::MouseDownEvent& e, vik::Window&,
@@ -1575,6 +1733,7 @@ int main(int argc, char** argv) {
     std::string pod_url, pod_token, pod_project;
     bool probe_only = false;
     bool doctest = false;
+    double cancel_after = -1.0;
     double regen_from = -1.0, regen_to = -1.0;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
@@ -1585,6 +1744,8 @@ int main(int argc, char** argv) {
         else if (arg == "--connect" && i + 1 < argc) pod_url = argv[++i];
         else if (arg == "--probe") probe_only = true;
         else if (arg == "--doctest") doctest = true;
+        else if (arg == "--cancel-after" && i + 1 < argc)
+            cancel_after = std::stod(argv[++i]);
         else if (arg == "--regen" && i + 1 < argc) {
             const std::string spec = argv[++i];
             const size_t colon = spec.find(':');
@@ -1626,6 +1787,7 @@ int main(int argc, char** argv) {
                     }
                     s.regen_from = regen_from;
                     s.regen_to = regen_to;
+                    s.cancel_after = cancel_after;
                     // The device decides the rate; the session follows it,
                     // because everything decoded is resampled to it once.
                     if (g_device.running()) s.session.rate = g_device.rate();
@@ -1668,9 +1830,28 @@ int main(int argc, char** argv) {
                             s.regenerate(c.app());
                         }
 
+                        // Scripted cancel: prove the path exists rather than
+                        // trusting that a button wired to an endpoint works.
+                        if (s.cancel_after >= 0.0 && !s.jobs.empty() &&
+                            !s.jobs.front().cancelling) {
+                            const double age = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() -
+                                s.jobs.front().started).count();
+                            if (age >= s.cancel_after) {
+                                std::printf("CANCEL requesting stop of %s after %.1fs\n",
+                                            s.jobs.front().id.c_str(), age);
+                                std::fflush(stdout);
+                                s.cancel_job(s.jobs.front().id, c.app());
+                            }
+                        }
+
                         const bool rolling = g_mixer.transport.playing.load();
                         g_mixer.collect(g_device.running());
-                        if (landed || rolling || s.meter > 0.001f) c.notify();
+                        // A job strip shows elapsed seconds, so it has to repaint
+                        // while a render runs even though nothing else changed.
+                        if (landed || rolling || s.meter > 0.001f ||
+                            !s.jobs.empty())
+                            c.notify();
                     });
                     return true;
                 });
@@ -1702,6 +1883,19 @@ int main(int argc, char** argv) {
                 return handle;
             });
     });
+
+    // The UI is gone; nothing may wake it now.
+    g_ui_alive.store(false, std::memory_order_release);
+
+    // Wait for detached workers to unwind before static destruction takes the
+    // inbox out from under them. Bounded, because a wedged network call must
+    // not hold the process open forever -- but generous enough that a normal
+    // download finishes.
+    for (int waited = 0; g_workers.load(std::memory_order_acquire) > 0 && waited < 100;
+         ++waited)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (const int stuck = g_workers.load(std::memory_order_acquire); stuck > 0)
+        std::printf("note: %d worker(s) still running at exit\n", stuck);
 
     g_device.stop();
     return 0;
