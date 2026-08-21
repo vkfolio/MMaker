@@ -27,6 +27,22 @@ DEFAULT_URL = os.environ.get("ACESTEP_URL", "http://127.0.0.1:8001")
 POLL_S = float(os.environ.get("ACESTEP_POLL_S", "3"))
 MAX_WAIT_S = float(os.environ.get("ACESTEP_MAX_WAIT_S", "1800"))
 
+# Quality tiers, from ACE-Step's own model-selection guide.
+#
+# turbo models are distilled for 8 steps and ignore CFG; base models want
+# 32-64 steps with guidance and run two forward passes, so they need roughly
+# double the VRAM. The XL pair is 4B rather than 0.6B. "ultra" is what to use
+# when the GPU is large and the wait does not matter.
+QUALITY = {
+    "fast":  {"model": "acestep-v15-turbo",    "lm": "acestep-5Hz-lm-0.6B",
+              "inference_steps": 8,  "guidance_scale": None, "vram_gb": 6},
+    "high":  {"model": "acestep-v15-xl-turbo", "lm": "acestep-5Hz-lm-1.7B",
+              "inference_steps": 8,  "guidance_scale": None, "vram_gb": 14},
+    "ultra": {"model": "acestep-v15-xl-base",  "lm": "acestep-5Hz-lm-4B",
+              "inference_steps": 50, "guidance_scale": 7.0,  "vram_gb": 30},
+}
+DEFAULT_QUALITY = os.environ.get("ACESTEP_QUALITY", "high").strip().lower()
+
 
 AUDIO_RE = re.compile(r"\.(mp3|wav|flac|ogg|m4a)(\?|$)", re.I)
 
@@ -66,6 +82,15 @@ def _deep_audio(obj, _depth=0):
             if found:
                 return found
     return None
+
+
+def _seed_params(seed) -> dict:
+    """ACE-Step randomises unless told not to.
+
+    use_random_seed defaults to true, so passing a seed alone changes nothing --
+    and every version we record claims a seed that would not reproduce it.
+    """
+    return {"seed": int(seed), "use_random_seed": False}
 
 
 def _envelope(resp):
@@ -225,8 +250,26 @@ class AceStepEngine:
         return {
             "bpm": grid.bpm,
             "key_scale": grid.key_scale,
+            "time_signature": grid.time_sig.split("/")[0],
             "audio_duration": round(grid.duration_s, 3),
         }
+
+    def _quality_params(self, quality: str | None = None) -> dict:
+        tier = QUALITY.get((quality or DEFAULT_QUALITY), QUALITY["high"])
+        params = {
+            "model": tier["model"],
+            "lm_model_path": tier["lm"],
+            "inference_steps": tier["inference_steps"],
+            # Ask for WAV directly. The default is 128 kbps MP3, which we would
+            # only have to transcode back for mixing and separation anyway.
+            "audio_format": "wav",
+            # One clip per call: we make variations from distinct seeds, and the
+            # default batch of 2 doubles the work for a second take we discard.
+            "batch_size": 1,
+        }
+        if tier["guidance_scale"] is not None:
+            params["guidance_scale"] = tier["guidance_scale"]
+        return params
 
     def _run(self, params, dest, src_audio=None, report=None):
         task_id = self._submit(params, src_audio)
@@ -235,49 +278,55 @@ class AceStepEngine:
     # -- Engine interface --------------------------------------------------
 
     def generate(self, dest, prompt, grid, seed, lyrics="", vocal_language="en",
-                 src_audio=None, report=None):
+                 src_audio=None, report=None, quality=None):
         params = {
             **self._grid_params(grid),
+            **self._quality_params(quality),
             "task_type": "cover" if src_audio else "text2music",
             "prompt": prompt,
             "lyrics": lyrics or None,
             "vocal_language": vocal_language,
-            "seed": seed,
+            **_seed_params(seed),
         }
         return self._run(params, dest, src_audio, report)
 
     def layer(self, dest, track_class, src_audio, prompt, grid, seed,
-              lyrics="", vocal_language="en", report=None):
+              lyrics="", vocal_language="en", report=None, quality=None):
         params = {
             **self._grid_params(grid),
+            **self._quality_params(quality),
             "task_type": "lego",
             "track_name": track_class,
             "prompt": prompt,
             "lyrics": lyrics or None,
             "vocal_language": vocal_language,
-            "seed": seed,
+            **_seed_params(seed),
         }
         return self._run(params, dest, src_audio, report)
 
-    def repaint(self, dest, src_audio, start_s, end_s, prompt, grid, seed, report=None):
+    def repaint(self, dest, src_audio, start_s, end_s, prompt, grid, seed,
+                report=None, quality=None):
         params = {
             **self._grid_params(grid),
+            **self._quality_params(quality),
             "task_type": "repaint",
             "prompt": prompt,
             "repainting_start": round(start_s, 3),
             "repainting_end": round(end_s, 3),
             "chunk_mask_mode": "explicit",
-            "seed": seed,
+            **_seed_params(seed),
         }
         return self._run(params, dest, src_audio, report)
 
-    def extend(self, dest, src_audio, added_s, prompt, grid, seed, report=None):
+    def extend(self, dest, src_audio, added_s, prompt, grid, seed, report=None,
+               quality=None):
         params = {
             **self._grid_params(grid),
+            **self._quality_params(quality),
             "task_type": "complete",
             "prompt": prompt,
             "audio_duration": round(grid.duration_s + added_s, 3),
-            "seed": seed,
+            **_seed_params(seed),
         }
         return self._run(params, dest, src_audio, report)
 
@@ -287,7 +336,7 @@ class AceStepEngine:
             **self._grid_params(grid),
             "task_type": "extract",
             "track_name": track_class,
-            "seed": seed,
+            **_seed_params(seed),
         }
         return self._run(params, dest, src_audio, report)
 

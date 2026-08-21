@@ -33,6 +33,11 @@ def _seed(explicit: int | None = None) -> int:
     return explicit if explicit is not None else random.randint(1, 2_000_000_000)
 
 
+def _quality(project: Project) -> dict:
+    """Only the real engine takes a quality tier; the stub has no such notion."""
+    return {"quality": project.quality} if engines.music().name == "acestep" else {}
+
+
 def _verify(path: Path, grid: Grid, auto_nudge: bool = True) -> SyncReport:
     """Beat-check a generated stem and correct small, consistent latency.
 
@@ -72,16 +77,18 @@ def generate_variations(project: Project, count: int, report=None) -> list[dict]
     not the default -- we say so in the prompt and withhold lyrics.
     """
     engine = engines.music()
-    prompt = presets.compose_prompt(project.prompt, project.style)
-    lyrics = "" if project.instrumental else project.lyrics
+    lyrics = (project.lyrics or "").strip()
+
+    # ACE-Step reads "[instrumental]" in the LYRICS field as the instruction to
+    # leave vocals out -- that is the documented control, not prompt wording.
     if project.instrumental:
-        if "instrumental" not in prompt.lower():
-            prompt = f"{prompt}, instrumental, no vocals".lstrip(", ")
-    elif not lyrics.strip():
-        # Empty lyrics alone yield an instrumental -- ACE-Step has nothing to
-        # sing. Ask for vocals in the prompt so its songwriter supplies words.
-        if "vocal" not in prompt.lower() and "sung" not in prompt.lower():
-            prompt = f"{prompt}, with lead vocals, sung".lstrip(", ")
+        lyrics = "[instrumental]"
+    prompt = presets.build_prompt(
+        project.prompt, project.style,
+        instrumental=project.instrumental,
+        want_vocals=not project.instrumental and not lyrics,
+        bpm=project.grid.bpm,
+    )
     src = _abs(project, project.source_audio) if project.source_audio else None
 
     out_dir = storage.project_dir(project.id) / "variations"
@@ -95,7 +102,7 @@ def generate_variations(project: Project, count: int, report=None) -> list[dict]
         dest = out_dir / f"var_{i + 1}_{seed}.wav"
         engine.generate(dest, prompt=prompt, grid=project.grid, seed=seed,
                         lyrics=lyrics, vocal_language=project.vocal_language,
-                        src_audio=src)
+                        src_audio=src, **_quality(project))
         variation = Variation(seed=seed, audio=_rel(project, dest), prompt=prompt)
         project.variations.append(variation)
         made.append(variation.model_dump())
@@ -259,7 +266,8 @@ def repaint_stem(project: Project, stem: Stem, start_bar: int, end_bar: int,
         report(0.15, f"repainting bars {start_bar}-{end_bar}")
 
     engines.music().repaint(dest, src, start_s, end_s,
-                            prompt or stem.prompt, project.grid, seed)
+                            prompt or stem.prompt, project.grid, seed,
+                            **_quality(project))
 
     # Prove the untouched region really was untouched, rather than trusting it.
     outside_residual = _outside_residual(src, dest, start_s, end_s)
@@ -310,7 +318,8 @@ def extend_stem(project: Project, stem: Stem, bars: int,
         report(0.15, f"extending by {bars} bars")
 
     engines.music().extend(dest, _abs(project, stem.version.audio), added_s,
-                           prompt or stem.prompt, project.grid, seed)
+                           prompt or stem.prompt, project.grid, seed,
+                           **_quality(project))
 
     version = stem.add(StemVersion(
         audio=_rel(project, dest), op="extend",
@@ -342,7 +351,7 @@ def vary_stem(project: Project, stem: Stem, seed: int | None = None,
     engines.music().layer(dest, stem.track_class, context,
                           prompt or stem.prompt, project.grid, seed,
                           lyrics=project.lyrics if stem.track_class == "vocals" else "",
-                          vocal_language=project.vocal_language)
+                          vocal_language=project.vocal_language, **_quality(project))
 
     version = stem.add(StemVersion(
         audio=_rel(project, dest), op="vary",
@@ -374,16 +383,17 @@ def add_layer(project: Project, track_class: str, prompt: str = "",
     if report:
         report(0.25, f"generating {track_class}")
 
-    composed = presets.compose_prompt(prompt or project.prompt, project.style)
+    composed = presets.build_prompt(prompt or project.prompt, project.style,
+                                    bpm=project.grid.bpm)
     engine = engines.music()
     if context is None:
         engine.generate(dest, composed, project.grid, seed,
                         lyrics=project.lyrics if track_class == "vocals" else "",
-                        vocal_language=project.vocal_language)
+                        vocal_language=project.vocal_language, **_quality(project))
     else:
         engine.layer(dest, track_class, context, composed, project.grid, seed,
                      lyrics=project.lyrics if track_class == "vocals" else "",
-                     vocal_language=project.vocal_language)
+                     vocal_language=project.vocal_language, **_quality(project))
 
     stem.add(StemVersion(
         audio=_rel(project, dest), op="generate",

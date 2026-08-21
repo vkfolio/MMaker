@@ -1,7 +1,9 @@
-"""Style presets -- prompt templates, our code rather than a model feature.
+"""Style presets and prompt construction.
 
-Kept as data so they can be edited without touching the engine, and so the UI
-can show the same list it sends.
+ACE-Step reads the prompt as a tag list, not prose. Its guidance: 3-7 tags,
+ordered genre/era, then instruments, then mood, then tempo -- and never mix
+contradictory descriptors, which produce muddled output. Presets are therefore
+stored as ordered tag groups rather than sentences.
 """
 
 STYLES = [
@@ -27,6 +29,47 @@ SFX_PRESETS = [
 ]
 
 _BY_ID = {s["id"]: s for s in STYLES}
+
+# Tags beyond this many dilute the prompt rather than sharpen it.
+MAX_TAGS = 7
+
+
+def build_prompt(user_text: str, style_id: str = "", *, instrumental: bool = False,
+                 want_vocals: bool = False, bpm: int | None = None) -> str:
+    """Compose a tag list: style tags first, the user's words next, then tempo.
+
+    Order matters to the model (genre, instruments, mood, tempo) and the preset
+    tags are already written in that order, so the user's own words slot in
+    before the tempo tag rather than being appended at the end.
+    """
+    tags: list[str] = []
+
+    preset = _BY_ID.get(style_id)
+    if preset:
+        tags.extend(t.strip() for t in preset["prompt"].split(",") if t.strip())
+
+    for part in (user_text or "").split(","):
+        part = part.strip()
+        if part and part.lower() not in (t.lower() for t in tags):
+            tags.append(part)
+
+    # Vocal intent belongs in the tags; the lyrics field carries the words.
+    if instrumental:
+        if not any("instrumental" in t.lower() for t in tags):
+            tags.append("instrumental")
+    elif want_vocals:
+        if not any(("vocal" in t.lower() or "sung" in t.lower()) for t in tags):
+            tags.append("lead vocals")
+
+    if bpm and not any("bpm" in t.lower() for t in tags):
+        tags.append(f"{bpm} BPM")
+
+    return ", ".join(tags[:MAX_TAGS])
+
+
+def lyric_budget(duration_s: float) -> int:
+    """Roughly how many words fit. ACE-Step sings ~2.5 words per second."""
+    return max(8, int(duration_s * 2.5))
 
 
 def style(style_id):

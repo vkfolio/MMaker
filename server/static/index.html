@@ -368,7 +368,7 @@ section { margin-bottom: 30px; }
       <span class="hint">Describe it, or drop a MIDI file or a recording.</span>
     </div>
     <div class="panel idea">
-      <textarea id="prompt" placeholder="A slow indie soul groove — brushed drums, warm rhodes, room for a vocal."></textarea>
+      <textarea id="prompt" placeholder="indie folk, acoustic guitar, soft strings, warm, nostalgic — comma-separated tags work best, 3 to 7 of them"></textarea>
       <div class="idea-row" style="gap:14px">
         <div class="seg" role="group" aria-label="Vocals or instrumental">
           <button type="button" class="seg-btn" id="modeSong" aria-pressed="true">Song with vocals</button>
@@ -390,6 +390,14 @@ section { margin-bottom: 30px; }
           <input type="number" id="bars" value="32" min="1" max="512"></div>
         <div class="field"><label class="chan" for="takes">Takes</label>
           <input type="number" id="takes" value="4" min="1" max="8"></div>
+        <div class="field">
+          <label class="chan" for="quality">Quality</label>
+          <select id="quality" title="Bigger model and more diffusion steps take longer">
+            <option value="fast">Fast</option>
+            <option value="high" selected>High</option>
+            <option value="ultra">Ultra</option>
+          </select>
+        </div>
         <label class="drop" id="drop">
           Drop a file<input type="file" id="file" accept=".mid,.midi,audio/*" hidden>
         </label>
@@ -605,9 +613,19 @@ function setMode(instrumental) {
   $("#lyrics").hidden = instrumental;
   $("#modeHint").textContent = instrumental
     ? "No vocals. Add them later per stem if you change your mind."
-    : "Type lyrics for a sung track. Blank asks the model to write its own, "
-      + "which is less reliable.";
+    : lyricHint();
 }
+function lyricHint() {
+  const bars = +$("#bars").value || 32;
+  const bpm = +$("#bpm").value || 96;
+  const secs = bars * 4 * 60 / bpm;
+  const words = Math.max(8, Math.round(secs * 2.5));
+  return `About ${words} words fits ${Math.round(secs)}s. Short lines of 4-8 words sing best.`;
+}
+["#bars", "#bpm"].forEach(sel => $(sel).addEventListener("change", () => {
+  if (!state.instrumental) $("#modeHint").textContent = lyricHint();
+}));
+
 $("#modeSong").addEventListener("click", () => setMode(false));
 $("#modeInst").addEventListener("click", () => setMode(true));
 setMode(false);
@@ -629,6 +647,7 @@ $("#go").addEventListener("click", async () => {
       instrumental: !!state.instrumental,
       bpm: +$("#bpm").value, key_scale: $("#key").value,
       bars: +$("#bars").value, variations: +$("#takes").value,
+      quality: $("#quality").value,
     };
     const res = await post("/api/projects", body);
     state.project = res.project;

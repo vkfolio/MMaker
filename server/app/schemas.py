@@ -102,6 +102,7 @@ class Project(BaseModel):
     id: str = Field(default_factory=lambda: _id("prj"))
     title: str = "Untitled"
     instrumental: bool = False
+    quality: Literal["fast", "high", "ultra"] = "high"
     grid: Grid = Field(default_factory=Grid)
     idea_kind: IdeaKind = "prompt"
     prompt: str = ""
@@ -137,6 +138,7 @@ class CreateProject(BaseModel):
     lyrics: str = ""
     # ACE-Step sings by default; instrumental is the deliberate choice.
     instrumental: bool = False
+    quality: Literal["fast", "high", "ultra"] = "high"
     vocal_language: str = "en"
     bpm: int | None = None
     key_scale: str | None = None
