@@ -191,7 +191,8 @@ def add_layer(project_id: str, body: AddLayerRequest):
     job = jobs.queue.submit(
         "layer",
         lambda report: service.add_layer(
-            _get(project_id), body.track_class, body.prompt, body.seed, report),
+            _get(project_id), body.track_class, body.prompt, body.seed, report,
+            start_s=body.start_s, end_s=body.end_s),
         project_id=project_id,
     )
     return {"job": job.public()}

@@ -215,6 +215,10 @@ class AddLayerRequest(BaseModel):
     track_class: TrackClass
     prompt: str = ""
     seed: int | None = None
+    # Optional region. Without it the layer spans the whole arrangement, which
+    # is all the API could express before.
+    start_s: float | None = Field(None, ge=0)
+    end_s: float | None = Field(None, gt=0)
 
 
 class VocalRequest(BaseModel):
@@ -226,6 +230,9 @@ class VocalRequest(BaseModel):
 
 class VoiceRequest(BaseModel):
     voice_id: str
+    # Optional region: convert only part of a stem and splice it back.
+    start_s: float | None = Field(None, ge=0)
+    end_s: float | None = Field(None, gt=0)
 
 
 class MixState(BaseModel):

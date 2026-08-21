@@ -402,8 +402,14 @@ def vary_stem(project: Project, stem: Stem, seed: int | None = None,
 
 
 def add_layer(project: Project, track_class: str, prompt: str = "",
-              seed: int | None = None, report=None) -> dict:
-    """Generate a new stem that fits everything already in the project."""
+              seed: int | None = None, report=None,
+              start_s: float | None = None, end_s: float | None = None) -> dict:
+    """Generate a new stem that fits everything already in the project.
+
+    With a region, only that slice is generated and it is placed at the right
+    offset inside a silent bed, so a layer can answer "just here" rather than
+    always spanning the whole arrangement.
+    """
     _require_confirmed(project)
     seed = _seed(seed)
     stem = Stem(split_id=project.active_split or "",
@@ -417,6 +423,13 @@ def add_layer(project: Project, track_class: str, prompt: str = "",
         context = mixdown(project, storage.project_dir(project.id) / "_context.wav")
     except NotReady:
         context = None
+
+    region = None
+    if context is not None and start_s is not None and end_s is not None and end_s > start_s:
+        region = (float(start_s), float(end_s))
+        sliced = storage.project_dir(project.id) / "_context_region.wav"
+        audio.slice_seconds(context, sliced, region[0], region[1])
+        context = sliced
 
     dest = _next_path(project, stem, "layer")
     if report:
@@ -436,9 +449,16 @@ def add_layer(project: Project, track_class: str, prompt: str = "",
                      vocal_language=project.vocal_language,
                      report=report, **_quality(project))
 
+    if region is not None:
+        # Put the generated slice back where it belongs on the timeline.
+        placed = _next_path(project, stem, "placed")
+        audio.place(dest, placed, region[0], project.grid.duration_s)
+        dest = placed
+
     stem.add(StemVersion(
         audio=_rel(project, dest), op="generate",
-        params={"seed": seed, "prompt": composed, "track_class": track_class},
+        params={"seed": seed, "prompt": composed, "track_class": track_class,
+                **({"start_s": region[0], "end_s": region[1]} if region else {})},
         sync=_verify(dest, project.grid),
     ))
     project.stems.append(stem)
@@ -474,8 +494,9 @@ def generate_vocals(project: Project, lyrics: str | None = None,
     return stem.model_dump()
 
 
-def apply_voice(project: Project, stem: Stem, voice_id: str, report=None) -> dict:
-    """Convert a vocal stem onto a library voice."""
+def apply_voice(project: Project, stem: Stem, voice_id: str, report=None,
+                start_s: float | None = None, end_s: float | None = None) -> dict:
+    """Convert a vocal stem onto a library voice, optionally only a region."""
     reference = voices.reference_path(voice_id)
     if not reference:
         raise NotReady(f"no such voice: {voice_id}")
@@ -485,12 +506,23 @@ def apply_voice(project: Project, stem: Stem, voice_id: str, report=None) -> dic
     if report:
         report(0.3, "converting voice")
 
-    engines.voice().convert_voice(dest, src, reference)
+    region = None
+    if start_s is not None and end_s is not None and end_s > start_s:
+        region = (float(start_s), float(end_s))
+        piece = storage.project_dir(project.id) / "_voice_region.wav"
+        audio.slice_seconds(src, piece, region[0], region[1])
+        converted = storage.project_dir(project.id) / "_voice_converted.wav"
+        engines.voice().convert_voice(converted, piece, reference)
+        audio.splice(src, converted, dest, region[0], region[1])
+    else:
+        engines.voice().convert_voice(dest, src, reference)
 
     stem.voice_id = voice_id
     version = stem.add(StemVersion(
         audio=_rel(project, dest), op="voice",
-        params={"voice_id": voice_id, "label": (voices.get(voice_id) or {}).get("label")},
+        params={"voice_id": voice_id,
+                "label": (voices.get(voice_id) or {}).get("label"),
+                **({"start_s": region[0], "end_s": region[1]} if region else {})},
         sync=_verify(dest, project.grid, auto_nudge=False),
     ))
     storage.save(project)

@@ -186,5 +186,52 @@ def concat(paths, dest):
     return write(dest, np.vstack(parts), sr)
 
 
+def splice(base_path, patch_path, dest, start_s: float, end_s: float,
+           fade_ms: float = 10.0):
+    """Replace [start_s, end_s) of base with patch, crossfading both seams.
+
+    Region-limited tools regenerate only a slice; dropping it in raw leaves an
+    audible click at each boundary, so both edges are ramped.
+    """
+    base, sr = load(base_path)
+    patch, patch_sr = load(patch_path)
+    if patch_sr != sr:
+        patch = resample(patch, patch_sr, sr)
+
+    i0 = max(0, int(start_s * sr))
+    i1 = min(len(base), int(end_s * sr))
+    span = i1 - i0
+    if span <= 0:
+        return write(dest, base, sr)
+
+    width = base.shape[1]
+    if patch.shape[1] == 1 and width > 1:
+        patch = np.repeat(patch, width, axis=1)
+    patch = patch[:span, :width]
+    if len(patch) < span:
+        patch = np.vstack([patch, np.zeros((span - len(patch), width), np.float32)])
+
+    out = base.copy()
+    fade = min(int(sr * fade_ms / 1000.0), span // 2)
+    if fade > 0:
+        ramp = np.linspace(0, 1, fade, dtype=np.float32)[:, None]
+        patch[:fade] = patch[:fade] * ramp + out[i0:i0 + fade] * (1 - ramp)
+        patch[-fade:] = (patch[-fade:] * (1 - ramp)
+                         + out[i1 - fade:i1] * ramp)
+    out[i0:i1] = patch
+    return write(dest, out, sr)
+
+
+def place(patch_path, dest, start_s: float, total_s: float):
+    """Put a short clip at an offset inside a silent bed of total_s."""
+    patch, sr = load(patch_path)
+    out = np.zeros((int(total_s * sr), patch.shape[1]), dtype=np.float32)
+    i0 = max(0, int(start_s * sr))
+    n = min(len(patch), len(out) - i0)
+    if n > 0:
+        out[i0:i0 + n] = patch[:n]
+    return write(dest, out, sr)
+
+
 def silence(dest, duration_s: float, sr: int = 48000, channels: int = 2):
     return write(dest, np.zeros((int(duration_s * sr), channels), dtype=np.float32), sr)

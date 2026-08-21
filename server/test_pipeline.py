@@ -436,6 +436,56 @@ def test_add_layer_conditions_on_existing_stems():
     assert (storage.project_dir(pid) / stem["versions"][0]["audio"]).exists()
 
 
+def test_layer_can_target_a_region():
+    """A layer confined to bars 3-5 must be silent outside that window."""
+    import numpy as np
+    pid = make_project(bars=8)
+    split(pid)
+    grid = storage.load(pid).grid
+    start_s, end_s = grid.bar_to_seconds(3), grid.bar_to_seconds(5)
+
+    job = client.post(f"/api/projects/{pid}/layers",
+                      json={"track_class": "strings", "prompt": "pad",
+                            "start_s": start_s, "end_s": end_s}).json()["job"]
+    stem = wait_job(job["id"])["result"]
+    path = storage.project_dir(pid) / stem["versions"][0]["audio"]
+    data, sr = audio.load(path)
+
+    assert abs(len(data) / sr - grid.duration_s) < 0.2, "layer should span the grid"
+    inside = np.abs(data[int(start_s * sr):int(end_s * sr)]).max()
+    before = np.abs(data[:int(start_s * sr)]).max() if start_s > 0 else 0.0
+    assert inside > 0.05, "the targeted region should contain audio"
+    assert before < 1e-4, f"audio leaked before the region (peak {before})"
+
+
+def test_voice_can_target_a_region():
+    """Converting a region must leave the rest of the stem bit-identical."""
+    ref = write_wav(_TMP / "regionref.wav", seconds=3.0, freq=280)
+    with open(ref, "rb") as fh:
+        vid = client.post("/api/voices",
+                          files={"file": ("r.wav", fh, "audio/wav")},
+                          data={"label": "Region", "consent": "test"}).json()["voice"]["id"]
+
+    pid = make_project(bars=8)
+    stems = split(pid)
+    vocal = next(s for s in stems if s["track_class"] == "vocals")
+    before_path = storage.project_dir(pid) / vocal["versions"][0]["audio"]
+    before, sr = audio.load(before_path)
+
+    job = client.post(f"/api/projects/{pid}/stems/{vocal['id']}/voice",
+                      json={"voice_id": vid, "start_s": 4.0, "end_s": 8.0}).json()["job"]
+    version = wait_job(job["id"])["result"]
+    after, _ = audio.load(storage.project_dir(pid) / version["audio"])
+
+    import numpy as np
+    head = np.abs(before[:int(3.5 * sr)] - after[:int(3.5 * sr)]).max()
+    mid = np.abs(before[int(4.5 * sr):int(7.5 * sr)]
+                 - after[int(4.5 * sr):int(7.5 * sr)]).max()
+    assert head < 1e-4, f"audio outside the region changed (delta {head})"
+    assert mid > 1e-3, "the targeted region was not converted"
+    assert version["params"]["start_s"] == 4.0
+
+
 def test_delete_stem():
     pid = make_project()
     stems = split(pid)

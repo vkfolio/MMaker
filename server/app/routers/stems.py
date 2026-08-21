@@ -80,7 +80,8 @@ def voice(project_id: str, stem_id: str, body: VoiceRequest):
     def work(report):
         project = _get(project_id)
         return service.apply_voice(project, project.stem(stem_id),
-                                   body.voice_id, report)
+                                   body.voice_id, report,
+                                   start_s=body.start_s, end_s=body.end_s)
 
     return {"job": jobs.queue.submit("voice", work, project_id).public()}
 
