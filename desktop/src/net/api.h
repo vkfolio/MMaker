@@ -95,6 +95,29 @@ public:
     const std::string& last_error() const { return last_error_; }
 
     Health health();
+
+    /// Ad-hoc generation. Creates a scratch workspace on the pod and renders
+    /// into it.
+    ///
+    /// The pod needs somewhere to put the audio and something to hang stem ids
+    /// off, so a server-side project is unavoidable -- but it is scratch, not a
+    /// document. The user's project is the local .mmproj; this id is recorded as
+    /// provenance so later tools know where the audio came from, and is never
+    /// shown as something to browse.
+    struct Generated {
+        std::string project_id;
+        JobRef      job;
+        bool        ok = false;
+    };
+    Generated generate(const std::string& prompt, const std::string& lyrics,
+                       int bars, const std::string& quality,
+                       bool instrumental, double bpm,
+                       const std::string& idempotency_key = {});
+
+    /// Separate a rendered take into stems, so each part is editable.
+    std::optional<JobRef> split(const std::string& project_id,
+                                const std::string& variation_id,
+                                const std::string& tier = "basic");
     std::vector<ProjectSummary> projects();
     std::optional<ProjectDetail> project(const std::string& id);
 

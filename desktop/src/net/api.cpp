@@ -117,6 +117,55 @@ Health ApiClient::health() {
     return h;
 }
 
+ApiClient::Generated ApiClient::generate(const std::string& prompt,
+                                         const std::string& lyrics, int bars,
+                                         const std::string& quality,
+                                         bool instrumental, double bpm,
+                                         const std::string& idempotency_key) {
+    Generated out;
+    json body;
+    body["title"] = "scratch";
+    body["prompt"] = prompt;
+    body["bars"] = bars;
+    body["variations"] = 1;          // one take; more is the pod doing work we discard
+    body["quality"] = quality;
+    body["instrumental"] = instrumental;
+    if (bpm > 0) body["bpm"] = static_cast<int>(bpm);
+    // An empty lyrics field means instrumental regardless of the flag, so it is
+    // only sent when there is something to sing.
+    if (!lyrics.empty()) body["lyrics"] = lyrics;
+
+    const Response r = http_.post(url("/api/projects"), body.dump(), idempotency_key);
+    auto parsed = parse(r, last_error_);
+    if (!parsed) return out;
+
+    if (auto p = parsed->find("project"); p != parsed->end() && p->is_object())
+        out.project_id = field<std::string>(*p, "id", "");
+    if (auto j = parsed->find("job"); j != parsed->end() && j->is_object())
+        out.job = read_job(*j);
+    out.ok = !out.project_id.empty() && !out.job.id.empty();
+    if (!out.ok) last_error_ = "the pod accepted the request but named no project";
+    return out;
+}
+
+std::optional<JobRef> ApiClient::split(const std::string& project_id,
+                                       const std::string& variation_id,
+                                       const std::string& tier) {
+    json body;
+    body["variation_id"] = variation_id;
+    body["tier"] = tier;
+    const Response r = http_.post(
+        url("/api/projects/" + url_escape(project_id) + "/split"), body.dump());
+    auto parsed = parse(r, last_error_);
+    if (!parsed) return std::nullopt;
+    auto it = parsed->find("job");
+    if (it == parsed->end() || !it->is_object()) {
+        last_error_ = "split accepted but no job returned";
+        return std::nullopt;
+    }
+    return read_job(*it);
+}
+
 std::vector<ProjectSummary> ApiClient::projects() {
     std::vector<ProjectSummary> out;
     const Response r = http_.get(url("/api/projects"));

@@ -239,6 +239,12 @@ struct Studio {
     bool                  dirty = false;
     bool                  show_settings = false;
     bool                  show_layers = false;
+    bool                  show_generate = false;
+    std::string           gen_prompt = "warm indie soul, brushed drums, rhodes";
+    std::string           gen_lyrics;
+    std::string           gen_quality = "ultra";
+    int                   gen_bars = 16;
+    bool                  gen_instrumental = false;
     std::string           doc_status;
 
     std::string pod_url;
@@ -276,6 +282,7 @@ struct Studio {
     bool   regen_done = false;
     double cancel_after = -1.0;   // scripted cancel, for testing the path
     std::string scripted_layer;   // scripted add-a-layer, likewise
+    std::string scripted_prompt;  // scripted generate, likewise
 
     // -- content ------------------------------------------------------------
 
@@ -480,13 +487,12 @@ struct Studio {
                 wake_ui(platform);
                 return;
             }
-            auto list = api.projects();
-            if (list.empty() && !api.last_error().empty()) {
-                g_inbox.push(MsgStatus{api.last_error(), true});
-                wake_ui(platform);
-                return;
-            }
-            g_inbox.push(MsgProjects{std::move(list)});
+            // Reachability, not an inventory. Listing the pod's projects would
+            // be asking a generation service what work exists, which is the
+            // question the local document answers.
+            std::string note = health.ready ? "ready" : health.status;
+            if (!health.gpu.empty()) note += " · " + health.gpu;
+            g_inbox.push(MsgStatus{note, false});
             wake_ui(platform);
         }).detach();
     }
@@ -700,6 +706,130 @@ struct Studio {
         "drums", "bass", "guitar", "keyboard", "strings", "synth",
         "brass", "woodwinds", "percussion", "fx", "backing_vocals", "vocals",
     };
+
+    /// Ad-hoc generation: describe something, get stems on the timeline.
+    ///
+    /// The pod is a generation service here, not a place work lives. It needs a
+    /// workspace to hang audio and stem ids off, so one is created per request
+    /// and kept only as provenance -- the local document is the project, and
+    /// nothing in the UI ever offers the pod's projects as things to open.
+    void generate(const std::string& prompt, vik::App& app) {
+        if (net_busy || pod_url.empty() || prompt.empty()) return;
+
+        net_busy = true;
+        net_error = false;
+        net_status = "generating…";
+        show_generate = false;
+
+        auto* platform = &app.platform();
+        std::thread([url = pod_url, token = pod_token, prompt,
+                     lyrics = gen_lyrics, bars = gen_bars, quality = gen_quality,
+                     instrumental = gen_instrumental, bpm = session.bpm,
+                     rate = session.rate, platform] {
+            WorkerScope scope;
+            mx::net::ApiClient api;
+            api.set_base(url);
+            api.set_token(token);
+
+            auto made = api.generate(prompt, lyrics, bars, quality, instrumental, bpm);
+            if (!made.ok) {
+                g_inbox.push(MsgStatus{"generate refused: " + api.last_error(), true});
+                wake_ui(platform);
+                return;
+            }
+            g_inbox.push(MsgJob{made.job.id, "generate", made.job.status,
+                                made.job.message, made.job.queue_position, false});
+            wake_ui(platform);
+
+            auto finished = api.follow(made.job.id, [&](const mx::net::JobRef& j) {
+                g_inbox.push(MsgJob{j.id, "generate", j.status, j.message,
+                                    j.queue_position, false});
+                wake_ui(platform);
+                return true;
+            });
+            g_inbox.push(MsgJob{finished.id, "generate", finished.status,
+                                finished.message, 0, true});
+            wake_ui(platform);
+            if (finished.status != "done") {
+                g_inbox.push(MsgStatus{"generate " + finished.status +
+                    (finished.error.empty() ? "" : ": " + finished.error),
+                    finished.status != "cancelled"});
+                wake_ui(platform);
+                return;
+            }
+
+            auto detail = api.project(made.project_id);
+            if (!detail || detail->variations.empty()) {
+                g_inbox.push(MsgStatus{"rendered, but no take came back", true});
+                wake_ui(platform);
+                return;
+            }
+
+            // Split it, because a single mixed take is not editable. This is the
+            // step that makes the result parts rather than a bounce.
+            auto split = api.split(made.project_id, detail->variations.front().id,
+                                   "basic");
+            if (split) {
+                g_inbox.push(MsgJob{split->id, "split", split->status,
+                                    split->message, split->queue_position, false});
+                wake_ui(platform);
+                auto done = api.follow(split->id, [&](const mx::net::JobRef& j) {
+                    g_inbox.push(MsgJob{j.id, "split", j.status, j.message,
+                                        j.queue_position, false});
+                    wake_ui(platform);
+                    return true;
+                });
+                g_inbox.push(MsgJob{done.id, "split", done.status, done.message,
+                                    0, true});
+                wake_ui(platform);
+                detail = api.project(made.project_id);
+            }
+
+            g_inbox.push(MsgProjectOpened{made.project_id, "Untitled",
+                                          detail ? detail->summary.bpm : 120.0,
+                                          detail ? detail->summary.bars : 32,
+                                          detail ? static_cast<int>(detail->stems.size())
+                                                 : 0});
+            wake_ui(platform);
+
+            // Stems if the split produced any, otherwise the take itself, so a
+            // failed split still leaves something to listen to.
+            int ordinal = 0;
+            if (detail && !detail->stems.empty()) {
+                for (const auto& stem : detail->stems) {
+                    const auto* version = stem.version();
+                    if (!version || version->audio.empty()) continue;
+                    const uint64_t key = mx::net::cache_key(made.project_id,
+                                                            version->id, version->audio);
+                    const auto cached = mx::net::cache_path(key);
+                    const bool hit = std::filesystem::exists(cached);
+                    if (!hit && !api.fetch_audio(made.project_id, version->audio,
+                                                 cached.string()))
+                        continue;
+                    mx::Media media = mx::decode_file(cached, rate);
+                    if (!media.ok()) continue;
+                    g_inbox.push(MsgStemArrived{
+                        stem.label.empty() ? stem.track_class : stem.label,
+                        stem.id, version->id, ordinal++, std::move(media), 0.0, hit});
+                    wake_ui(platform);
+                }
+            } else if (detail) {
+                const auto& take = detail->variations.front();
+                const uint64_t key = mx::net::cache_key(made.project_id, take.id,
+                                                        take.audio);
+                const auto cached = mx::net::cache_path(key);
+                if (std::filesystem::exists(cached) ||
+                    api.fetch_audio(made.project_id, take.audio, cached.string())) {
+                    mx::Media media = mx::decode_file(cached, rate);
+                    if (media.ok())
+                        g_inbox.push(MsgStemArrived{"take", "", take.id, 0,
+                                                    std::move(media), 0.0, false});
+                }
+            }
+            g_inbox.push(MsgStatus{"", false});
+            wake_ui(platform);
+        }).detach();
+    }
 
     /// Generate a new part against what the project already has.
     ///
@@ -947,7 +1077,10 @@ struct Studio {
                 } else if constexpr (std::is_same_v<T, MsgStemArrived>) {
                     place_stem(m);
                     last_decode_ms = m.fetch_ms;
-                    if (selftest && !scripted_layer.empty() && regen_fired)
+                    if (selftest && regen_fired &&
+                        (!scripted_layer.empty() ||
+                         (!scripted_prompt.empty() && stems_arrived >= stems_expected &&
+                          stems_expected > 0)))
                         regen_done = true;
                     net_status = "loaded " + std::to_string(stems_arrived) + "/" +
                                  std::to_string(std::max(stems_expected, stems_arrived));
@@ -1074,11 +1207,233 @@ struct Studio {
     }
 
     vik::AnyElement render(vik::Window&, vik::Context<Studio>& cx);
+    vik::AnyElement generate_modal(vik::Context<Studio>& cx);
+    vik::AnyElement layer_modal(vik::Context<Studio>& cx);
+    vik::AnyElement settings_modal(vik::Context<Studio>& cx);
 };
 
 // ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
+
+/// The generate modal, as its own function rather than another branch inside
+/// render().
+///
+/// Not a style choice. MSVC reserves frame space for the temporaries in every
+/// branch of a function, taken or not, and render() had grown large enough that
+/// adding this block overflowed the stack on the first draw -- a crash before
+/// anything appeared, in a modal that was not even open. Each panel owning its
+/// own frame keeps that from being a lurking limit.
+/// The instrument picker, in its own frame. See generate_modal for why.
+/// Connection settings, in its own frame. See generate_modal for why.
+vik::AnyElement Studio::settings_modal(vik::Context<Studio>& cx) {
+    auto icon_button = [&cx](const char* id, const char* icon, bool active, auto fn) {
+        return vik::div().id(id).px_3().py_2().rounded_md()
+            .flex_row().items_center().justify_center()
+            .bg(active ? vik::rgb(0x3a4a68) : vik::rgb(0x21252f))
+            .border_1().border_color(vik::rgb(0x3b4250))
+            .cursor_pointer()
+            .on_click(cx.listener(fn))
+            .child(vik::ui::phosphor(icon, vik::ui::PhWeight::Fill)
+                       .size(16.0f).color(vik::rgb(0xc9cedb)));
+    };
+
+        // Connection only. Nothing here lists the pod's projects: the pod
+        // generates audio on request, and the project is the local document.
+        // Offering its scratch workspaces as things to open is what made it
+        // look like a document store.
+        return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
+            .flex_row().items_center().justify_center()
+            .bg(vik::rgba(0x00000099))
+            .child(vik::div().flex_col().gap_3().p_4().w_px(460.0f)
+                .rounded_lg().bg(vik::rgb(0x232834))
+                .border_1().border_color(vik::rgb(0x3b4250))
+                .child(vik::div().flex_row().items_center().justify_between()
+                    .child(vik::text("Settings").text_xl().text_color(vik::white()))
+                    .child(icon_button("close", "x", false,
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) {
+                            s.show_settings = false;
+                            c.notify();
+                        })))
+                .child(vik::text("Render pod").text_xs().text_color(vik::rgb(0x8d94a3)))
+                .child(vik::text(pod_url.empty() ? "not configured" : pod_url)
+                           .text_color(vik::rgb(0xc9cedb)))
+                .child(vik::text(pod_token.empty()
+                           ? "no token stored"
+                           : "token stored (encrypted for this Windows account)")
+                           .text_xs().text_color(vik::rgb(0x6c7383)))
+                .child(vik::text(net_status).text_xs()
+                           .text_color(vik::rgb(net_error ? 0xe05c72 : 0x8d94a3)))
+                .child(vik::div().flex_row().items_center().gap_2()
+                    .child(icon_button("s-conn", "plugs-connected", false,
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) { s.connect(c.app()); c.notify(); }))
+                    .child(vik::text("Test the connection")
+                               .text_xs().text_color(vik::rgb(0x8d94a3)))))
+            .into_any();
+    }
+
+vik::AnyElement Studio::layer_modal(vik::Context<Studio>& cx) {
+    auto icon_button = [&cx](const char* id, const char* icon, bool active, auto fn) {
+        return vik::div().id(id).px_3().py_2().rounded_md()
+            .flex_row().items_center().justify_center()
+            .bg(active ? vik::rgb(0x3a4a68) : vik::rgb(0x21252f))
+            .border_1().border_color(vik::rgb(0x3b4250))
+            .cursor_pointer()
+            .on_click(cx.listener(fn))
+            .child(vik::ui::phosphor(icon, vik::ui::PhWeight::Fill)
+                       .size(16.0f).color(vik::rgb(0xc9cedb)));
+    };
+
+        auto chips = vik::div().flex_row().wrap().gap_2();
+        for (const char* name : kTrackClasses) {
+            chips = std::move(chips).child(
+                vik::div().id("chip").px_3().py_2().rounded_md().cursor_pointer()
+                    .bg(vik::rgb(0x2c313d))
+                    .border_1().border_color(vik::rgb(0x3b4250))
+                    .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x3a4a68)); })
+                    .on_click(cx.listener([name](Studio& s, const vik::ClickEvent&,
+                                                 vik::Window&,
+                                                 vik::Context<Studio>& c) {
+                        s.add_layer(name, c.app());
+                        c.notify();
+                    }))
+                    .child(vik::text(name).text_color(vik::rgb(0xe6e8ec))));
+        }
+
+        return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
+            .flex_row().items_center().justify_center()
+            .bg(vik::rgba(0x00000099))
+            .child(vik::div().flex_col().gap_3().p_4().w_px(480.0f)
+                .rounded_lg().bg(vik::rgb(0x232834))
+                .border_1().border_color(vik::rgb(0x3b4250))
+                .child(vik::div().flex_row().items_center().justify_between()
+                    .child(vik::text("Add a Layer").text_xl().text_color(vik::white()))
+                    .child(icon_button("lclose", "x", false,
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) {
+                            s.show_layers = false;
+                            c.notify();
+                        })))
+                // Say what it will act on. A tool whose scope is invisible is a
+                // tool people use once and then stop trusting.
+                .child(vik::text(selection.active()
+                        ? std::format("Over the selection, {:.2f}-{:.2f}s",
+                                      static_cast<double>(selection.begin()) / session.rate,
+                                      static_cast<double>(selection.end()) / session.rate)
+                        : std::string("Over the whole arrangement "
+                                      "-- shift-drag a range first to narrow it"))
+                    .text_xs().text_color(vik::rgb(0x8d94a3)))
+                .child(std::move(chips)))
+            .into_any();
+    }
+
+vik::AnyElement Studio::generate_modal(vik::Context<Studio>& cx) {
+    auto icon_button = [&cx](const char* id, const char* icon, bool active, auto fn) {
+        return vik::div().id(id).px_3().py_2().rounded_md()
+            .flex_row().items_center().justify_center()
+            .bg(active ? vik::rgb(0x3a4a68) : vik::rgb(0x21252f))
+            .border_1().border_color(vik::rgb(0x3b4250))
+            .cursor_pointer()
+            .hover([](vik::StyleRefinement& s) { s.bg(vik::rgb(0x2c313d)); })
+            .on_click(cx.listener(fn))
+            .child(vik::ui::phosphor(icon, vik::ui::PhWeight::Fill)
+                       .size(16.0f)
+                       .color(active ? vik::rgb(0xffffff) : vik::rgb(0xc9cedb)));
+    };
+
+        auto chip = [&cx](const char* label, bool on, auto fn) {
+            return vik::div().id("c").px_3().py_1().rounded_md().cursor_pointer()
+                .bg(vik::rgb(on ? 0x3a4a68 : 0x2c313d))
+                .on_click(cx.listener(fn))
+                .child(vik::text(label).text_color(vik::rgb(on ? 0xffffff : 0x8d94a3)));
+    };
+
+    return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
+            .flex_row().items_center().justify_center()
+            .bg(vik::rgba(0x000000aa))
+            .child(vik::div().flex_col().gap_3().p_4().w_px(560.0f)
+                .rounded_lg().bg(vik::rgb(0x232834))
+                .border_1().border_color(vik::rgb(0x3b4250))
+                .child(vik::div().flex_row().items_center().justify_between()
+                    .child(vik::text("Generate").text_xl().text_color(vik::white()))
+                    .child(icon_button("gclose", "x", false,
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) {
+                            s.show_generate = false;
+                            c.notify();
+                        })))
+                // Tags, because that is what the model reads: prose gets
+                // averaged into nothing, and three to seven tags is the
+                // documented sweet spot.
+                .child(vik::text("Style tags -- genre, instruments, mood, tempo")
+                           .text_xs().text_color(vik::rgb(0x8d94a3)))
+                .child(vik::div().flex_row().wrap().gap_2()
+                    .child(chip("warm indie soul", gen_prompt == "warm indie soul, brushed drums, rhodes",
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) {
+                            s.gen_prompt = "warm indie soul, brushed drums, rhodes";
+                            c.notify();
+                        }))
+                    .child(chip("cinematic strings", gen_prompt == "cinematic strings, timpani, epic, slow",
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) {
+                            s.gen_prompt = "cinematic strings, timpani, epic, slow";
+                            c.notify();
+                        }))
+                    .child(chip("lofi hip hop", gen_prompt == "lofi hip hop, dusty rhodes, vinyl, 80 bpm",
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) {
+                            s.gen_prompt = "lofi hip hop, dusty rhodes, vinyl, 80 bpm";
+                            c.notify();
+                        }))
+                    .child(chip("kids lullaby", gen_prompt == "children's lullaby, music box, celesta, gentle",
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) {
+                            s.gen_prompt = "children's lullaby, music box, celesta, gentle";
+                            c.notify();
+                        })))
+                .child(vik::text(gen_prompt.empty() ? "(pick a style)" : gen_prompt)
+                           .text_color(vik::rgb(0xc9cedb)))
+                .child(vik::div().flex_row().gap_2().items_center()
+                    .child(vik::text("quality").text_xs().text_color(vik::rgb(0x6c7383)))
+                    .child(chip("fast", gen_quality == "fast",
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) { s.gen_quality = "fast"; c.notify(); }))
+                    .child(chip("high", gen_quality == "high",
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) { s.gen_quality = "high"; c.notify(); }))
+                    .child(chip("ultra", gen_quality == "ultra",
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) { s.gen_quality = "ultra"; c.notify(); })))
+                .child(vik::div().flex_row().gap_2().items_center()
+                    .child(vik::text("length").text_xs().text_color(vik::rgb(0x6c7383)))
+                    .child(chip("8 bars", gen_bars == 8,
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) { s.gen_bars = 8; c.notify(); }))
+                    .child(chip("16 bars", gen_bars == 16,
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) { s.gen_bars = 16; c.notify(); }))
+                    .child(chip("32 bars", gen_bars == 32,
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) { s.gen_bars = 32; c.notify(); })))
+                .child(vik::div().flex_row().items_center().gap_3()
+                    .child(vik::div().id("go").px_4().py_2().rounded_md().cursor_pointer()
+                        .bg(vik::rgb(0x3a4a68))
+                        .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x4a5f86)); })
+                        .on_click(cx.listener([](Studio& s, const vik::ClickEvent&,
+                                                 vik::Window&,
+                                                 vik::Context<Studio>& c) {
+                            s.generate(s.gen_prompt, c.app());
+                            c.notify();
+                        }))
+                        .child(vik::text("Generate").text_color(vik::white())))
+                    .child(vik::text("Renders on the pod, then splits into stems "
+                                     "so each part is editable.")
+                        .text_xs().text_color(vik::rgb(0x565c6b)))))
+            .into_any();
+}
 
 vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
     auto* self = this;
@@ -1281,7 +1636,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                             s.cancel_job(id, c.app());
                             c.notify();
                         }))
-                        .child(vik::text(job.cancelling ? "stopping…" : "Cancel")
+                        .child(vik::text(job.cancelling ? "stoppingâ€¦" : "Cancel")
                                    .text_xs().text_color(vik::rgb(0xe6e8ec)))));
         }
         job_strip = vik::div().absolute().bottom(72.0f).left(0.0f).right(0.0f)
@@ -1317,6 +1672,15 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
         .child(vik::div().flex_row().items_center().gap_1().px_2().py_1()
             .rounded_lg().bg(vik::rgb(0x232834))
             .border_1().border_color(vik::rgb(0x3b4250))
+            .child(tool("t-gen", "sparkle",
+                        pod_url.empty() ? "Set a pod first (gear, bottom left)"
+                                        : "Generate  (G)",
+                        !pod_url.empty() && !net_busy,
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) {
+                            s.show_generate = true;
+                            c.notify();
+                        }))
             .child(tool("t-mic", "microphone-stage", "Record a voice take (not yet)",
                         false, [](Studio&, const vik::ClickEvent&, vik::Window&,
                                   vik::Context<Studio>&) {}))
@@ -1324,7 +1688,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                         [](Studio&, const vik::ClickEvent&, vik::Window&,
                            vik::Context<Studio>&) {}))
             .child(divider())
-            .child(tool("t-regen", "sparkle",
+            .child(tool("t-regen", "arrows-clockwise",
                         armed ? "Regenerate the selection  (R)"
                               : "Select a range on a pod track first",
                         armed,
@@ -1528,116 +1892,12 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
 
     vik::AnyElement overlay = vik::div().into_any();
 
-    // --- add a layer: instrument chips -------------------------------------
-    if (show_layers) {
-        auto chips = vik::div().flex_row().wrap().gap_2();
-        for (const char* name : kTrackClasses) {
-            chips = std::move(chips).child(
-                vik::div().id("chip").px_3().py_2().rounded_md().cursor_pointer()
-                    .bg(vik::rgb(0x2c313d))
-                    .border_1().border_color(vik::rgb(0x3b4250))
-                    .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x3a4a68)); })
-                    .on_click(cx.listener([name](Studio& s, const vik::ClickEvent&,
-                                                 vik::Window&,
-                                                 vik::Context<Studio>& c) {
-                        s.add_layer(name, c.app());
-                        c.notify();
-                    }))
-                    .child(vik::text(name).text_color(vik::rgb(0xe6e8ec))));
-        }
+    if (show_generate) overlay = generate_modal(cx);
 
-        overlay = vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
-            .flex_row().items_center().justify_center()
-            .bg(vik::rgba(0x00000099))
-            .child(vik::div().flex_col().gap_3().p_4().w_px(480.0f)
-                .rounded_lg().bg(vik::rgb(0x232834))
-                .border_1().border_color(vik::rgb(0x3b4250))
-                .child(vik::div().flex_row().items_center().justify_between()
-                    .child(vik::text("Add a Layer").text_xl().text_color(vik::white()))
-                    .child(icon_button("lclose", "x", false,
-                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                           vik::Context<Studio>& c) {
-                            s.show_layers = false;
-                            c.notify();
-                        })))
-                // Say what it will act on. A tool whose scope is invisible is a
-                // tool people use once and then stop trusting.
-                .child(vik::text(selection.active()
-                        ? std::format("Over the selection, {:.2f}-{:.2f}s",
-                                      static_cast<double>(selection.begin()) / session.rate,
-                                      static_cast<double>(selection.end()) / session.rate)
-                        : std::string("Over the whole arrangement "
-                                      "-- shift-drag a range first to narrow it"))
-                    .text_xs().text_color(vik::rgb(0x8d94a3)))
-                .child(std::move(chips)))
-            .into_any();
-    }
+    if (show_layers) overlay = layer_modal(cx);
 
-    // --- settings: the pod, and importing from it --------------------------
-    // A modal over the canvas, like the reference's tool dialogs. Importing is
-    // deliberately here rather than in the main navigation: pulling stems from
-    // a pod project is something you do once to start a local project, not the
-    // way you open your work.
-    if (show_settings && !show_layers) {
-        auto card = vik::div().flex_col().gap_3().p_4().w_px(460.0f)
-            .rounded_lg().bg(vik::rgb(0x232834))
-            .border_1().border_color(vik::rgb(0x3b4250))
-            .child(vik::div().flex_row().items_center().justify_between()
-                .child(vik::text("Settings").text_xl().text_color(vik::white()))
-                .child(icon_button("close", "x", false,
-                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                       vik::Context<Studio>& c) {
-                        s.show_settings = false;
-                        c.notify();
-                    })))
-            .child(vik::text("Render pod").text_xs().text_color(vik::rgb(0x8d94a3)))
-            .child(vik::text(pod_url.empty() ? "not configured" : pod_url)
-                       .text_color(vik::rgb(0xc9cedb)))
-            .child(vik::text(pod_token.empty()
-                       ? "no token stored"
-                       : "token stored (encrypted for this Windows account)")
-                       .text_xs().text_color(vik::rgb(0x6c7383)))
-            .child(vik::text(net_status).text_xs()
-                       .text_color(vik::rgb(net_error ? 0xe05c72 : 0x8d94a3)))
-            .child(vik::div().flex_row().gap_2()
-                .child(icon_button("s-conn", "plugs-connected", false,
-                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                       vik::Context<Studio>& c) { s.connect(c.app()); c.notify(); }))
-                .child(vik::text(projects.empty()
-                           ? "Connect to list pod projects"
-                           : std::to_string(projects.size()) +
-                             " pod projects -- pick one to import its stems")
-                           .text_xs().text_color(vik::rgb(0x8d94a3))));
-
-        // Import list: a pod project becomes a *new local project* whose audio
-        // is fetched once and then belongs to the document.
-        auto imports = vik::div().flex_col().max_h(220.0f).overflow_hidden();
-        const size_t shown = std::min<size_t>(projects.size(), 8);
-        for (size_t i = 0; i < shown; ++i) {
-            const auto& proj = projects[i];
-            imports = std::move(imports).child(
-                vik::div().id("imp").px_3().py_1().rounded_md().cursor_pointer()
-                    .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x2c3446)); })
-                    .on_click(cx.listener([id = proj.id](Studio& s,
-                                                          const vik::ClickEvent&,
-                                                          vik::Window&,
-                                                          vik::Context<Studio>& c) {
-                        s.open_project(id, c.app());
-                        s.show_settings = false;
-                        s.dirty = true;      // imported, not yet saved anywhere
-                        c.notify();
-                    }))
-                    .child(vik::text(proj.title.substr(0, 34))
-                               .text_color(vik::rgb(0xc9cedb))));
-        }
-        if (!projects.empty()) card = std::move(card).child(std::move(imports));
-
-        overlay = vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
-            .flex_row().items_center().justify_center()
-            .bg(vik::rgba(0x00000099))
-            .child(std::move(card))
-            .into_any();
-    }
+    if (show_settings && !show_layers && !show_generate)
+        overlay = settings_modal(cx);
 
     return vik::div().size_full().flex_col().relative().bg(vik::rgb(0x14161d))
         .on_key_down(cx.listener(
@@ -1646,6 +1906,8 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 if (e.key == "space") s.toggle_play();
                 else if (e.key == "r") s.regenerate(c.app());
                 else if (e.key == "e") s.export_mix();
+                else if (e.key == "g" && !s.pod_url.empty())
+                    s.show_generate = !s.show_generate;
                 else if (e.key == "l" && !s.open_project_id.empty())
                     s.show_layers = !s.show_layers;
                 else if (e.key == "escape") s.selection.clear();
@@ -1916,6 +2178,7 @@ int main(int argc, char** argv) {
     bool doctest = false;
     double cancel_after = -1.0;
     std::string layer_class;
+    std::string gen_prompt;
     double regen_from = -1.0, regen_to = -1.0;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
@@ -1929,6 +2192,7 @@ int main(int argc, char** argv) {
         else if (arg == "--cancel-after" && i + 1 < argc)
             cancel_after = std::stod(argv[++i]);
         else if (arg == "--layer" && i + 1 < argc) layer_class = argv[++i];
+        else if (arg == "--generate" && i + 1 < argc) gen_prompt = argv[++i];
         else if (arg == "--regen" && i + 1 < argc) {
             const std::string spec = argv[++i];
             const size_t colon = spec.find(':');
@@ -1955,6 +2219,13 @@ int main(int argc, char** argv) {
         app.open_window(
             vik::WindowOptions{.title = "musicX Studio", .size = {1200.0f, 720.0f}},
             [&](vik::Window&, vik::App& app) {
+                // Created before the entity that stores it, not inside its
+                // update: making an entity while another is being updated
+                // re-enters entity storage, and the Studio& held across that
+                // call does not survive it. The symptom was a crash at startup,
+                // before anything drew.
+                // BISECT: state creation disabled
+
                 auto handle = app.add_entity<Studio>();
                 app.update_entity(handle, [&](Studio& s, vik::Context<Studio>& c) {
                     s.selftest = selftest;
@@ -1972,6 +2243,7 @@ int main(int argc, char** argv) {
                     s.regen_to = regen_to;
                     s.cancel_after = cancel_after;
                     s.scripted_layer = layer_class;
+                    s.scripted_prompt = gen_prompt;
                     // The device decides the rate; the session follows it,
                     // because everything decoded is resampled to it once.
                     if (g_device.running()) s.session.rate = g_device.rate();
@@ -1996,6 +2268,14 @@ int main(int argc, char** argv) {
                 app.set_interval(std::chrono::milliseconds(16), [handle](vik::App& a) {
                     a.update_entity(handle, [](Studio& s, vik::Context<Studio>& c) {
                         const bool landed = s.pump();
+
+                        if (!s.scripted_prompt.empty() && !s.regen_fired &&
+                            !s.net_busy) {
+                            s.regen_fired = true;
+                            std::printf("GENERATE %s\n", s.scripted_prompt.c_str());
+                            std::fflush(stdout);
+                            s.generate(s.scripted_prompt, c.app());
+                        }
 
                         if (!s.scripted_layer.empty() && !s.regen_fired &&
                             !s.net_busy && s.stems_arrived > 0) {
