@@ -35,6 +35,21 @@ add_library(mx_audio STATIC
 )
 target_include_directories(mx_audio PUBLIC src third_party)
 
+# --- the app --------------------------------------------------------------
+add_executable(musicx
+    src/app_main.cpp
+    src/audio/device.cpp
+    src/media/decode.cpp
+    src/media/peaks.cpp
+    src/ui/arrangement.cpp
+    src/miniaudio_impl.c
+)
+target_include_directories(musicx PRIVATE src third_party)
+target_link_libraries(musicx PRIVATE mx_audio vik_components)
+if(WIN32)
+    target_link_libraries(musicx PRIVATE ole32 winmm)
+endif()
+
 # --- the gate: audio correctness under editing ---------------------------
 add_executable(mixer_test tests/mixer_test.cpp)
 target_link_libraries(mixer_test PRIVATE mx_audio)
