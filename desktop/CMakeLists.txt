@@ -39,6 +39,7 @@ target_include_directories(mx_audio PUBLIC src third_party)
 add_executable(musicx
     src/app_main.cpp
     src/audio/device.cpp
+    src/media/bounce.cpp
     src/media/decode.cpp
     src/media/peaks.cpp
     src/ui/arrangement.cpp

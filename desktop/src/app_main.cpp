@@ -29,6 +29,7 @@
 
 #include "audio/device.h"
 #include "audio/mixer.h"
+#include "media/bounce.h"
 #include "media/decode.h"
 #include "session.h"
 #include "ui/arrangement.h"
@@ -575,6 +576,46 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
 
 }  // namespace
 
+/// Loads a folder into a session on this thread.
+///
+/// Shared by --render and --bounce. Both are headless, so there is no UI to
+/// keep responsive and no reason for the worker dance the window path needs.
+bool load_synchronously(Studio& studio, const fs::path& folder) {
+    if (folder.empty()) { studio.build_demo(); return true; }
+
+    std::vector<fs::path> files;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(folder, ec)) {
+        if (!e.is_regular_file()) continue;
+        auto ext = e.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext == ".wav" || ext == ".mp3" || ext == ".flac") files.push_back(e.path());
+    }
+    std::sort(files.begin(), files.end());
+    if (files.empty()) { studio.build_demo(); return true; }
+
+    static const uint32_t colors[] = {0xff4f8ef7, 0xffe0813c, 0xff56c08a,
+                                      0xffc169d6, 0xffe05c72, 0xff40b8c4,
+                                      0xffd9b23c, 0xff7f8cf0};
+    int n = 0;
+    for (const auto& f : files) {
+        mx::Media media = mx::decode_file(f, studio.session.rate);
+        if (!media.ok()) {
+            std::printf("  skip: %s\n", media.error.c_str());
+            continue;
+        }
+        auto& track = studio.session.add_track(f.stem().string(),
+                                               colors[n % std::size(colors)]);
+        auto& src = studio.session.add_source(f, f.stem().string());
+        src.buffer = media.buffer;
+        src.peaks  = std::move(media.peaks);
+        auto& clip = studio.session.add_clip(track.id, src.id, 0, src.buffer->frames);
+        clip.name = f.stem().string();
+        ++n;
+    }
+    return n > 0;
+}
+
 /// Draws the arrangement to a PNG with no window involved.
 ///
 /// Capturing a real window turns out to be unreliable to automate -- focus does
@@ -585,42 +626,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
 int render_png(const fs::path& folder, const fs::path& out, int w, int h) {
     Studio studio;
     studio.session.rate = 48000;
-
-    if (folder.empty()) {
-        studio.build_demo();
-    } else {
-        // Synchronous: there is no UI here to keep responsive.
-        std::vector<fs::path> files;
-        std::error_code ec;
-        for (const auto& e : fs::directory_iterator(folder, ec)) {
-            if (!e.is_regular_file()) continue;
-            auto ext = e.path().extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            if (ext == ".wav" || ext == ".mp3" || ext == ".flac") files.push_back(e.path());
-        }
-        std::sort(files.begin(), files.end());
-        if (files.empty()) studio.build_demo();
-
-        static const uint32_t colors[] = {0xff4f8ef7, 0xffe0813c, 0xff56c08a,
-                                          0xffc169d6, 0xffe05c72, 0xff40b8c4,
-                                          0xffd9b23c, 0xff7f8cf0};
-        int n = 0;
-        for (const auto& f : files) {
-            mx::Media media = mx::decode_file(f, studio.session.rate);
-            if (!media.ok()) {
-                std::printf("  skip: %s\n", media.error.c_str());
-                continue;
-            }
-            auto& track = studio.session.add_track(f.stem().string(),
-                                                   colors[n % std::size(colors)]);
-            auto& src = studio.session.add_source(f, f.stem().string());
-            src.buffer = media.buffer;
-            src.peaks  = std::move(media.peaks);
-            auto& clip = studio.session.add_clip(track.id, src.id, 0, src.buffer->frames);
-            clip.name = f.stem().string();
-            ++n;
-        }
-    }
+    if (!load_synchronously(studio, folder)) return 1;
 
     const float timeline_w = static_cast<float>(w) - 160.0f;
     studio.view.frames_per_pixel =
@@ -657,18 +663,43 @@ int render_png(const fs::path& folder, const fs::path& out, int w, int h) {
     return 0;
 }
 
+/// Load a folder and mix it straight to a file. No window, no device.
+int bounce_offline(const fs::path& folder, const fs::path& out) {
+    Studio studio;
+    studio.session.rate = 48000;
+    if (!load_synchronously(studio, folder)) return 1;
+
+    const auto r = mx::bounce(studio.session, out);
+    if (!r.ok) {
+        std::printf("bounce failed: %s\n", r.error.c_str());
+        return 1;
+    }
+    std::printf("bounced %s\n", out.string().c_str());
+    std::printf("  %.2fs of audio from %zu clips on %zu tracks\n",
+                r.seconds, studio.session.clips.size(), studio.session.tracks.size());
+    std::printf("  %.0f ms to render -- %.1fx faster than real time\n",
+                r.render_ms, r.realtime_ratio);
+    std::printf("  peak %.3f (%.1f dBFS)%s\n", r.peak,
+                20.0 * std::log10(std::max(1e-9f, r.peak)),
+                r.clipped ? "  CLIPPED" : "");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     fs::path folder;
     fs::path render_to;
+    fs::path bounce_to;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--selftest") selftest = true;
         else if (arg == "--render" && i + 1 < argc) render_to = argv[++i];
+        else if (arg == "--bounce" && i + 1 < argc) bounce_to = argv[++i];
         else folder = arg;
     }
 
     if (!render_to.empty()) return render_png(folder, render_to, 1600, 900);
+    if (!bounce_to.empty()) return bounce_offline(folder, bounce_to);
 
     if (!g_device.start(g_mixer, 48000))
         std::printf("audio: %s\n", g_device.error().c_str());

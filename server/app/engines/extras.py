@@ -37,7 +37,6 @@ class DemucsEngine:
         try:
             import torch
             from demucs.apply import apply_model
-            from demucs.audio import save_audio
             from demucs.pretrained import get_model
         except ImportError as exc:
             raise EngineError(
@@ -55,6 +54,23 @@ class DemucsEngine:
         model.to(device).eval()
 
         data, sr = au.load(src_audio)
+
+        # Demucs models are trained at their own rate (44.1 kHz for htdemucs)
+        # while ACE-Step renders 48 kHz, so the two have to be reconciled
+        # somewhere. Doing it here, explicitly, in both directions:
+        #   in  -- give the model the rate it expects;
+        #   out -- give the project back the rate everything else uses.
+        #
+        # What this replaces was worse than a missing resample. The audio went
+        # in at 48 kHz untouched and the result was saved declaring
+        # model.samplerate, so the samples were 48 kHz and the header said
+        # 44.1 kHz. Nothing errors on that; it just makes those stems read
+        # 8.8% long, drifting against any stem written by another path. The
+        # null test caught it as a mix that would not cancel.
+        model_sr = int(model.samplerate)
+        if sr != model_sr:
+            data = au.resample(data, sr, model_sr)
+
         wav = torch.from_numpy(data.T).float()
         if wav.shape[0] == 1:
             wav = wav.repeat(2, 1)
@@ -68,7 +84,12 @@ class DemucsEngine:
         result = {}
         for name, source in zip(model.sources, sources):
             path = out_dir / f"{name}.wav"
-            save_audio(source.cpu(), str(path), model.samplerate)
+            stem = source.cpu().numpy().T          # [samples, channels]
+            if sr != model_sr:
+                stem = au.resample(stem, model_sr, sr)
+            # Written at the project's rate, with a header that says so, so the
+            # stems line up with the variation they came from.
+            au.write(path, stem, sr)
             result[name] = path
         return result
 

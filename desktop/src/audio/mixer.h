@@ -31,6 +31,17 @@ class Mixer {
 public:
     void prepare(uint32_t sample_rate, uint32_t channels);
 
+    /// Put the mixer into offline mode for a bounce.
+    ///
+    /// The gain ramps exist to hide discontinuities that a listener would hear.
+    /// A file has no such moment: fading in over the first 5 ms would just be a
+    /// defect baked into the export. So the master starts at full level and the
+    /// clip smoothers start settled, while everything else -- the graph, the
+    /// mixing, the fades, the per-clip crossfades -- stays exactly the code that
+    /// runs in real time. That sameness is the point: a bounce that used its own
+    /// mixing path would not prove anything about the one people hear.
+    void begin_offline();
+
     /// Called from the UI thread. Takes ownership of the graph; it is freed
     /// only once the audio thread can no longer be looking at it.
     void publish(std::unique_ptr<PlaybackGraph> graph);
@@ -110,6 +121,7 @@ private:
     float last_out_[kDeclickChannels]{};
     float declick_[kDeclickChannels]{};
     float declick_gain_ = 0.0f;
+    bool  offline_ = false;
 
     static constexpr int kClipSlots = 2048;   // power of two
     std::vector<ClipState> clip_states_;

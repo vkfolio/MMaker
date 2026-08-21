@@ -32,6 +32,14 @@ void Mixer::prepare(uint32_t sample_rate, uint32_t channels) {
     std::fill(std::begin(declick_), std::end(declick_), 0.0f);
 }
 
+void Mixer::begin_offline() {
+    offline_ = true;
+    master_gain_ = 1.0f;
+    declick_gain_ = 0.0f;
+    played_.store(0, std::memory_order_relaxed);
+    for (auto& st : clip_states_) st = ClipState{};
+}
+
 Mixer::ClipState& Mixer::clip_state(ClipId id) noexcept {
     // Open addressing over a preallocated table: no allocation on the RT
     // thread, and a bounded probe. A collision degrades to a shared smoother,
@@ -179,8 +187,9 @@ void Mixer::process(float* out, int64_t frames) noexcept {
             st.last_start  = clip.start_frame;
             st.last_offset = clip.source_offset;
 
-            if (jumped) arm_declick();
-            if (jumped || !st.was_on) st.gain = 0.0f;
+            if (jumped && !offline_) arm_declick();
+            if (!offline_ && (jumped || !st.was_on)) st.gain = 0.0f;
+            if (offline_) st.gain = target_gain;   // settled: nothing to hide
             st.was_on = true;
 
             const float pan  = track->pan;
@@ -239,7 +248,12 @@ void Mixer::process(float* out, int64_t frames) noexcept {
             float v = out[i * ch + c] * master_gain_;
             if (declick_gain_ > 0.0f && c < kDeclickChannels)
                 v += declick_[c] * declick_gain_;
-            v = std::clamp(v, -1.0f, 1.0f);
+            // Clamp for the device, never for a bounce. A sound card cannot
+            // accept more than full scale, so clipping there is the least-bad
+            // option -- but a float file can hold it, and clamping an export
+            // throws away headroom the user may still want to recover. The
+            // null test found this by clipping on a three-stem sum.
+            if (!offline_) v = std::clamp(v, -1.0f, 1.0f);
             out[i * ch + c] = v;
             if (c < kDeclickChannels) last_out_[c] = v;
             block_peak = std::max(block_peak, std::abs(v));
