@@ -40,6 +40,7 @@ add_executable(musicx
     src/app_main.cpp
     src/audio/device.cpp
     src/media/bounce.cpp
+    src/app/crash.cpp
     src/app/document.cpp
     src/app/settings.cpp
     src/net/api.cpp
@@ -56,7 +57,22 @@ find_package(nlohmann_json CONFIG REQUIRED)
 target_link_libraries(musicx PRIVATE mx_audio vik_components
                       CURL::libcurl nlohmann_json::nlohmann_json)
 if(WIN32)
-    target_link_libraries(musicx PRIVATE ole32 winmm crypt32)
+    target_link_libraries(musicx PRIVATE ole32 winmm crypt32 dbghelp)
+
+    # 8 MB of stack instead of the 1 MB default.
+    #
+    # A declarative UI builds its tree out of temporaries, and MSVC reserves
+    # frame space for every branch of a function whether it runs or not. render()
+    # plus an open modal was enough to overflow 1 MB, which shows up as
+    # STATUS_FATAL_USER_CALLBACK_EXCEPTION -- a crash with no stack, inside a
+    # panel that may not even be visible. Splitting functions helped and did not
+    # remove the ceiling; this does, and costs nothing but address space.
+    target_link_options(musicx PRIVATE /STACK:8388608)
+
+    # Symbols in Release. A crash log full of raw addresses names
+    # nothing, and /DEBUG costs only a .pdb beside the exe.
+    target_compile_options(musicx PRIVATE $<$<CONFIG:Release>:/Zi>)
+    target_link_options(musicx PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
 endif()
 
 # --- the gate: audio correctness under editing ---------------------------

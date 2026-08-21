@@ -33,6 +33,7 @@
 #include "media/bounce.h"
 #include "net/api.h"
 #include "net/cache.h"
+#include "app/crash.h"
 #include "app/document.h"
 #include "app/settings.h"
 #include "media/decode.h"
@@ -275,6 +276,7 @@ struct Studio {
 
     bool selftest = false;
     int  reports  = 0;
+    int  stress_tick = 0;
     // Drives the select-and-regenerate loop without a mouse, so the milestone
     // is checkable from a terminal rather than only by hand.
     double regen_from = -1.0, regen_to = -1.0;
@@ -283,6 +285,7 @@ struct Studio {
     double cancel_after = -1.0;   // scripted cancel, for testing the path
     std::string scripted_layer;   // scripted add-a-layer, likewise
     std::string scripted_prompt;  // scripted generate, likewise
+    bool        stress = false;   // cycle panels hard, to shake out frame limits
 
     // -- content ------------------------------------------------------------
 
@@ -2170,6 +2173,8 @@ int document_roundtrip(const fs::path& folder) {
 }
 
 int main(int argc, char** argv) {
+    mx::install_crash_handler();
+
     fs::path folder;
     fs::path render_to;
     fs::path bounce_to;
@@ -2179,6 +2184,8 @@ int main(int argc, char** argv) {
     double cancel_after = -1.0;
     std::string layer_class;
     std::string gen_prompt;
+    std::string open_panel;
+    bool stress = false;
     double regen_from = -1.0, regen_to = -1.0;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
@@ -2193,6 +2200,8 @@ int main(int argc, char** argv) {
             cancel_after = std::stod(argv[++i]);
         else if (arg == "--layer" && i + 1 < argc) layer_class = argv[++i];
         else if (arg == "--generate" && i + 1 < argc) gen_prompt = argv[++i];
+        else if (arg == "--open" && i + 1 < argc) open_panel = argv[++i];
+        else if (arg == "--stress") stress = true;
         else if (arg == "--regen" && i + 1 < argc) {
             const std::string spec = argv[++i];
             const size_t colon = spec.find(':');
@@ -2244,6 +2253,13 @@ int main(int argc, char** argv) {
                     s.cancel_after = cancel_after;
                     s.scripted_layer = layer_class;
                     s.scripted_prompt = gen_prompt;
+                    // Open a panel at startup so every one of them is drawn at
+                    // least once in a scripted run. A modal that only renders
+                    // when a human clicks it is a modal nothing tests.
+                    s.show_generate = (open_panel == "generate");
+                    s.show_layers   = (open_panel == "layers");
+                    s.show_settings = (open_panel == "settings");
+                    s.stress = stress;
                     // The device decides the rate; the session follows it,
                     // because everything decoded is resampled to it once.
                     if (g_device.running()) s.session.rate = g_device.rate();
@@ -2316,6 +2332,26 @@ int main(int argc, char** argv) {
                                 std::fflush(stdout);
                                 s.cancel_job(s.jobs.front().id, c.app());
                             }
+                        }
+
+                        // Cycle every panel and both selection states as fast
+                        // as the app will draw them. The crash that prompted
+                        // this appeared only after minutes of clicking, so the
+                        // test has to click.
+                        if (s.stress) {
+                            ++s.stress_tick;
+                            const int phase = (s.stress_tick / 7) % 5;
+                            s.show_generate = (phase == 1);
+                            s.show_layers   = (phase == 2);
+                            s.show_settings = (phase == 3);
+                            if (phase == 4 && !s.session.tracks.empty()) {
+                                s.selection.track = s.session.tracks.front().id;
+                                s.selection.from = 0;
+                                s.selection.to = s.session.rate * 2;
+                            } else if (phase == 0) {
+                                s.selection.clear();
+                            }
+                            c.notify();
                         }
 
                         const bool rolling = g_mixer.transport.playing.load();
