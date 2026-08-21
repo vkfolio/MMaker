@@ -41,6 +41,7 @@ add_executable(musicx
     src/audio/device.cpp
     src/media/bounce.cpp
     src/net/api.cpp
+    src/net/cache.cpp
     src/net/http.cpp
     src/media/decode.cpp
     src/media/peaks.cpp

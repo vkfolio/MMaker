@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <format>
 #include <mutex>
+#include <variant>
 #include <numbers>
 #include <string>
 #include <thread>
@@ -31,6 +32,7 @@
 #include "audio/mixer.h"
 #include "media/bounce.h"
 #include "net/api.h"
+#include "net/cache.h"
 #include "media/decode.h"
 #include "session.h"
 #include "ui/arrangement.h"
@@ -56,29 +58,64 @@ namespace {
 /// Deliberately not std::function<void(App&)>. A callable is exactly the type
 /// that lets a worker capture and refcount a Handle<T>, which would defeat the
 /// rule that workers never touch an entity. A variant cannot smuggle one.
-struct DecodedMessage {
+struct MsgDecoded {
     mx::SourceId source_id = 0;
     mx::Media    media;
     double       decode_ms = 0.0;
 };
 
+struct MsgProjects {
+    std::vector<mx::net::ProjectSummary> list;
+};
+
+struct MsgProjectOpened {
+    std::string id;
+    std::string title;
+    double      bpm = 120.0;
+    int         bars = 32;
+    int         stems = 0;
+};
+
+/// One stem, downloaded and decoded, ready for the UI to place.
+///
+/// It carries a label and an ordinal rather than ids: ids are handed out on the
+/// UI thread, and a worker inventing one would be inventing an identity the
+/// session has not agreed to.
+struct MsgStemArrived {
+    std::string label;
+    std::string stem_id;
+    std::string version_id;
+    int         ordinal = 0;
+    mx::Media   media;
+    double      fetch_ms = 0.0;
+    bool        from_cache = false;
+};
+
+struct MsgStatus {
+    std::string text;
+    bool        error = false;
+};
+
+using UiMessage = std::variant<MsgDecoded, MsgProjects, MsgProjectOpened,
+                               MsgStemArrived, MsgStatus>;
+
 class Inbox {
 public:
-    void push(DecodedMessage m) {
+    void push(UiMessage m) {
         std::lock_guard lock(mutex_);
         queue_.push_back(std::move(m));
     }
-    std::vector<DecodedMessage> drain() {
+    std::vector<UiMessage> drain() {
         std::lock_guard lock(mutex_);
-        std::vector<DecodedMessage> out(std::make_move_iterator(queue_.begin()),
-                                        std::make_move_iterator(queue_.end()));
+        std::vector<UiMessage> out(std::make_move_iterator(queue_.begin()),
+                                   std::make_move_iterator(queue_.end()));
         queue_.clear();
         return out;
     }
 
 private:
-    std::mutex                 mutex_;
-    std::deque<DecodedMessage> queue_;
+    std::mutex             mutex_;
+    std::deque<UiMessage>  queue_;
 };
 
 Inbox      g_inbox;
@@ -142,6 +179,18 @@ struct Studio {
 
     bool  fitted      = false;
     float timeline_px = 1100.0f;   // last measured canvas width
+
+    // --- network ------------------------------------------------------------
+    std::string pod_url;
+    std::string pod_token;
+    std::string net_status = "not connected";
+    bool        net_busy = false;
+    bool        net_error = false;
+    std::vector<mx::net::ProjectSummary> projects;
+    std::string open_project_id;
+    int         stems_expected = 0;
+    int         stems_arrived = 0;
+    int         cache_hits = 0;
 
     bool selftest = false;
     int  reports  = 0;
@@ -242,7 +291,7 @@ struct Studio {
             const auto t0 = std::chrono::steady_clock::now();
             mx::Media media = mx::decode_file(file, rate);
             const auto t1 = std::chrono::steady_clock::now();
-            g_inbox.push(DecodedMessage{
+            g_inbox.push(MsgDecoded{
                 id, std::move(media),
                 std::chrono::duration<double, std::milli>(t1 - t0).count()});
             // Without this the UI can sit in SDL_WaitEventTimeout until the
@@ -251,40 +300,220 @@ struct Studio {
         }).detach();
     }
 
+    /// Connect and list what is on the pod. Runs on a worker.
+    void connect(vik::App& app) {
+        if (net_busy || pod_url.empty()) return;
+        net_busy = true;
+        net_status = "connecting…";
+        net_error = false;
+        auto* platform = &app.platform();
+        std::thread([url = pod_url, token = pod_token, platform] {
+            mx::net::ApiClient api;
+            api.set_base(url);
+            api.set_token(token);
+            const auto health = api.health();
+            if (!health.reachable) {
+                g_inbox.push(MsgStatus{"cannot reach the pod: " + api.last_error(), true});
+                platform->wake();
+                return;
+            }
+            auto list = api.projects();
+            if (list.empty() && !api.last_error().empty()) {
+                g_inbox.push(MsgStatus{api.last_error(), true});
+                platform->wake();
+                return;
+            }
+            g_inbox.push(MsgProjects{std::move(list)});
+            platform->wake();
+        }).detach();
+    }
+
+    /// Open a project: fetch its stems, decode them, stream them in.
+    ///
+    /// Each stem is reported the moment it is ready rather than waiting for the
+    /// set, so a slow one does not hold up the rest -- and crucially the whole
+    /// unit of work (download, decode, build the pyramid) finishes on the
+    /// worker before anything is reported done. Reporting earlier would move
+    /// the decode onto the UI thread, which is where dropped frames come from.
+    void open_project(const std::string& id, vik::App& app) {
+        if (net_busy) return;
+        net_busy = true;
+        net_error = false;
+        net_status = "opening…";
+        stems_expected = stems_arrived = cache_hits = 0;
+        auto* platform = &app.platform();
+        const uint32_t rate = session.rate;
+
+        std::thread([url = pod_url, token = pod_token, id, rate, platform] {
+            mx::net::ApiClient api;
+            api.set_base(url);
+            api.set_token(token);
+
+            auto detail = api.project(id);
+            if (!detail) {
+                g_inbox.push(MsgStatus{"cannot open project: " + api.last_error(), true});
+                platform->wake();
+                return;
+            }
+            g_inbox.push(MsgProjectOpened{detail->summary.id, detail->summary.title,
+                                          detail->summary.bpm, detail->summary.bars,
+                                          static_cast<int>(detail->stems.size())});
+            platform->wake();
+
+            int ordinal = 0;
+            for (const auto& stem : detail->stems) {
+                const auto* version = stem.version();
+                if (!version || version->audio.empty()) continue;
+
+                const auto t0 = std::chrono::steady_clock::now();
+                const uint64_t key = mx::net::cache_key(detail->summary.id,
+                                                        version->id, version->audio);
+                const auto cached = mx::net::cache_path(key);
+                bool hit = std::filesystem::exists(cached);
+
+                if (!hit &&
+                    !api.fetch_audio(detail->summary.id, version->audio,
+                                     cached.string())) {
+                    g_inbox.push(MsgStatus{stem.track_class + ": " + api.last_error(), true});
+                    platform->wake();
+                    continue;
+                }
+
+                mx::Media media = mx::decode_file(cached, rate);
+                if (!media.ok()) {
+                    // A cached file that will not decode is a poisoned cache
+                    // entry, not a permanent failure. Drop it so the next
+                    // attempt refetches instead of failing forever.
+                    std::error_code ec;
+                    std::filesystem::remove(cached, ec);
+                    g_inbox.push(MsgStatus{stem.track_class + ": " + media.error, true});
+                    platform->wake();
+                    continue;
+                }
+
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                g_inbox.push(MsgStemArrived{
+                    stem.label.empty() ? stem.track_class : stem.label,
+                    stem.id, version->id, ordinal++, std::move(media), ms, hit});
+                platform->wake();
+            }
+            g_inbox.push(MsgStatus{"", false});
+            platform->wake();
+        }).detach();
+    }
+
+    /// Places a stem that a worker finished. Ids are minted here, on the UI
+    /// thread, which is the only place they may be.
+    void place_stem(MsgStemArrived& msg) {
+        static const uint32_t colors[] = {0xff4f8ef7, 0xffe0813c, 0xff56c08a,
+                                          0xffc169d6, 0xffe05c72, 0xff40b8c4,
+                                          0xffd9b23c, 0xff7f8cf0};
+        auto& track = session.add_track(msg.label,
+                                        colors[msg.ordinal % std::size(colors)]);
+        auto& source = session.add_source({}, msg.label);
+        source.buffer = msg.media.buffer;
+        source.peaks = std::move(msg.media.peaks);
+        source.source_rate = msg.media.source_rate;
+        // Provenance, not a mirror: enough to fetch this audio again and to say
+        // where it came from. No copy of the server's project.
+        source.project_id = open_project_id;
+        source.stem_id = msg.stem_id;
+        source.version_id = msg.version_id;
+
+        auto& clip = session.add_clip(track.id, source.id, 0, source.buffer->frames);
+        clip.name = msg.label;
+        clip.fade_in = clip.fade_out = session.rate / 200;
+
+        ++stems_arrived;
+        if (msg.from_cache) ++cache_hits;
+        ++loaded_sources;
+    }
+
     /// Everything a worker produced is applied here, on the UI thread.
     bool pump() {
         bool changed = false;
-        for (auto& msg : g_inbox.drain()) {
-            --g_pending;
-            last_decode_ms = msg.decode_ms;
-            mx::Source* src = session.find_source(msg.source_id);
-            if (!src) continue;
-            if (!msg.media.ok()) {
-                std::printf("decode failed: %s\n", msg.media.error.c_str());
-                continue;
-            }
-            src->buffer      = msg.media.buffer;
-            src->peaks       = std::move(msg.media.peaks);
-            src->source_rate = msg.media.source_rate;
+        for (auto& message : g_inbox.drain()) {
+            std::visit([&](auto& m) {
+                using T = std::decay_t<decltype(m)>;
 
-            // Stems from one render are aligned, so they all start at zero.
-            mx::TrackId track = 0;
-            for (size_t i = 0; i < session.sources.size(); ++i)
-                if (session.sources[i].id == msg.source_id && i < session.tracks.size())
-                    track = session.tracks[i].id;
-            if (track) {
-                auto& clip = session.add_clip(track, src->id, 0, src->buffer->frames);
-                clip.name = src->label;
-                clip.fade_in = clip.fade_out = session.rate / 200;
-            }
-            ++loaded_sources;
-            changed = true;
+                if constexpr (std::is_same_v<T, MsgDecoded>) {
+                    --g_pending;
+                    last_decode_ms = m.decode_ms;
+                    mx::Source* src = session.find_source(m.source_id);
+                    if (!src) return;
+                    if (!m.media.ok()) {
+                        std::printf("decode failed: %s\n", m.media.error.c_str());
+                        return;
+                    }
+                    src->buffer = m.media.buffer;
+                    src->peaks = std::move(m.media.peaks);
+                    src->source_rate = m.media.source_rate;
+
+                    mx::TrackId track = 0;
+                    for (size_t i = 0; i < session.sources.size(); ++i)
+                        if (session.sources[i].id == m.source_id &&
+                            i < session.tracks.size())
+                            track = session.tracks[i].id;
+                    if (track) {
+                        auto& clip = session.add_clip(track, src->id, 0,
+                                                      src->buffer->frames);
+                        clip.name = src->label;
+                        clip.fade_in = clip.fade_out = session.rate / 200;
+                    }
+                    ++loaded_sources;
+                    changed = true;
+
+                } else if constexpr (std::is_same_v<T, MsgProjects>) {
+                    projects = std::move(m.list);
+                    net_busy = false;
+                    net_error = false;
+                    net_status = std::to_string(projects.size()) + " projects";
+
+                } else if constexpr (std::is_same_v<T, MsgProjectOpened>) {
+                    // A fresh project replaces the arrangement rather than
+                    // adding to it: two projects share no timeline, and merging
+                    // them silently would be a worse surprise than clearing.
+                    session.tracks.clear();
+                    session.clips.clear();
+                    session.sources.clear();
+                    loaded_sources = 0;
+                    fitted = false;
+                    open_project_id = m.id;
+                    session.title = m.title;
+                    session.bpm = m.bpm;
+                    stems_expected = m.stems;
+                    net_status = m.stems > 0
+                        ? ("loading " + std::to_string(m.stems) + " stems…")
+                        : "no stems -- split a take on the pod first";
+                    changed = true;
+
+                } else if constexpr (std::is_same_v<T, MsgStemArrived>) {
+                    place_stem(m);
+                    last_decode_ms = m.fetch_ms;
+                    net_status = "loaded " + std::to_string(stems_arrived) + "/" +
+                                 std::to_string(std::max(stems_expected, stems_arrived));
+                    changed = true;
+
+                } else if constexpr (std::is_same_v<T, MsgStatus>) {
+                    net_busy = false;
+                    if (!m.text.empty()) {
+                        net_status = m.text;
+                        net_error = m.error;
+                    } else if (stems_arrived > 0) {
+                        net_status = std::to_string(stems_arrived) + " stems" +
+                                     (cache_hits ? " (" + std::to_string(cache_hits) +
+                                                   " cached)" : "");
+                    }
+                }
+            }, message);
         }
+
         if (changed) {
             session.loop_end = session.length_frames();
             // Fit on the first content to arrive. Re-fitting on every later
-            // decode would yank the view out from under someone who had
-            // already started navigating.
+            // stem would yank the view out from under someone who had already
+            // started navigating.
             if (!fitted && session.length_frames() > 0) {
                 view.frames_per_pixel = mx::View::fit(session.length_frames(), timeline_px);
                 fitted = true;
@@ -329,14 +558,15 @@ struct Studio {
         std::printf(
             "STUDIO device=%s rate=%u latency_ms=%.1f | sources=%d pending=%d "
             "decode_ms=%.0f | tracks=%zu clips=%zu | playhead=%.2fs xruns=%u "
-            "| paint_ms=%.2f (build %.2f skia %.2f) worst=%.2f frames=%d columns=%lld\n",
+            "| net=%s stems=%d/%d cached=%d | paint_ms=%.2f (build %.2f skia %.2f) worst=%.2f frames=%d columns=%lld\n",
             g_device.running() ? g_device.backend().c_str() : "NONE",
             g_device.rate(), 1000.0 * g_device.latency_frames() /
                 std::max(1u, g_device.rate()),
             loaded_sources, g_pending.load(), last_decode_ms,
             session.tracks.size(), session.clips.size(),
             static_cast<double>(playhead()) / std::max(1u, session.rate),
-            g_mixer.xruns(), last_paint_ms, build_ms, submit_ms, worst_paint_ms, frames,
+            g_mixer.xruns(), net_status.c_str(), stems_arrived, stems_expected,
+            cache_hits, last_paint_ms, build_ms, submit_ms, worst_paint_ms, frames,
             static_cast<long long>(columns));
         std::fflush(stdout);
     }
@@ -556,6 +786,63 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     c.notify();
                 }));
 
+    // --- pod sidebar: real elements, because it is chrome ------------------
+    auto row = [](std::string label, std::string value, uint32_t tint) {
+        return vik::div().flex_col().gap_1().px_3().py_2()
+            .child(vik::text(std::move(label)).text_xs().text_color(vik::rgb(0x6c7383)))
+            .child(vik::text(std::move(value)).text_color(vik::rgb(tint)));
+    };
+
+    auto sidebar = vik::div().flex_col().w_px(230.0f)
+        .bg(vik::rgb(0x1b1e27)).border_1().border_color(vik::rgb(0x2c313d))
+        .child(vik::div().flex_row().items_center().gap_2().px_3().py_2()
+            .child(vik::ui::phosphor("cloud", vik::ui::PhWeight::Fill)
+                       .size(14.0f).color(vik::rgb(pod_url.empty() ? 0x6c7383
+                                                                   : 0x56c08a)))
+            .child(vik::text("Pod").text_color(vik::rgb(0xe6e8ec))))
+        .child(row("status", net_status,
+                   net_error ? 0xe05c72 : (net_busy ? 0xd9903c : 0x8d94a3)));
+
+    if (!pod_url.empty())
+        sidebar = std::move(sidebar).child(row("url", pod_url, 0x6c7383));
+
+    sidebar = std::move(sidebar).child(
+        vik::div().px_3().py_2()
+            .child(icon_button("connect", net_busy ? "hourglass" : "plugs-connected",
+                               false,
+                [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                   vik::Context<Studio>& c) {
+                    s.connect(c.app());
+                    c.notify();
+                })));
+
+    if (!projects.empty()) {
+        auto list = vik::div().flex_col().flex_1().overflow_hidden()
+            .child(vik::text("  Projects").text_xs().text_color(vik::rgb(0x6c7383)));
+        // Enough to choose from without turning the sidebar into a file
+        // browser; a proper browser with search is Phase 2's polish, not its
+        // gate.
+        const size_t shown = std::min<size_t>(projects.size(), 14);
+        for (size_t i = 0; i < shown; ++i) {
+            const auto& proj = projects[i];
+            const bool active = proj.id == open_project_id;
+            list = std::move(list).child(
+                vik::div().id("proj").px_3().py_1().cursor_pointer()
+                    .bg(vik::rgb(active ? 0x2c3446 : 0x1b1e27))
+                    .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x242936)); })
+                    .on_click(cx.listener([id = proj.id](Studio& s,
+                                                         const vik::ClickEvent&,
+                                                         vik::Window&,
+                                                         vik::Context<Studio>& c) {
+                        s.open_project(id, c.app());
+                        c.notify();
+                    }))
+                    .child(vik::text(proj.title.substr(0, 26))
+                               .text_color(vik::rgb(active ? 0xffd58a : 0xc9cedb))));
+        }
+        sidebar = std::move(sidebar).child(std::move(list));
+    }
+
     return vik::div().size_full().flex_col().bg(vik::rgb(0x14161d))
         .on_key_down(cx.listener(
             [](Studio& s, const vik::KeyDownEvent& e, vik::Window&,
@@ -570,6 +857,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             }))
         .child(std::move(transport))
         .child(vik::div().flex_1().flex_row()
+                   .child(std::move(sidebar))
                    .child(std::move(headers))
                    .child(std::move(timeline)))
         .into_any();
@@ -778,6 +1066,7 @@ int main(int argc, char** argv) {
     fs::path render_to;
     fs::path bounce_to;
     std::string pod_url, pod_token, pod_project;
+    bool probe_only = false;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -785,6 +1074,7 @@ int main(int argc, char** argv) {
         else if (arg == "--render" && i + 1 < argc) render_to = argv[++i];
         else if (arg == "--bounce" && i + 1 < argc) bounce_to = argv[++i];
         else if (arg == "--connect" && i + 1 < argc) pod_url = argv[++i];
+        else if (arg == "--probe") probe_only = true;
         else if (arg == "--token" && i + 1 < argc) pod_token = argv[++i];
         else if (arg == "--project" && i + 1 < argc) pod_project = argv[++i];
         else folder = arg;
@@ -792,7 +1082,8 @@ int main(int argc, char** argv) {
 
     if (!render_to.empty()) return render_png(folder, render_to, 1600, 900);
     if (!bounce_to.empty()) return bounce_offline(folder, bounce_to);
-    if (!pod_url.empty()) return connect_probe(pod_url, pod_token, pod_project);
+    if (!pod_url.empty() && probe_only)
+        return connect_probe(pod_url, pod_token, pod_project);
 
     if (!g_device.start(g_mixer, 48000))
         std::printf("audio: %s\n", g_device.error().c_str());
@@ -804,12 +1095,20 @@ int main(int argc, char** argv) {
                 auto handle = app.add_entity<Studio>();
                 app.update_entity(handle, [&](Studio& s, vik::Context<Studio>& c) {
                     s.selftest = selftest;
+                    s.pod_url = pod_url;
+                    s.pod_token = pod_token;
                     // The device decides the rate; the session follows it,
                     // because everything decoded is resampled to it once.
                     if (g_device.running()) s.session.rate = g_device.rate();
                     s.session.loop_start = 0;
-                    if (folder.empty()) s.build_demo();
-                    else s.load_folder(folder, app);
+                    if (!pod_url.empty()) {
+                        if (!pod_project.empty()) s.open_project(pod_project, app);
+                        else s.connect(app);
+                    } else if (folder.empty()) {
+                        s.build_demo();
+                    } else {
+                        s.load_folder(folder, app);
+                    }
                     s.view.frames_per_pixel = 512.0;
                     s.publish();
                     c.notify();
