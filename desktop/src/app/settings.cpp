@@ -95,6 +95,9 @@ Settings Settings::load() {
         json j;
         file >> j;
         s.pod_url = j.value("pod_url", "");
+        s.local_url = j.value("local_url", "http://127.0.0.1:8000");
+        s.mode = j.value("mode", std::string("local")) == "cloud"
+                     ? Mode::Cloud : Mode::Local;
         s.auto_connect = j.value("auto_connect", false);
         s.last_document = j.value("last_document", "");
         s.pod_token = unprotect_secret(j.value("pod_token_dpapi", ""));
@@ -109,6 +112,8 @@ bool Settings::save() const {
     std::filesystem::create_directories(path().parent_path(), ec);
     json j;
     j["pod_url"] = pod_url;
+    j["local_url"] = local_url;
+    j["mode"] = (mode == Mode::Cloud) ? "cloud" : "local";
     j["auto_connect"] = auto_connect;
     j["last_document"] = last_document;
     // Named for what it is, so nobody mistakes the value for something they can

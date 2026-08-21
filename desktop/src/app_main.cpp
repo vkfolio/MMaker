@@ -430,6 +430,19 @@ struct Studio {
         }).detach();
     }
 
+    /// Switch where renders happen. Nothing else changes: the client speaks to
+    /// a URL, so a mode is which URL, not a second implementation.
+    void set_mode(mx::Mode mode, vik::App& app) {
+        settings.mode = mode;
+        settings.save();
+        pod_url = settings.active_url();
+        pod_token = settings.active_token();
+        projects.clear();
+        net_error = false;
+        net_status = pod_url.empty() ? "no address set" : "not connected";
+        if (!pod_url.empty()) connect(app);
+    }
+
     void mark_dirty() { dirty = true; }
 
     void new_document() {
@@ -1534,55 +1547,86 @@ vik::AnyElement Studio::settings_modal(vik::Context<Studio>& cx) {
         // generates audio on request, and the project is the local document.
         // Offering its scratch workspaces as things to open is what made it
         // look like a document store.
-        return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
-            .flex_row().items_center().justify_center()
-            // Swallow mouse input. Without this a modal is only visually on
-            // top: clicks land on the timeline behind it, so opening Generate
-            // moved the playhead. Dimming the background is not the same as
-            // blocking it.
+        const bool cloud = settings.mode == mx::Mode::Cloud;
+
+    auto mode_chip = [&cx](const char* label, const char* detail, bool on,
+                           mx::Mode which) {
+        return vik::div().id("mode").flex_1().flex_col().gap_1().px_3().py_2()
+            .rounded_md().cursor_pointer()
+            .bg(vik::rgb(on ? 0x3a4a68 : 0x2c313d))
+            .border_1().border_color(vik::rgb(on ? 0x5b5bd6 : 0x3b4250))
+            .on_click(cx.listener([which](Studio& s, const vik::ClickEvent&,
+                                          vik::Window&, vik::Context<Studio>& c) {
+                s.set_mode(which, c.app());
+                c.notify();
+            }))
+            .child(vik::text(label).text_color(vik::rgb(on ? 0xffffff : 0xc9cedb)))
+            .child(vik::text(detail).text_xs().text_color(vik::rgb(0x8d94a3)));
+    };
+
+    return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
+        .flex_row().items_center().justify_center()
+        .occlude()
+        .on_mouse_down(vik::MouseButton::Left, cx.listener(
+            [](Studio& s, const vik::MouseDownEvent&, vik::Window&,
+               vik::Context<Studio>& c) {
+                s.show_settings = false;
+                c.notify();
+            }))
+        .bg(vik::rgba(0x00000099))
+        .child(vik::div().flex_col().gap_3().p_4().w_px(500.0f)
             .occlude()
-            // A click on the dimmed area dismisses, as modals do. The card
-            // below stops propagation so clicking its contents does not.
-            .on_mouse_down(vik::MouseButton::Left, cx.listener(
-                [](Studio& s, const vik::MouseDownEvent&, vik::Window&,
-                   vik::Context<Studio>& c) {
-                    s.show_generate = s.show_layers = s.show_settings = false;
-                    c.notify();
-                }))
-            .bg(vik::rgba(0x00000099))
-            .child(vik::div().flex_col().gap_3().p_4().w_px(460.0f)
-                .occlude()
-                .on_mouse_down(vik::MouseButton::Left,
-                    [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
-                        w.stop_propagation();
-                    })
-                .rounded_lg().bg(vik::rgb(0x232834))
-                .border_1().border_color(vik::rgb(0x3b4250))
-                .child(vik::div().flex_row().items_center().justify_between()
-                    .child(vik::text("Settings").text_xl().text_color(vik::white()))
-                    .child(icon_button("close", "x", false,
-                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                           vik::Context<Studio>& c) {
-                            s.show_settings = false;
-                            c.notify();
-                        })))
-                .child(vik::text("Render pod").text_xs().text_color(vik::rgb(0x8d94a3)))
-                .child(vik::text(pod_url.empty() ? "not configured" : pod_url)
-                           .text_color(vik::rgb(0xc9cedb)))
-                .child(vik::text(pod_token.empty()
-                           ? "no token stored"
-                           : "token stored (encrypted for this Windows account)")
-                           .text_xs().text_color(vik::rgb(0x6c7383)))
-                .child(vik::text(net_status).text_xs()
-                           .text_color(vik::rgb(net_error ? 0xe05c72 : 0x8d94a3)))
-                .child(vik::div().flex_row().items_center().gap_2()
-                    .child(icon_button("s-conn", "plugs-connected", false,
-                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                           vik::Context<Studio>& c) { s.connect(c.app()); c.notify(); }))
-                    .child(vik::text("Test the connection")
-                               .text_xs().text_color(vik::rgb(0x8d94a3)))))
-            .into_any();
-    }
+            .on_mouse_down(vik::MouseButton::Left,
+                [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
+                    w.stop_propagation();
+                })
+            .rounded_lg().bg(vik::rgb(0x232834))
+            .border_1().border_color(vik::rgb(0x3b4250))
+            .child(vik::div().flex_row().items_center().justify_between()
+                .child(vik::text("Settings").text_xl().text_color(vik::white()))
+                .child(icon_button("close", "x", false,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) {
+                        s.show_settings = false;
+                        c.notify();
+                    })))
+
+            .child(vik::text("Where renders happen")
+                       .text_xs().text_color(vik::rgb(0x8d94a3)))
+            // Two addresses, one switch. The client only ever speaks to a URL,
+            // so a mode is which URL -- not a second implementation, and not a
+            // reason to retype the pod address every time you switch back.
+            .child(vik::div().flex_row().gap_2()
+                .child(mode_chip("Local", "this laptop, turbo tier", !cloud,
+                                 mx::Mode::Local))
+                .child(mode_chip("Cloud", "RunPod, all tiers", cloud,
+                                 mx::Mode::Cloud)))
+
+            .child(vik::text(pod_url.empty() ? "no address set" : pod_url)
+                       .text_color(vik::rgb(0xc9cedb)))
+            .child(vik::text(net_status).text_xs()
+                       .text_color(vik::rgb(net_error ? 0xe05c72 : 0x8d94a3)))
+
+            .child(vik::div().flex_row().items_center().gap_2()
+                .child(icon_button("s-conn", "plugs-connected", false,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) { s.connect(c.app()); c.notify(); }))
+                .child(vik::text("Test the connection")
+                           .text_xs().text_color(vik::rgb(0x8d94a3))))
+
+            // Say what each mode needs, rather than leaving a failed connection
+            // to be interpreted.
+            .child(vik::text(
+                    cloud
+                        ? (pod_token.empty()
+                               ? "No token stored. Start once with --connect <url> "
+                                 "--token <token>."
+                               : "Token stored, encrypted for this Windows account.")
+                        : "Start the engine first:  pwsh -File tools\\start-local.ps1"
+                          "   (install-local.ps1 the first time)")
+                .text_xs().text_color(vik::rgb(0x6c7383))))
+        .into_any();
+}
 
 vik::AnyElement Studio::layer_modal(vik::Context<Studio>& cx) {
     auto icon_button = [&cx](const char* id, const char* icon, bool active, auto fn) {
@@ -1686,7 +1730,7 @@ vik::AnyElement Studio::tool_modal(vik::Context<Studio>& cx, const char* title,
         .on_mouse_down(vik::MouseButton::Left, cx.listener(
             [](Studio& s, const vik::MouseDownEvent&, vik::Window&,
                vik::Context<Studio>& c) {
-                s.tool = Tool::None;
+                s.tool = Studio::Tool::None;
                 c.notify();
             }))
         .child(vik::div().flex_col().gap_3().p_4().w_px(520.0f)
@@ -1710,7 +1754,7 @@ vik::AnyElement Studio::tool_modal(vik::Context<Studio>& cx, const char* title,
                     .on_click(cx.listener([](Studio& s, const vik::ClickEvent&,
                                              vik::Window&,
                                              vik::Context<Studio>& c) {
-                        s.tool = Tool::None;
+                        s.tool = Studio::Tool::None;
                         c.notify();
                     }))
                     .child(vik::ui::phosphor("x", vik::ui::PhWeight::Bold)
@@ -1725,7 +1769,7 @@ vik::AnyElement Studio::tool_modal(vik::Context<Studio>& cx, const char* title,
                         Studio& s, const vik::ClickEvent&, vik::Window&,
                         vik::Context<Studio>& c) {
                     if (!ready) return;
-                    s.tool = Tool::None;
+                    s.tool = Studio::Tool::None;
                     run(s, c.app());
                     c.notify();
                 }))
@@ -1786,7 +1830,7 @@ vik::AnyElement Studio::current_tool_modal(vik::Context<Studio>& cx) {
                     .on_click(cx.listener([name](Studio& s, const vik::ClickEvent&,
                                                  vik::Window&,
                                                  vik::Context<Studio>& c) {
-                        s.tool = Tool::None;
+                        s.tool = Studio::Tool::None;
                         s.add_layer(name, c.app());
                         c.notify();
                     }))
@@ -2559,7 +2603,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 if (s.tool != Tool::None || s.show_generate ||
                     s.show_layers || s.show_settings) {
                     if (e.key == "escape") {
-                        s.tool = Tool::None;
+                        s.tool = Studio::Tool::None;
                         s.show_generate = s.show_layers = s.show_settings = false;
                         c.notify();
                     }
@@ -2916,13 +2960,19 @@ int main(int argc, char** argv) {
                     s.settings = mx::Settings::load();
                     // Flags win over stored settings: a scripted run must be
                     // reproducible regardless of what this machine remembers.
-                    s.pod_url = pod_url.empty() ? s.settings.pod_url : pod_url;
-                    s.pod_token = pod_token.empty() ? s.settings.pod_token : pod_token;
                     if (!pod_url.empty()) {
-                        s.settings.pod_url = pod_url;
-                        s.settings.pod_token = pod_token;
+                        // An explicit --connect is a cloud address unless it is
+                        // plainly this machine.
+                        const bool loopback =
+                            pod_url.find("127.0.0.1") != std::string::npos ||
+                            pod_url.find("localhost") != std::string::npos;
+                        s.settings.mode = loopback ? mx::Mode::Local : mx::Mode::Cloud;
+                        (loopback ? s.settings.local_url : s.settings.pod_url) = pod_url;
+                        if (!loopback) s.settings.pod_token = pod_token;
                         s.settings.save();
                     }
+                    s.pod_url = s.settings.active_url();
+                    s.pod_token = s.settings.active_token();
                     s.regen_from = regen_from;
                     s.regen_to = regen_to;
                     s.cancel_after = cancel_after;
@@ -2934,12 +2984,12 @@ int main(int argc, char** argv) {
                     s.show_generate = (open_panel == "generate");
                     s.show_layers   = (open_panel == "layers");
                     s.show_settings = (open_panel == "settings");
-                    if (open_panel == "splitter") s.tool = Tool::Splitter;
-                    else if (open_panel == "inspire") s.tool = Tool::Inspire;
-                    else if (open_panel == "enhance") s.tool = Tool::Enhance;
-                    else if (open_panel == "extend") s.tool = Tool::Extend;
-                    else if (open_panel == "voice") s.tool = Tool::Voice;
-                    else if (open_panel == "tool-layer") s.tool = Tool::Layer;
+                    if (open_panel == "splitter") s.tool = Studio::Tool::Splitter;
+                    else if (open_panel == "inspire") s.tool = Studio::Tool::Inspire;
+                    else if (open_panel == "enhance") s.tool = Studio::Tool::Enhance;
+                    else if (open_panel == "extend") s.tool = Studio::Tool::Extend;
+                    else if (open_panel == "voice") s.tool = Studio::Tool::Voice;
+                    else if (open_panel == "tool-layer") s.tool = Studio::Tool::Layer;
                     s.stress = stress;
                     // Read the theme once at startup. It is what tooltips
                     // dereference, and a missing one used to surface only when

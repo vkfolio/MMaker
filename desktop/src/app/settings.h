@@ -17,7 +17,17 @@
 
 namespace mx {
 
+/// Where renders happen.
+///
+/// The client only ever talks to a URL, so this is a URL choice and not a
+/// second code path. Keeping both URLs rather than one editable field means
+/// switching modes does not make you retype the pod address, and the token
+/// follows the cloud URL it belongs to.
+enum class Mode { Local, Cloud };
+
 struct Settings {
+    Mode        mode = Mode::Local;
+    std::string local_url = "http://127.0.0.1:8000";
     std::string pod_url;
     std::string pod_token;
     bool        auto_connect = false;
@@ -25,6 +35,16 @@ struct Settings {
 
     /// Where settings live: %LOCALAPPDATA%/MusicMaker/settings.json
     static std::filesystem::path path();
+
+    /// The URL the current mode points at.
+    const std::string& active_url() const {
+        return mode == Mode::Cloud ? pod_url : local_url;
+    }
+    /// Local needs no token: it guards a machine that costs money to run, and
+    /// this one is already yours.
+    std::string active_token() const {
+        return mode == Mode::Cloud ? pod_token : std::string{};
+    }
 
     /// Missing or unreadable settings are not an error -- a first run has none.
     static Settings load();
