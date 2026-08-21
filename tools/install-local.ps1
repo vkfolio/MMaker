@@ -123,9 +123,27 @@ if ($SkipModels) {
     )
     $py = Join-Path $acestep ".venv\Scripts\python.exe"
 
+    # hf_transfer is the difference between ~18 MB/s and ~0.4 MB/s on an 8 GB
+    # download, so it is worth installing -- but not worth failing over.
+    Note "ensuring hf_transfer (fast downloads)"
+    # No 2>&1 here. In Windows PowerShell, redirecting a native command's stderr
+    # wraps every line in an ErrorRecord, which under ErrorActionPreference=Stop
+    # turns uv's ordinary progress chatter into a fatal error. The exit code is
+    # the thing to check, and even that is advisory: a missing hf_transfer only
+    # makes the download slower, and the Python side already copes.
+    & uv pip install --python $py hf_transfer | Out-Null
+    if ($LASTEXITCODE -ne 0) { Warn "could not install hf_transfer -- downloads will be slower" }
+
     $script = @'
 import os, sys, pathlib
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+try:
+    import hf_transfer                      # noqa: F401
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+except ImportError:
+    # Asking for the fast path without the package installed is a hard error
+    # inside huggingface_hub, so the flag is only set when it can be honoured.
+    os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+    print("  (hf_transfer unavailable -- downloading the slow way)")
 try:
     from huggingface_hub import snapshot_download
 except ImportError:
