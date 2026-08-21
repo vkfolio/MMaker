@@ -101,9 +101,11 @@ def generate_variations(project: Project, count: int, report=None) -> list[dict]
             report(i / count, f"variation {i + 1} of {count}")
         seed = _seed()
         dest = out_dir / f"var_{i + 1}_{seed}.wav"
+        # report is threaded in so the engine's poll loop is a cancellation
+        # point -- without it a cancelled render runs to completion unnoticed.
         engine.generate(dest, prompt=prompt, grid=project.grid, seed=seed,
                         lyrics=lyrics, vocal_language=project.vocal_language,
-                        src_audio=src, **_quality(project))
+                        src_audio=src, report=report, **_quality(project))
         variation = Variation(seed=seed, audio=_rel(project, dest), prompt=prompt)
         project.variations.append(variation)
         made.append(variation.model_dump())
@@ -278,7 +280,7 @@ def repaint_stem(project: Project, stem: Stem, start_s: float, end_s: float,
 
     engines.music().repaint(dest, src, start_s, end_s,
                             prompt or stem.prompt, project.grid, seed,
-                            **_quality(project))
+                            report=report, **_quality(project))
 
     # Prove the untouched region really was untouched, rather than trusting it.
     outside_residual = _outside_residual(src, dest, start_s, end_s)
@@ -330,7 +332,7 @@ def extend_stem(project: Project, stem: Stem, bars: int,
 
     engines.music().extend(dest, _abs(project, stem.version.audio), added_s,
                            prompt or stem.prompt, project.grid, seed,
-                           **_quality(project))
+                           report=report, **_quality(project))
 
     version = stem.add(StemVersion(
         audio=_rel(project, dest), op="extend",
@@ -362,7 +364,8 @@ def vary_stem(project: Project, stem: Stem, seed: int | None = None,
     engines.music().layer(dest, stem.track_class, context,
                           prompt or stem.prompt, project.grid, seed,
                           lyrics=project.lyrics if stem.track_class == "vocals" else "",
-                          vocal_language=project.vocal_language, **_quality(project))
+                          vocal_language=project.vocal_language,
+                          report=report, **_quality(project))
 
     version = stem.add(StemVersion(
         audio=_rel(project, dest), op="vary",
@@ -402,11 +405,13 @@ def add_layer(project: Project, track_class: str, prompt: str = "",
     if context is None:
         engine.generate(dest, composed, project.grid, seed,
                         lyrics=project.lyrics if track_class == "vocals" else "",
-                        vocal_language=project.vocal_language, **_quality(project))
+                        vocal_language=project.vocal_language,
+                        report=report, **_quality(project))
     else:
         engine.layer(dest, track_class, context, composed, project.grid, seed,
                      lyrics=project.lyrics if track_class == "vocals" else "",
-                     vocal_language=project.vocal_language, **_quality(project))
+                     vocal_language=project.vocal_language,
+                     report=report, **_quality(project))
 
     stem.add(StemVersion(
         audio=_rel(project, dest), op="generate",

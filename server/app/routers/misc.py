@@ -30,6 +30,15 @@ def get_job(job_id: str):
     return job.public()
 
 
+@jobs_router.post("/{job_id}/cancel")
+def cancel_job(job_id: str):
+    """Stop a job. Queued jobs stop at once; running ones at their next report."""
+    job = jobs.queue.cancel(job_id)
+    if not job:
+        raise HTTPException(404, "no such job")
+    return job.public()
+
+
 @jobs_router.get("/{job_id}/events")
 async def job_events(job_id: str):
     """Server-sent progress. The UI never blocks on a render."""

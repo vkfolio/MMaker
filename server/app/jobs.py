@@ -14,12 +14,22 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
+class JobCancelled(Exception):
+    """Raised inside a worker when the client asked to stop.
+
+    asyncio.to_thread cannot be cancelled from outside, so cancellation has to
+    be cooperative: every long-running step already calls report() to say where
+    it is, and report() is therefore the natural place to notice and bail out.
+    """
+
+
 @dataclass
 class Job:
     id: str
     kind: str
     project_id: str | None = None
-    status: str = "queued"            # queued | running | done | error
+    status: str = "queued"            # queued | running | done | error | cancelled
+    cancel_requested: bool = False
     progress: float = 0.0             # 0..1, meaningful only if determinate
     # ACE-Step reports no progress signal, so a percentage would be invented.
     # Say so, and let the client show elapsed time instead of a fake bar.
@@ -40,6 +50,7 @@ class Job:
             "determinate": self.determinate,
             "queue_position": self.queue_position,
             "message": self.message, "result": self.result, "error": self.error,
+            "cancel_requested": self.cancel_requested,
             "elapsed_s": round((self.finished_at or time.time()) - self.created_at, 1),
         }
 
@@ -47,6 +58,7 @@ class Job:
 class JobQueue:
     def __init__(self, concurrency: int = 1):
         self._jobs: dict[str, Job] = {}
+        self._by_key: dict[str, str] = {}
         self._concurrency = concurrency
         self._sem: asyncio.Semaphore | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -66,11 +78,27 @@ class JobQueue:
     def _evict(self):
         """Finished jobs accumulated forever; keep the most recent."""
         finished = [j for j in self._jobs.values()
-                    if j.status in ("done", "error") and not j._subscribers]
+                    if j.status in ("done", "error", "cancelled")
+                    and not j._subscribers]
         excess = len(finished) - self.MAX_FINISHED
         if excess > 0:
             for j in sorted(finished, key=lambda j: j.finished_at or 0)[:excess]:
                 self._jobs.pop(j.id, None)
+
+    def cancel(self, job_id: str) -> Job | None:
+        """Ask a job to stop. A queued job stops immediately; a running one
+        stops at its next progress report."""
+        job = self._jobs.get(job_id)
+        if not job or job.status in ("done", "error", "cancelled"):
+            return job
+        job.cancel_requested = True
+        if job.status == "queued":
+            job.status = "cancelled"
+            job.message = "cancelled before it started"
+            job.finished_at = time.time()
+            self._renumber()
+        self._notify(job)
+        return job
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
@@ -90,9 +118,22 @@ class JobQueue:
             if j.status != "queued":
                 j.queue_position = 0
 
-    def submit(self, kind: str, fn: Callable, project_id: str | None = None) -> Job:
-        """fn(report) -> result, run in a worker thread. report(progress, msg)."""
+    def submit(self, kind: str, fn: Callable, project_id: str | None = None,
+               idempotency_key: str | None = None) -> Job:
+        """fn(report) -> result, run in a worker thread. report(progress, msg).
+
+        With an idempotency key, a repeated submit returns the original job
+        rather than starting a second render -- a POST whose response was lost
+        has already spent GPU time the client never learned about.
+        """
+        if idempotency_key:
+            existing = self._by_key.get(idempotency_key)
+            if existing and existing in self._jobs:
+                return self._jobs[existing]
+
         job = Job(id=f"job_{uuid.uuid4().hex[:10]}", kind=kind, project_id=project_id)
+        if idempotency_key:
+            self._by_key[idempotency_key] = job.id
         self._jobs[job.id] = job
         self._evict()
         self._renumber()
@@ -110,6 +151,9 @@ class JobQueue:
         loop = asyncio.get_running_loop()
 
         def report(progress: float, message: str = ""):
+            # Every long step calls this, so it is where cancellation lands.
+            if job.cancel_requested:
+                raise JobCancelled(job.id)
             # A negative progress means "running, but I cannot know how far".
             if progress < 0:
                 job.determinate = False
@@ -132,6 +176,9 @@ class JobQueue:
                 job.status = "done"
                 job.progress = 1.0
                 job.message = job.message or "complete"
+            except JobCancelled:
+                job.status = "cancelled"
+                job.message = "cancelled"
             except Exception as exc:                       # noqa: BLE001
                 job.status = "error"
                 job.error = f"{type(exc).__name__}: {exc}"

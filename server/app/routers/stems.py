@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 
 from .. import jobs, service, storage
 from ..schemas import (ExtendRequest, MixState, Project, RepaintRequest,

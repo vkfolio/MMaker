@@ -101,18 +101,19 @@ class StubEngine:
     name = "stub"
 
     def generate(self, dest, prompt, grid, seed, lyrics="", vocal_language="en",
-                 src_audio=None):
+                 src_audio=None, report=None, quality=None):
         return audio.write(dest, _render("mix", grid, seed, grid.duration_s), SR)
 
     def layer(self, dest, track_class, src_audio, prompt, grid, seed,
-              lyrics="", vocal_language="en"):
+              lyrics="", vocal_language="en", report=None, quality=None):
         # Returns the new part alone -- the behaviour we hope ACE-Step has, and
         # which research/lego_chain.py exists to confirm on a real pod.
         base, sr = audio.load(src_audio)
         duration = len(base) / sr
         return audio.write(dest, _render(track_class, grid, seed, duration), SR)
 
-    def repaint(self, dest, src_audio, start_s, end_s, prompt, grid, seed):
+    def repaint(self, dest, src_audio, start_s, end_s, prompt, grid, seed,
+                report=None, quality=None):
         data, sr = audio.load(src_audio)
         fresh = _render("mix", grid, seed, max(end_s - start_s, 0.01))
         i0 = int(start_s * sr)
@@ -135,7 +136,8 @@ class StubEngine:
             out[i0:i0 + span] = patch
         return audio.write(dest, out, sr)
 
-    def extend(self, dest, src_audio, added_s, prompt, grid, seed):
+    def extend(self, dest, src_audio, added_s, prompt, grid, seed,
+               report=None, quality=None):
         data, sr = audio.load(src_audio)
         tail = _render("mix", grid, seed, added_s)
         if tail.shape[1] != data.shape[1]:

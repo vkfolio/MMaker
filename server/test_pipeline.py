@@ -478,6 +478,56 @@ def test_unknown_voice_is_rejected():
 
 # ---- phase 6 --------------------------------------------------------------
 
+def test_cancel_stops_a_queued_job():
+    """A queued job must stop at once; asyncio.to_thread cannot be cancelled
+    from outside, so cancellation is cooperative via the report callback."""
+    pid = make_project(bars=8)
+    split(pid)
+    # Two jobs: concurrency is 1, so the second is queued behind the first.
+    first = client.post(f"/api/projects/{pid}/layers",
+                        json={"track_class": "strings"}).json()["job"]
+    second = client.post(f"/api/projects/{pid}/layers",
+                         json={"track_class": "brass"}).json()["job"]
+
+    body = client.post(f"/api/jobs/{second['id']}/cancel").json()
+    assert body["status"] == "cancelled", body
+    assert body["cancel_requested"] is True
+
+    final = client.get(f"/api/jobs/{second['id']}").json()
+    assert final["status"] == "cancelled"
+    wait_job(first["id"])   # the one we did not cancel still completes
+
+
+def test_cancelling_a_finished_job_is_harmless():
+    pid = make_project(bars=8)
+    job = client.post(f"/api/projects/{pid}/variations?count=1").json()["job"]
+    wait_job(job["id"])
+    body = client.post(f"/api/jobs/{job['id']}/cancel").json()
+    assert body["status"] == "done", "cancelling a finished job must not rewrite it"
+
+
+def test_cancel_unknown_job_is_404():
+    assert client.post("/api/jobs/job_nope/cancel").status_code == 404
+
+
+def test_idempotency_key_does_not_start_a_second_render():
+    """A POST whose response was lost has already spent GPU time. Repeating it
+    with the same key must return the original job, not start another."""
+    key = "probe-key-123"
+    body = {"title": "idem", "prompt": "test", "bars": 4, "variations": 1}
+    a = client.post("/api/projects", json=body,
+                    headers={"Idempotency-Key": key}).json()
+    b = client.post("/api/projects", json=body,
+                    headers={"Idempotency-Key": key}).json()
+    assert a["job"]["id"] == b["job"]["id"], "the same key started a second job"
+    wait_job(a["job"]["id"])
+
+    c = client.post("/api/projects", json=body,
+                    headers={"Idempotency-Key": "different-key"}).json()
+    assert c["job"]["id"] != a["job"]["id"], "a different key must start a new job"
+    wait_job(c["job"]["id"])
+
+
 def test_sfx_generation():
     job = client.post("/api/sfx", json={
         "prompt": "deep impact hit", "duration_s": 2.0, "variations": 2,

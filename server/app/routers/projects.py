@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from .. import analysis, jobs, midi, presets, service, storage
@@ -48,7 +48,8 @@ def list_projects():
 
 
 @router.post("/projects")
-def create_project(body: CreateProject):
+def create_project(body: CreateProject,
+                   idempotency_key: str | None = Header(None, alias="Idempotency-Key")):
     project = Project(
         title=body.title,
         prompt=body.prompt,
@@ -74,6 +75,7 @@ def create_project(body: CreateProject):
         "variations",
         lambda report: service.generate_variations(_get(project.id), body.variations, report),
         project_id=project.id,
+        idempotency_key=idempotency_key,
     )
     return {"project": project.model_dump(), "job": job.public()}
 
@@ -169,13 +171,15 @@ def delete_project(project_id: str):
 # ---- stems ----------------------------------------------------------------
 
 @router.post("/projects/{project_id}/split")
-def split(project_id: str, body: SplitRequest):
+def split(project_id: str, body: SplitRequest,
+          idempotency_key: str | None = Header(None, alias="Idempotency-Key")):
     _get(project_id)
     job = jobs.queue.submit(
         "split",
         lambda report: service.split_variation(
             _get(project_id), body.variation_id, body.method, report),
         project_id=project_id,
+        idempotency_key=idempotency_key,
     )
     return {"job": job.public()}
 
