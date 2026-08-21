@@ -231,6 +231,11 @@ struct Studio {
     float   meter          = 0.0f;
 
     mx::Settings settings;
+    // Keys are dispatched along the focused node's path. With nothing focused
+    // the path is empty and on_key_down never fires, which is why every
+    // shortcut silently did nothing.
+    vik::FocusHandle keys;
+    bool             keys_focused = false;
     bool  fitted      = false;
     float timeline_px = 1100.0f;   // last measured canvas width
 
@@ -1197,14 +1202,14 @@ struct Studio {
         std::printf(
             "STUDIO device=%s rate=%u latency_ms=%.1f | sources=%d pending=%d "
             "decode_ms=%.0f | tracks=%zu clips=%zu | playhead=%.2fs xruns=%u "
-            "| theme=%d net=%s stems=%d/%d cached=%d jobs=%zu%s | paint_ms=%.2f (build %.2f skia %.2f) worst=%.2f frames=%d columns=%lld\n",
+            "| theme=%d keys=%d net=%s stems=%d/%d cached=%d jobs=%zu%s | paint_ms=%.2f (build %.2f skia %.2f) worst=%.2f frames=%d columns=%lld\n",
             g_device.running() ? g_device.backend().c_str() : "NONE",
             g_device.rate(), 1000.0 * g_device.latency_frames() /
                 std::max(1u, g_device.rate()),
             loaded_sources, g_pending.load(), last_decode_ms,
             session.tracks.size(), session.clips.size(),
             static_cast<double>(playhead()) / std::max(1u, session.rate),
-            g_mixer.xruns(), theme_ok ? 1 : 0,
+            g_mixer.xruns(), theme_ok ? 1 : 0, keys_focused ? 1 : 0,
             net_status.c_str(), stems_arrived, stems_expected,
             cache_hits, jobs.size(), job_note.c_str(),
             last_paint_ms, build_ms, submit_ms, worst_paint_ms, frames,
@@ -1742,6 +1747,10 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     // surface origin; event positions are already local.
                     const float x = e.position.x;
                     const float y = e.position.y;
+                    // Click anywhere that is not a clip to move the playhead,
+                    // the way every editor does it. Restricting that to a 28px
+                    // ruler strip made the playhead feel stuck, because almost
+                    // nowhere you would click actually moved it.
                     if (y < mx::kRulerHeight) {
                         s.scrubbing = true;
                         s.seek(s.view.frame_at(x));
@@ -1763,8 +1772,11 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                         if (const auto* clip = s.session.find_clip(id))
                             s.drag_grab = s.view.frame_at(x) - clip->start_frame;
                     } else {
+                        // Empty lane: move the playhead and start scrubbing.
                         s.selected = 0;
                         s.selection.clear();
+                        s.scrubbing = true;
+                        s.seek(s.view.frame_at(x));
                     }
                     c.notify();
                 }))
@@ -1816,13 +1828,26 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             .on_scroll_wheel(cx.listener(
                 [](Studio& s, const vik::ScrollWheelEvent& e, vik::Window&,
                    vik::Context<Studio>& c) {
+                    // A plain wheel only reports delta.y. Scrolling the timeline
+                    // off delta.x meant an ordinary mouse did nothing at all,
+                    // which is most of why navigation felt broken.
+                    const double step = e.delta.y != 0.0f ? e.delta.y : e.delta.x;
+                    if (step == 0.0) return;
+
                     if (e.modifiers.control || e.modifiers.alt) {
-                        const double factor = e.delta.y > 0 ? 1.15 : 1.0 / 1.15;
-                        s.view.zoom_about(e.position.x, factor, 8.0, 65536.0);
+                        // Ctrl+wheel zooms about the cursor: wheel up zooms in,
+                        // and the frame under the pointer stays under it. That
+                        // is the behaviour every editor shares, and getting the
+                        // direction backwards is instantly wrong to anyone.
+                        const double factor = step > 0.0 ? 1.0 / 1.2 : 1.2;
+                        s.view.zoom_about(e.position.x, factor, 4.0, 262144.0);
                     } else {
+                        // Otherwise scroll the timeline horizontally, since that
+                        // is the axis a timeline has.
                         s.view.scroll_frames = std::max<int64_t>(
                             0, s.view.scroll_frames -
-                                   static_cast<int64_t>(e.delta.x * s.view.frames_per_pixel));
+                                   static_cast<int64_t>(step * 3.0 *
+                                                        s.view.frames_per_pixel));
                     }
                     c.notify();
                 }));
@@ -1912,6 +1937,31 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
         overlay = settings_modal(cx);
 
     return vik::div().size_full().flex_col().relative().bg(vik::rgb(0x14161d))
+        .track_focus(keys)
+        .key_context("Studio")
+        // Claim focus on any click in the window. Keys are dispatched along the
+        // focused node's path, so without this the shortcuts fire into nothing
+        // -- and a listener that is simply never called looks exactly like a
+        // listener that does not work.
+        .capture_mouse_down(vik::MouseButton::Left, cx.listener(
+            [](Studio& s, const vik::MouseDownEvent&, vik::Window& w,
+               vik::Context<Studio>&) {
+                if (s.keys && !s.keys_focused) {
+                    w.focus(s.keys);
+                    s.keys_focused = true;
+                }
+            }))
+        // Also on the first mouse move: requiring a click before the keyboard
+        // works is the kind of rule nobody is told and everybody trips over.
+        // Once only, so it never steals focus back from a text field.
+        .capture_mouse_move(cx.listener(
+            [](Studio& s, const vik::MouseMoveEvent&, vik::Window& w,
+               vik::Context<Studio>&) {
+                if (s.keys && !s.keys_focused) {
+                    w.focus(s.keys);
+                    s.keys_focused = true;
+                }
+            }))
         .on_key_down(cx.listener(
             [](Studio& s, const vik::KeyDownEvent& e, vik::Window&,
                vik::Context<Studio>& c) {
@@ -2252,11 +2302,15 @@ int main(int argc, char** argv) {
                 // re-enters entity storage, and the Studio& held across that
                 // call does not survive it. The symptom was a crash at startup,
                 // before anything drew.
-                // BISECT: state creation disabled
+                // Created before the entity that stores it: making an entity
+                // while another is being updated re-enters entity storage, and
+                // the Studio& held across that call does not survive it.
+                auto key_focus = app.focus_handle();
 
                 auto handle = app.add_entity<Studio>();
                 app.update_entity(handle, [&](Studio& s, vik::Context<Studio>& c) {
                     s.selftest = selftest;
+                    s.keys = key_focus;
                     s.settings = mx::Settings::load();
                     // Flags win over stored settings: a scripted run must be
                     // reproducible regardless of what this machine remembers.

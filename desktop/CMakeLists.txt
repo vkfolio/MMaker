@@ -76,6 +76,12 @@ if(WIN32)
 endif()
 
 # --- the gate: audio correctness under editing ---------------------------
+add_executable(zoom_check tests/zoom_check.cpp src/ui/arrangement.cpp
+               src/media/peaks.cpp)
+target_include_directories(zoom_check PRIVATE src third_party)
+target_link_libraries(zoom_check PRIVATE vik_components)
+add_test(NAME zoom_anchor COMMAND zoom_check)
+
 add_executable(mixer_test tests/mixer_test.cpp)
 target_link_libraries(mixer_test PRIVATE mx_audio)
 
