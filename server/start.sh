@@ -67,22 +67,38 @@ else
   # request naming it gets
   #     Model 'acestep-v15-xl-turbo' not found in ['acestep-v15-turbo'],
   #     using primary: acestep-v15-turbo
-  # and renders at turbo quality without failing. Slots 2 and 3 exist for
-  # exactly this and are enabled only by these env vars, so they are set here
-  # from whatever is actually on disk.
+  # and renders at turbo quality without failing. Slots exist for exactly this
+  # and are enabled only by these env vars, which take model names.
+  #
+  # Best-first, and deliberately so. Slot 1 is also the fallback for any model
+  # ACE-Step does not recognise, so ordering it best-first means an unmatched
+  # request degrades toward quality rather than away from it -- the failure
+  # that actually happened here was silent degradation to the weakest model.
+  # There are only three slots, which is exactly the number of tiers.
   CKPT_DIR="${ACESTEP_CHECKPOINT_DIR:-$ACESTEP_DIR/checkpoints}"
-  for slot_spec in "2:acestep-v15-xl-turbo" "3:acestep-v15-xl-base"; do
-    slot="${slot_spec%%:*}"
-    model="${slot_spec#*:}"
-    if [ -d "$CKPT_DIR/$model" ]; then
+  PREFERENCE="${ACESTEP_MODEL_PREFERENCE:-acestep-v15-xl-base acestep-v15-xl-turbo acestep-v15-turbo}"
+
+  slot=1
+  registered=""
+  for model in $PREFERENCE; do
+    [ -d "$CKPT_DIR/$model" ] || continue
+    [ "$slot" -gt 3 ] && { log "no slot left for $model (ACE-Step allows 3)"; continue; }
+    if [ "$slot" = "1" ]; then
+      export ACESTEP_CONFIG_PATH="$model"
+    else
       export "ACESTEP_CONFIG_PATH${slot}=$model"
-      log "model slot ${slot}: $model"
     fi
+    log "model slot ${slot}: $model"
+    registered="$registered $model"
+    slot=$((slot + 1))
   done
-  if [ -z "${ACESTEP_CONFIG_PATH2:-}" ]; then
-    log "only acestep-v15-turbo present -- 'high' and 'ultra' will render as 'fast'"
-    log "  fetch them with: bash tools/fetch-quality-weights.sh high"
-  fi
+
+  case "$registered" in
+    *xl-base*)  : ;;
+    *xl-turbo*) log "no acestep-v15-xl-base -- 'ultra' will render as 'high'" ;;
+    *)          log "only acestep-v15-turbo present -- every tier renders as 'fast'"
+                log "  fetch better weights: bash tools/fetch-quality-weights.sh all" ;;
+  esac
 
   log "starting ACE-Step on :${ACESTEP_PORT} (first run downloads weights)"
   (

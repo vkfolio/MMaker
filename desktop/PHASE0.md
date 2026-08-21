@@ -33,14 +33,47 @@ renderer" — a different, lesser product. It doesn't. Build the direct loop.
 **What still follows even at 6 s:** every tool needs visible progress and a
 working cancel. Six seconds with no feedback still feels broken.
 
-### The caveat
+### The caveat, resolved
 
-All three tiers returned near-identical timings. Either the tiers are genuinely
-close, or **`ultra` is silently falling back to the turbo weights** because the
-XL checkpoints were never fetched. `/api/engine` was added to make this
-checkable. Until it is checked, treat these numbers as **a floor, honest for
-`fast`, unproven for `ultra`**. If `ultra` really runs 4B at 50 steps, its true
-latency is higher and the band assignment for the top tier may change.
+All three tiers originally returned near-identical timings, and I recorded that
+these numbers were "a floor, honest for `fast`, unproven for `ultra`". That
+caveat is now closed, and the reason was worse than a measurement artefact: all
+three tiers were rendering on the same model.
+
+`ACE-Step/Ace-Step1.5` ships only `acestep-v15-turbo`. The XL checkpoints are
+separate ~20 GB repos. And downloading them is not sufficient either -- ACE-Step's
+model registry is fixed at startup and does not scan the checkpoint directory, so
+a request naming an unregistered model gets
+
+    Model 'acestep-v15-xl-turbo' not found in ['acestep-v15-turbo'],
+    using primary: acestep-v15-turbo
+
+and renders at turbo quality **without failing**. Nothing in the result says so.
+Both checkpoints are now fetched and registered as model slots (see
+`server/start.sh` and `tools/fetch-quality-weights.sh`), and the log confirms
+each tier reaching its own model.
+
+Re-measured on the pod's RTX A6000, warm, 8 bars:
+
+| tier | model | steps | seconds |
+|------|-------|-------|---------|
+| fast  | `acestep-v15-turbo` 0.6B    | 8  | ~4.5 |
+| high  | `acestep-v15-xl-turbo` 4B   | 8  | ~5.1 |
+| ultra | `acestep-v15-xl-base` 4B    | 50 + CFG 7.0 | ~10.4 |
+
+At full length, `ultra` renders 32 bars in 23.9 s and **64 bars -- about two
+minutes of music -- in 41.4 s**, at 48 kHz stereo and sensible levels
+(-1.6 dBFS peak, -14 dBFS RMS).
+
+**This strengthens the verdict rather than weakening it.** The selection-driven
+loop stays interactive even on the largest model: a regional repaint operates on
+a few seconds of audio, not a whole song. Two things do follow:
+
+- Each model costs **49-81 s to load, once**, on first use after a restart. That
+  is a real cold-start the UI must not present as a normal render.
+- All three loaded together sit at **40 GB of 48 GB VRAM**. There is headroom for
+  two-minute renders but not much else; batch sizes above 1 or a fourth model
+  would not fit. Dropping the `fast` slot frees ~10 GB if that is ever needed.
 
 ## 2. Are the three technical seams alive?
 
