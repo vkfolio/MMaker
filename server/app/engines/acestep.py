@@ -33,15 +33,44 @@ MAX_WAIT_S = float(os.environ.get("ACESTEP_MAX_WAIT_S", "1800"))
 # 32-64 steps with guidance and run two forward passes, so they need roughly
 # double the VRAM. The XL pair is 4B rather than 0.6B. "ultra" is what to use
 # when the GPU is large and the wait does not matter.
+#
+# IMPORTANT -- what a pod actually has:
+#   The base weights repo (ACE-Step/Ace-Step1.5) ships exactly two things that
+#   matter here: acestep-v15-turbo and acestep-5Hz-lm-1.7B. Every other
+#   checkpoint below lives in its own Hugging Face repo (ACE-Step/<name>) and
+#   must be downloaded deliberately -- the XL DiTs are ~20 GB each.
+#
+#   Asking for a checkpoint that is not present does NOT fail. ACE-Step falls
+#   back to its default and renders anyway, so a tier can look like it worked
+#   while producing turbo output. That is exactly what happened here: all three
+#   tiers timed identically because all three were the same model.
+#
+#   `installed` marks what the stock download provides. /api/engine reports
+#   which tiers would fall back on this particular pod.
 QUALITY = {
-    "fast":  {"model": "acestep-v15-turbo",    "lm": "acestep-5Hz-lm-0.6B",
-              "inference_steps": 8,  "guidance_scale": None, "vram_gb": 6},
+    "fast":  {"model": "acestep-v15-turbo",    "lm": "acestep-5Hz-lm-1.7B",
+              "inference_steps": 8,  "guidance_scale": None, "vram_gb": 6,
+              "installed": True},
     "high":  {"model": "acestep-v15-xl-turbo", "lm": "acestep-5Hz-lm-1.7B",
-              "inference_steps": 8,  "guidance_scale": None, "vram_gb": 14},
+              "inference_steps": 8,  "guidance_scale": None, "vram_gb": 14,
+              "installed": False},
     "ultra": {"model": "acestep-v15-xl-base",  "lm": "acestep-5Hz-lm-4B",
-              "inference_steps": 50, "guidance_scale": 7.0,  "vram_gb": 30},
+              "inference_steps": 50, "guidance_scale": 7.0,  "vram_gb": 30,
+              "installed": False},
 }
-DEFAULT_QUALITY = os.environ.get("ACESTEP_QUALITY", "high").strip().lower()
+
+# Extra checkpoints a pod can opt into, with their download sizes, so the
+# operator can decide rather than discover.
+OPTIONAL_WEIGHTS = {
+    "acestep-v15-xl-turbo": 19.9,
+    "acestep-v15-xl-base":  19.9,
+    "acestep-5Hz-lm-4B":     8.4,
+    "acestep-5Hz-lm-0.6B":   1.4,
+}
+
+# `high` is the better default only once its weights exist. Until then the
+# honest default is the tier this pod can actually render.
+DEFAULT_QUALITY = os.environ.get("ACESTEP_QUALITY", "fast").strip().lower()
 
 
 AUDIO_RE = re.compile(r"\.(mp3|wav|flac|ogg|m4a)(\?|$)", re.I)
@@ -407,22 +436,49 @@ class AceStepEngine:
                 if resp.status_code != 200:
                     continue
                 body = resp.json()
+
+                # ACE-Step wraps everything in {"data": ..., "code": 200}, and
+                # here `data` is an object holding the list -- not the list.
+                # Iterating it yields key names, which is how this managed to
+                # report an empty inventory on a server that had models loaded.
+                payload = body.get("data")
+                if isinstance(payload, dict):
+                    entries = payload.get("models") or []
+                    info["default_model"] = payload.get("default_model")
+                elif isinstance(payload, list):
+                    entries = payload
+                else:
+                    entries = body.get("models") or []
+
                 names = []
-                for entry in (body.get("data") or body.get("models") or []):
+                for entry in entries:
                     if isinstance(entry, dict):
-                        names.append(entry.get("id") or entry.get("name"))
+                        names.append(entry.get("name") or entry.get("id"))
                     elif isinstance(entry, str):
                         names.append(entry)
                 info["available"] = [n for n in names if n]
                 info["source"] = path
+                if not info["available"]:
+                    # An empty list and an unparsed response look identical from
+                    # the outside, and the difference is the whole diagnosis.
+                    info["raw"] = str(body)[:400]
                 break
             except (requests.RequestException, ValueError):
                 continue
         info.setdefault("available", None)
         if info["available"]:
-            missing = [tier for tier, model in info["requested_tiers"].items()
-                       if model not in info["available"]]
+            missing = {tier: model for tier, model in info["requested_tiers"].items()
+                       if model not in info["available"]}
             info["tiers_that_would_fall_back"] = missing
+            if missing:
+                info["note"] = (
+                    "These tiers ask for checkpoints this pod does not have. "
+                    "ACE-Step falls back to its default silently, so they render "
+                    "at the default quality no matter what is requested. The XL "
+                    "checkpoints ship as separate Hugging Face repos "
+                    "(ACE-Step/<name>), roughly 20 GB each; the base weights repo "
+                    "carries only acestep-v15-turbo and acestep-5Hz-lm-1.7B."
+                )
         return info
 
     def ping(self) -> bool:
