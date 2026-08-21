@@ -19,12 +19,28 @@ endif()
 set(VIKUI_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory("${VIKUI_DIR}" "${CMAKE_BINARY_DIR}/vikui" EXCLUDE_FROM_ALL)
 
+# --- Phase 0 spike, kept as running evidence rather than as a product ---
 add_executable(spike
-    src/main.cpp
-    src/miniaudio_impl.c
+    spike/main.cpp
+    spike/miniaudio_impl.c
 )
 target_include_directories(spike PRIVATE third_party)
 target_link_libraries(spike PRIVATE vik_components)
+
+# --- the audio engine, deliberately free of any UI dependency -------------
+# Keeping the mixer linkable on its own is what makes the Phase 1 gate a test
+# rather than a listening session.
+add_library(mx_audio STATIC
+    src/audio/mixer.cpp
+)
+target_include_directories(mx_audio PUBLIC src third_party)
+
+# --- the gate: audio correctness under editing ---------------------------
+add_executable(mixer_test tests/mixer_test.cpp)
+target_link_libraries(mixer_test PRIVATE mx_audio)
+
+enable_testing()
+add_test(NAME mixer_gate COMMAND mixer_test)
 
 if(WIN32)
     # miniaudio's WASAPI backend.
