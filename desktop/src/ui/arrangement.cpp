@@ -266,13 +266,34 @@ DrawStats draw_arrangement(SkCanvas* c, const SkRect& bounds, Session& session,
     text_paint.setColor(SkColorSetARGB(0xee, 0x10, 0x12, 0x18));
     for (const Visible& v : visible) {
         if (!can_draw_text) break;
-        if (v.lane.width() <= 40.0f || v.clip->name.empty()) continue;
+        if (v.lane.width() <= 40.0f) continue;
         c->save();
         c->clipRect(SkRect::MakeLTRB(v.lane.left(), v.lane.top(),
                                      v.lane.right() - 3.0f, v.lane.top() + kTitle));
-        c->drawSimpleText(v.clip->name.c_str(), v.clip->name.size(),
-                          SkTextEncoding::kUTF8, v.lane.left() + 5.0f,
-                          v.lane.top() + 11.0f, font, text_paint);
+        if (!v.clip->name.empty())
+            c->drawSimpleText(v.clip->name.c_str(), v.clip->name.size(),
+                              SkTextEncoding::kUTF8, v.lane.left() + 5.0f,
+                              v.lane.top() + 11.0f, font, text_paint);
+
+        // Version badge, right-aligned in the title strip. Only once there is
+        // more than one: a clip that has never been through a tool has nothing
+        // to compare against, and a permanent "v1/1" is noise.
+        if (v.src && v.src->versions.size() > 1 && v.lane.width() > 96.0f) {
+            const std::string badge = "v" + std::to_string(v.src->current + 1) +
+                                      "/" + std::to_string(v.src->versions.size());
+            const float width = font.measureText(badge.c_str(), badge.size(),
+                                                 SkTextEncoding::kUTF8);
+            const SkRect pill = SkRect::MakeLTRB(
+                v.lane.right() - width - 12.0f, v.lane.top() + 2.0f,
+                v.lane.right() - 3.0f, v.lane.top() + kTitle - 2.0f);
+            SkPaint chip;
+            chip.setAntiAlias(true);
+            chip.setColor(SkColorSetARGB(0x66, 0x10, 0x12, 0x18));
+            c->drawRoundRect(pill, 3.0f, 3.0f, chip);
+            c->drawSimpleText(badge.c_str(), badge.size(), SkTextEncoding::kUTF8,
+                              pill.left() + 4.5f, v.lane.top() + 11.0f, font,
+                              text_paint);
+        }
         c->restore();
     }
     text_paint.setColor(pal.text);

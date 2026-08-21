@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -24,10 +25,23 @@ namespace mx {
 
 using SourceId = uint32_t;
 
-/// Where a piece of audio came from, and the decoded result.
+/// One rendered state of a source. A tool appends one rather than replacing
+/// what was there, which is what makes a result comparable: without a previous
+/// version to switch back to, a successful regenerate and a no-op look
+/// identical unless you happen to replay the exact region.
+struct SourceVersion {
+    std::string           id;          // server version id
+    std::string           audio;       // project-relative path
+    std::string           op;          // "import", "repaint", "vary", ...
+    std::filesystem::path local_path;  // in the content cache
+    BufferRef             buffer;
+    Peaks                 peaks;
+};
+
+/// Where a piece of audio came from, and every version of it fetched so far.
 ///
-/// The cache is keyed by content hash rather than by server id, so it stays
-/// correct even while the server's id guarantees are weak.
+/// The cache is keyed by project + version + path, so it stays correct even
+/// while the server's id guarantees are weak.
 struct Source {
     SourceId    id = 0;
     std::string project_id;
@@ -39,11 +53,40 @@ struct Source {
     std::filesystem::path local_path;
     std::string           label;
 
-    BufferRef buffer;      // decoded, at device rate
+    BufferRef buffer;      // decoded, at device rate -- the current version
     Peaks     peaks;
     uint32_t  source_rate = 0;
 
+    /// Every version fetched this session, oldest first, and which one is
+    /// showing. Switching is instant because each is already decoded.
+    std::vector<SourceVersion> versions;
+    int                        current = 0;
+
     bool loaded() const { return buffer != nullptr; }
+
+    /// Records a version and makes it current.
+    void adopt(SourceVersion v) {
+        // A tool re-run with the same result should not stack duplicates.
+        for (size_t i = 0; i < versions.size(); ++i) {
+            if (!v.id.empty() && versions[i].id == v.id) {
+                current = static_cast<int>(i);
+                show(current);
+                return;
+            }
+        }
+        versions.push_back(std::move(v));
+        current = static_cast<int>(versions.size()) - 1;
+        show(current);
+    }
+
+    /// Switches which version the timeline plays and draws.
+    void show(int index) {
+        if (versions.empty()) return;
+        current = std::clamp(index, 0, static_cast<int>(versions.size()) - 1);
+        buffer = versions[current].buffer;
+        peaks = versions[current].peaks;
+        version_id = versions[current].id;
+    }
 };
 
 struct Clip {

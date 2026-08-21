@@ -150,10 +150,12 @@ ApiClient::Generated ApiClient::generate(const std::string& prompt,
 
 std::optional<JobRef> ApiClient::split(const std::string& project_id,
                                        const std::string& variation_id,
-                                       const std::string& tier) {
+                                       const std::string& tier,
+                                       bool remove_reverb) {
     json body;
     body["variation_id"] = variation_id;
     body["tier"] = tier;
+    body["remove_reverb"] = remove_reverb;
     const Response r = http_.post(
         url("/api/projects/" + url_escape(project_id) + "/split"), body.dump());
     auto parsed = parse(r, last_error_);
@@ -164,6 +166,127 @@ std::optional<JobRef> ApiClient::split(const std::string& project_id,
         return std::nullopt;
     }
     return read_job(*it);
+}
+
+namespace {
+
+/// The tool calls are all the same request with a different path and body, so
+/// they share one implementation rather than five near-copies that can drift.
+std::optional<JobRef> post_job(Http& http, const std::string& url,
+                               const json& body, const std::string& key,
+                               std::string& error, const char* what) {
+    const Response r = http.post(url, body.dump(), key);
+    if (!r.ok()) {
+        if (!r.error.empty()) {
+            error = r.error;
+        } else {
+            error = "HTTP " + std::to_string(r.status);
+            try {
+                const json parsed = json::parse(r.body);
+                if (parsed.contains("detail") && parsed["detail"].is_string())
+                    error += ": " + parsed["detail"].get<std::string>();
+            } catch (const json::exception&) {
+            }
+        }
+        return std::nullopt;
+    }
+    try {
+        const json parsed = json::parse(r.body);
+        auto it = parsed.find("job");
+        if (it == parsed.end() || !it->is_object()) {
+            error = std::string(what) + " was accepted but named no job";
+            return std::nullopt;
+        }
+        JobRef job;
+        job.id = it->value("id", "");
+        job.kind = it->value("kind", "");
+        job.status = it->value("status", "");
+        job.message = it->value("message", "");
+        job.error = it->value("error", "");
+        job.queue_position = it->value("queue_position", 0);
+        return job;
+    } catch (const json::exception& e) {
+        error = std::string("malformed JSON: ") + e.what();
+        return std::nullopt;
+    }
+}
+
+}  // namespace
+
+std::optional<JobRef> ApiClient::vary(const std::string& project_id,
+                                      const std::string& stem_id,
+                                      const std::string& idempotency_key) {
+    return post_job(http_,
+                    url("/api/projects/" + url_escape(project_id) + "/stems/" +
+                        url_escape(stem_id) + "/vary"),
+                    json::object(), idempotency_key, last_error_, "vary");
+}
+
+std::optional<JobRef> ApiClient::extend(const std::string& project_id,
+                                        const std::string& stem_id, int bars,
+                                        const std::string& idempotency_key) {
+    json body;
+    body["bars"] = bars;
+    return post_job(http_,
+                    url("/api/projects/" + url_escape(project_id) + "/stems/" +
+                        url_escape(stem_id) + "/extend"),
+                    body, idempotency_key, last_error_, "extend");
+}
+
+std::optional<JobRef> ApiClient::isolate(const std::string& project_id,
+                                         const std::string& stem_id,
+                                         const std::string& idempotency_key) {
+    return post_job(http_,
+                    url("/api/projects/" + url_escape(project_id) + "/stems/" +
+                        url_escape(stem_id) + "/isolate"),
+                    json::object(), idempotency_key, last_error_, "isolate");
+}
+
+std::optional<JobRef> ApiClient::change_voice(const std::string& project_id,
+                                              const std::string& stem_id,
+                                              const std::string& voice_id,
+                                              double start_s, double end_s,
+                                              const std::string& idempotency_key) {
+    json body;
+    body["voice_id"] = voice_id;
+    if (start_s >= 0.0 && end_s > start_s) {
+        body["start_s"] = start_s;
+        body["end_s"] = end_s;
+    }
+    return post_job(http_,
+                    url("/api/projects/" + url_escape(project_id) + "/stems/" +
+                        url_escape(stem_id) + "/voice"),
+                    body, idempotency_key, last_error_, "voice change");
+}
+
+bool ApiClient::set_version(const std::string& project_id,
+                            const std::string& stem_id, int index) {
+    const Response r = http_.post(
+        url("/api/projects/" + url_escape(project_id) + "/stems/" +
+            url_escape(stem_id) + "/version/" + std::to_string(index)),
+        "{}");
+    if (!r.ok()) {
+        last_error_ = r.error.empty() ? ("HTTP " + std::to_string(r.status)) : r.error;
+        return false;
+    }
+    return true;
+}
+
+std::vector<ApiClient::Voice> ApiClient::voices() {
+    std::vector<Voice> out;
+    const Response r = http_.get(url("/api/voices"));
+    auto body = parse(r, last_error_);
+    if (!body) return out;
+    auto it = body->find("voices");
+    if (it == body->end() || !it->is_array()) return out;
+    for (const auto& v : *it) {
+        Voice voice;
+        voice.id = field<std::string>(v, "id", "");
+        voice.label = field<std::string>(v, "label", voice.id);
+        voice.description = field<std::string>(v, "description", "");
+        if (!voice.id.empty()) out.push_back(std::move(voice));
+    }
+    return out;
 }
 
 std::vector<ProjectSummary> ApiClient::projects() {

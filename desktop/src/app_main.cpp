@@ -43,6 +43,7 @@
 #include "vikui/vikui.h"
 #include "vikui/theme.h"
 #include "vikui/elements/canvas.h"
+#include "components/menu.h"
 #include "components/phosphor.h"
 
 #include <include/core/SkStream.h>
@@ -100,6 +101,8 @@ struct MsgStemUpdated {
     mx::TrackId  track_id = 0;
     mx::SourceId source_id = 0;
     std::string  version_id;
+    std::string  op;                 // which tool produced it
+    int64_t      affected_from = -1; // where to put the playhead, or -1
     mx::Media    media;
 };
 
@@ -234,6 +237,12 @@ struct Studio {
     // Keys are dispatched along the focused node's path. With nothing focused
     // the path is empty and on_key_down never fires, which is why every
     // shortcut silently did nothing.
+    /// A handle to this entity, for callbacks that receive only (Window&, App&)
+    /// -- menu items, chiefly. cx.listener() cannot wrap those because it wraps
+    /// an event-carrying signature. This lives on the UI thread only; workers
+    /// still never hold a handle.
+    vik::Handle<Studio> self;
+
     vik::FocusHandle keys;
     bool             keys_focused = false;
     bool  fitted      = false;
@@ -260,6 +269,14 @@ struct Studio {
     bool                  show_settings = false;
     bool                  show_layers = false;
     bool                  show_generate = false;
+    /// Which AI tool's modal is open. One field rather than a bool each: they
+    /// are mutually exclusive, and separate bools drift out of sync.
+    enum class Tool { None, Layer, Splitter, Inspire, Voice, Enhance, Extend };
+    Tool                  tool = Tool::None;
+    bool                  show_tool_picker = false;
+    std::string           split_tier = "basic";
+    bool                  split_remove_reverb = false;
+    int                   extend_bars = 8;
     std::string           gen_prompt = "warm indie soul, brushed drums, rhodes";
     std::string           gen_lyrics;
     std::string           gen_quality = "ultra";
@@ -715,7 +732,9 @@ struct Studio {
                 wake_ui(platform);
                 return;
             }
-            g_inbox.push(MsgStemUpdated{track_id, source_id, version->id, std::move(media)});
+            g_inbox.push(MsgStemUpdated{
+                track_id, source_id, version->id, "repaint",
+                static_cast<int64_t>(start_s * rate), std::move(media)});
             wake_ui(platform);
         }).detach();
     }
@@ -788,25 +807,9 @@ struct Studio {
                 return;
             }
 
-            // Split it, because a single mixed take is not editable. This is the
-            // step that makes the result parts rather than a bounce.
-            auto split = api.split(made.project_id, detail->variations.front().id,
-                                   "basic");
-            if (split) {
-                g_inbox.push(MsgJob{split->id, "split", split->status,
-                                    split->message, split->queue_position, false});
-                wake_ui(platform);
-                auto done = api.follow(split->id, [&](const mx::net::JobRef& j) {
-                    g_inbox.push(MsgJob{j.id, "split", j.status, j.message,
-                                        j.queue_position, false});
-                    wake_ui(platform);
-                    return true;
-                });
-                g_inbox.push(MsgJob{done.id, "split", done.status, done.message,
-                                    0, true});
-                wake_ui(platform);
-                detail = api.project(made.project_id);
-            }
+            // No split. Generate produces a take; separating it into parts is
+            // the Stem Splitter tool, invoked deliberately. Doing it here
+            // doubled time-to-first-sound and hid the take that was rendered.
 
             g_inbox.push(MsgProjectOpened{made.project_id, "Untitled",
                                           detail ? detail->summary.bpm : 120.0,
@@ -966,6 +969,259 @@ struct Studio {
         }).detach();
     }
 
+    /// The stem this selection refers to, or nullptr with a reason set.
+    ///
+    /// Every per-stem tool needs the same three things, and each one deriving
+    /// them separately is how they drift apart.
+    mx::Source* selected_source(std::string* why = nullptr) {
+        if (open_project_id.empty()) {
+            if (why) *why = "nothing here came from the pod";
+            return nullptr;
+        }
+        const mx::TrackId track =
+            selection.active() ? selection.track
+                               : (session.tracks.empty() ? 0 : session.tracks.front().id);
+        for (const auto& clip : session.clips) {
+            if (clip.track_id != track) continue;
+            mx::Source* src = session.find_source(clip.source_id);
+            if (src && !src->stem_id.empty()) return src;
+        }
+        if (why) *why = "that track did not come from the pod";
+        return nullptr;
+    }
+
+    /// Shared tail for every per-stem tool: follow the job, re-read the project,
+    /// fetch whatever version is current now, decode it, hand it back.
+    ///
+    /// Written once because the five tools differ only in which request starts
+    /// them -- and because each one re-deriving "which audio is the result"
+    /// would be five chances to assume the server names files predictably.
+    void run_tool(const char* op, mx::SourceId source_id, std::string stem_id,
+                  int64_t affected_from, vik::App& app,
+                  std::function<std::optional<mx::net::JobRef>(
+                      mx::net::ApiClient&, const std::string&, const std::string&)>
+                      start) {
+        if (net_busy || open_project_id.empty()) return;
+        net_busy = true;
+        net_error = false;
+        net_status = std::string(op) + "…";
+
+        auto* platform = &app.platform();
+        std::thread([url = pod_url, token = pod_token, project = open_project_id,
+                     op = std::string(op), stem_id, source_id, affected_from,
+                     rate = session.rate, start = std::move(start), platform] {
+            WorkerScope scope;
+            mx::net::ApiClient api;
+            api.set_base(url);
+            api.set_token(token);
+
+            auto job = start(api, project, stem_id);
+            if (!job) {
+                g_inbox.push(MsgStatus{op + " refused: " + api.last_error(), true});
+                wake_ui(platform);
+                return;
+            }
+            g_inbox.push(MsgJob{job->id, op, job->status, job->message,
+                                job->queue_position, false});
+            wake_ui(platform);
+
+            const auto finished = api.follow(job->id, [&](const mx::net::JobRef& j) {
+                g_inbox.push(MsgJob{j.id, op, j.status, j.message,
+                                    j.queue_position, false});
+                wake_ui(platform);
+                return true;
+            });
+            g_inbox.push(MsgJob{finished.id, op, finished.status, finished.message,
+                                0, true});
+            wake_ui(platform);
+
+            if (finished.status != "done") {
+                g_inbox.push(MsgStatus{
+                    op + " " + finished.status +
+                        (finished.error.empty() ? "" : ": " + finished.error),
+                    finished.status != "cancelled"});
+                wake_ui(platform);
+                return;
+            }
+
+            auto detail = api.project(project);
+            if (!detail) {
+                g_inbox.push(MsgStatus{"rendered, but cannot re-read the project: " +
+                                       api.last_error(), true});
+                wake_ui(platform);
+                return;
+            }
+
+            // A split makes new stems rather than a new version of this one, so
+            // reload the whole set. Anything else replaces one stem in place.
+            if (op == "split") {
+                g_inbox.push(MsgProjectOpened{project, "", detail->summary.bpm,
+                                              detail->summary.bars,
+                                              static_cast<int>(detail->stems.size())});
+                wake_ui(platform);
+                int ordinal = 0;
+                for (const auto& stem : detail->stems) {
+                    const auto* version = stem.version();
+                    if (!version || version->audio.empty()) continue;
+                    const uint64_t key = mx::net::cache_key(project, version->id,
+                                                            version->audio);
+                    const auto cached = mx::net::cache_path(key);
+                    const bool hit = std::filesystem::exists(cached);
+                    if (!hit && !api.fetch_audio(project, version->audio,
+                                                 cached.string()))
+                        continue;
+                    mx::Media media = mx::decode_file(cached, rate);
+                    if (!media.ok()) continue;
+                    g_inbox.push(MsgStemArrived{
+                        stem.label.empty() ? stem.track_class : stem.label,
+                        stem.id, version->id, ordinal++, std::move(media), 0.0, hit});
+                    wake_ui(platform);
+                }
+                g_inbox.push(MsgStatus{"", false});
+                wake_ui(platform);
+                return;
+            }
+
+            const mx::net::VersionRef* version = nullptr;
+            for (const auto& stem : detail->stems)
+                if (stem.id == stem_id) version = stem.version();
+            if (!version || version->audio.empty()) {
+                g_inbox.push(MsgStatus{"rendered, but the stem has no current version",
+                                       true});
+                wake_ui(platform);
+                return;
+            }
+
+            const uint64_t key = mx::net::cache_key(project, version->id, version->audio);
+            const auto cached = mx::net::cache_path(key);
+            if (!std::filesystem::exists(cached) &&
+                !api.fetch_audio(project, version->audio, cached.string())) {
+                g_inbox.push(MsgStatus{"cannot fetch the result: " + api.last_error(),
+                                       true});
+                wake_ui(platform);
+                return;
+            }
+            mx::Media media = mx::decode_file(cached, rate);
+            if (!media.ok()) {
+                std::error_code ec;
+                std::filesystem::remove(cached, ec);
+                g_inbox.push(MsgStatus{"the result will not decode: " + media.error,
+                                       true});
+                wake_ui(platform);
+                return;
+            }
+            g_inbox.push(MsgStemUpdated{0, source_id, version->id, op,
+                                        affected_from, std::move(media)});
+            wake_ui(platform);
+        }).detach();
+    }
+
+    void run_split(vik::App& app) {
+        if (net_busy || open_project_id.empty()) return;
+        // Split acts on the take, not on a stem, so it needs a variation id --
+        // which means asking the pod what this project actually has.
+        auto* platform = &app.platform();
+        net_busy = true;
+        net_error = false;
+        net_status = "splitting…";
+        std::thread([url = pod_url, token = pod_token, project = open_project_id,
+                     tier = split_tier, dereverb = split_remove_reverb,
+                     rate = session.rate, platform] {
+            WorkerScope scope;
+            mx::net::ApiClient api;
+            api.set_base(url);
+            api.set_token(token);
+
+            auto detail = api.project(project);
+            if (!detail || detail->variations.empty()) {
+                g_inbox.push(MsgStatus{"nothing to split -- generate a take first",
+                                       true});
+                wake_ui(platform);
+                return;
+            }
+            auto job = api.split(project, detail->variations.front().id, tier,
+                                 dereverb);
+            if (!job) {
+                g_inbox.push(MsgStatus{"split refused: " + api.last_error(), true});
+                wake_ui(platform);
+                return;
+            }
+            g_inbox.push(MsgJob{job->id, "split", job->status, job->message,
+                                job->queue_position, false});
+            wake_ui(platform);
+            const auto finished = api.follow(job->id, [&](const mx::net::JobRef& j) {
+                g_inbox.push(MsgJob{j.id, "split", j.status, j.message,
+                                    j.queue_position, false});
+                wake_ui(platform);
+                return true;
+            });
+            g_inbox.push(MsgJob{finished.id, "split", finished.status,
+                                finished.message, 0, true});
+            wake_ui(platform);
+            if (finished.status != "done") {
+                g_inbox.push(MsgStatus{"split " + finished.status,
+                                       finished.status != "cancelled"});
+                wake_ui(platform);
+                return;
+            }
+
+            detail = api.project(project);
+            if (!detail) {
+                g_inbox.push(MsgStatus{"split, but cannot re-read the project", true});
+                wake_ui(platform);
+                return;
+            }
+            g_inbox.push(MsgProjectOpened{project, "", detail->summary.bpm,
+                                          detail->summary.bars,
+                                          static_cast<int>(detail->stems.size())});
+            wake_ui(platform);
+            int ordinal = 0;
+            for (const auto& stem : detail->stems) {
+                const auto* version = stem.version();
+                if (!version || version->audio.empty()) continue;
+                const uint64_t key = mx::net::cache_key(project, version->id,
+                                                        version->audio);
+                const auto cached = mx::net::cache_path(key);
+                const bool hit = std::filesystem::exists(cached);
+                if (!hit && !api.fetch_audio(project, version->audio, cached.string()))
+                    continue;
+                mx::Media media = mx::decode_file(cached, rate);
+                if (!media.ok()) continue;
+                g_inbox.push(MsgStemArrived{
+                    stem.label.empty() ? stem.track_class : stem.label,
+                    stem.id, version->id, ordinal++, std::move(media), 0.0, hit});
+                wake_ui(platform);
+            }
+            g_inbox.push(MsgStatus{"", false});
+            wake_ui(platform);
+        }).detach();
+    }
+
+    void run_isolate(vik::App& app) {
+        std::string why;
+        mx::Source* src = selected_source(&why);
+        if (!src) { net_status = why; net_error = true; return; }
+        run_tool("enhance", src->id, src->stem_id, selection.begin(), app,
+                 [](mx::net::ApiClient& api, const std::string& project,
+                    const std::string& stem) {
+                     return api.isolate(project, stem, project + ":isolate:" + stem);
+                 });
+    }
+
+    void run_extend(vik::App& app) {
+        std::string why;
+        mx::Source* src = selected_source(&why);
+        if (!src) { net_status = why; net_error = true; return; }
+        run_tool("extend", src->id, src->stem_id, -1, app,
+                 [bars = extend_bars](mx::net::ApiClient& api,
+                                      const std::string& project,
+                                      const std::string& stem) {
+                     return api.extend(project, stem, bars,
+                                       project + ":extend:" + stem + ":" +
+                                           std::to_string(bars));
+                 });
+    }
+
     void cancel_job(const std::string& id, vik::App& app) {
         for (auto& job : jobs)
             if (job.id == id) job.cancelling = true;
@@ -1021,9 +1277,10 @@ struct Studio {
         auto& track = session.add_track(msg.label,
                                         colors[msg.ordinal % std::size(colors)]);
         auto& source = session.add_source({}, msg.label);
-        source.buffer = msg.media.buffer;
-        source.peaks = std::move(msg.media.peaks);
         source.source_rate = msg.media.source_rate;
+        source.adopt(mx::SourceVersion{msg.version_id, {}, "import", {},
+                                       msg.media.buffer,
+                                       std::move(msg.media.peaks)});
         // Provenance, not a mirror: enough to fetch this audio again and to say
         // where it came from. No copy of the server's project.
         source.project_id = open_project_id;
@@ -1110,20 +1367,25 @@ struct Studio {
                     changed = true;
 
                 } else if constexpr (std::is_same_v<T, MsgStemUpdated>) {
-                    // Swap the audio under the existing clip. The clip, its
-                    // track and its position are untouched -- only the source
-                    // buffer changes, so a regenerate cannot quietly move
-                    // anything on the timeline.
+                    // Append, never replace. A result you cannot compare against
+                    // the take before it is indistinguishable from no result at
+                    // all unless you happen to replay the exact region -- which
+                    // is precisely how a working regenerate got reported as
+                    // "nothing changed".
                     if (mx::Source* src = session.find_source(m.source_id)) {
-                        src->buffer = m.media.buffer;
-                        src->peaks = std::move(m.media.peaks);
-                        src->version_id = m.version_id;
+                        src->adopt(mx::SourceVersion{m.version_id, {}, m.op, {},
+                                                     m.media.buffer,
+                                                     std::move(m.media.peaks)});
                         for (auto& clip : session.clips)
                             if (clip.source_id == src->id)
                                 clip.length = std::min(clip.length, src->buffer->frames);
+
+                        // Put the playhead at the start of what changed, so the
+                        // next thing heard is the thing that was rendered.
+                        if (m.affected_from >= 0) seek(m.affected_from);
                     }
                     net_busy = false;
-                    net_status = "regenerated";
+                    net_status = m.op.empty() ? "done" : (m.op + " applied");
                     if (selftest) regen_done = true;
                     changed = true;
 
@@ -1234,6 +1496,12 @@ struct Studio {
     vik::AnyElement generate_modal(vik::Context<Studio>& cx);
     vik::AnyElement layer_modal(vik::Context<Studio>& cx);
     vik::AnyElement settings_modal(vik::Context<Studio>& cx);
+    vik::ui::MenuBuilder ai_tools_menu(vik::Context<Studio>& cx);
+    vik::AnyElement tool_modal(vik::Context<Studio>& cx, const char* title,
+                               const char* blurb, vik::AnyElement body,
+                               const char* action, bool ready,
+                               std::function<void(Studio&, vik::App&)> run);
+    vik::AnyElement current_tool_modal(vik::Context<Studio>& cx);
 };
 
 // ---------------------------------------------------------------------------
@@ -1388,6 +1656,224 @@ vik::AnyElement Studio::layer_modal(vik::Context<Studio>& cx) {
                 .child(std::move(chips)))
             .into_any();
     }
+
+/// The AI Tools menu, built once and used by both the right-click menu and the
+/// dock, so the two cannot offer different things.
+///
+/// Tools that exist but cannot act yet are shown disabled rather than hidden: a
+/// menu that changes shape depending on state is harder to learn than one where
+/// an item explains why it is unavailable.
+/// The shell every AI tool shares: "Selection a - b" in the corner, a title, a
+/// sentence about what it does, the tool's own controls, and one primary
+/// button. Taken from the reference, where every tool looks like this -- and the
+/// selection is restated on every one because a tool whose scope is invisible is
+/// a tool people stop trusting.
+vik::AnyElement Studio::tool_modal(vik::Context<Studio>& cx, const char* title,
+                                   const char* blurb, vik::AnyElement body,
+                                   const char* action, bool ready,
+                                   std::function<void(Studio&, vik::App&)> run) {
+    const std::string range =
+        selection.active()
+            ? std::format("{:.2f} - {:.2f}s",
+                          static_cast<double>(selection.begin()) / session.rate,
+                          static_cast<double>(selection.end()) / session.rate)
+            : std::string("whole track");
+
+    return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
+        .flex_row().items_center().justify_center()
+        .occlude()
+        .bg(vik::rgba(0x000000aa))
+        .on_mouse_down(vik::MouseButton::Left, cx.listener(
+            [](Studio& s, const vik::MouseDownEvent&, vik::Window&,
+               vik::Context<Studio>& c) {
+                s.tool = Tool::None;
+                c.notify();
+            }))
+        .child(vik::div().flex_col().gap_3().p_4().w_px(520.0f)
+            .occlude()
+            .on_mouse_down(vik::MouseButton::Left,
+                [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
+                    w.stop_propagation();
+                })
+            .rounded_lg().bg(vik::rgb(0x232834))
+            .border_1().border_color(vik::rgb(0x3b4250))
+            .child(vik::div().flex_row().items_start().justify_between()
+                .child(vik::div().flex_col()
+                    .child(vik::text("Selection").text_xs()
+                               .text_color(vik::rgb(0x6c7383)))
+                    .child(vik::text(range).text_xs()
+                               .text_color(vik::rgb(0xc9cedb))))
+                .child(vik::text(title).text_xl().text_color(vik::white()))
+                .child(vik::div().id("tclose").px_2().py_1().rounded_md()
+                    .cursor_pointer()
+                    .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x2c313d)); })
+                    .on_click(cx.listener([](Studio& s, const vik::ClickEvent&,
+                                             vik::Window&,
+                                             vik::Context<Studio>& c) {
+                        s.tool = Tool::None;
+                        c.notify();
+                    }))
+                    .child(vik::ui::phosphor("x", vik::ui::PhWeight::Bold)
+                               .size(14.0f).color(vik::rgb(0xc9cedb)))))
+            .child(vik::text(blurb).text_xs().text_color(vik::rgb(0x8d94a3)))
+            .child(std::move(body))
+            .child(vik::div().id("trun").px_4().py_2().rounded_md()
+                .flex_row().justify_center()
+                .bg(vik::rgb(ready ? 0x5b5bd6 : 0x2c313d))
+                .cursor_pointer()
+                .on_click(cx.listener([run = std::move(run), ready](
+                        Studio& s, const vik::ClickEvent&, vik::Window&,
+                        vik::Context<Studio>& c) {
+                    if (!ready) return;
+                    s.tool = Tool::None;
+                    run(s, c.app());
+                    c.notify();
+                }))
+                .child(vik::text(action)
+                           .text_color(vik::rgb(ready ? 0xffffff : 0x6c7383)))))
+        .into_any();
+}
+
+/// Whichever tool is open, or an empty element.
+vik::AnyElement Studio::current_tool_modal(vik::Context<Studio>& cx) {
+    auto chip = [&cx](const std::string& label, bool on, auto fn) {
+        return vik::div().id("tc").px_3().py_2().rounded_md().cursor_pointer()
+            .bg(vik::rgb(on ? 0x3a4a68 : 0x2c313d))
+            .border_1().border_color(vik::rgb(on ? 0x5b5bd6 : 0x3b4250))
+            .on_click(cx.listener(fn))
+            .child(vik::text(label).text_color(vik::rgb(on ? 0xffffff : 0xc9cedb)));
+    };
+
+    switch (tool) {
+    case Tool::Splitter: {
+        // The reference's dialog, option for option.
+        auto body = vik::div().flex_col().gap_2()
+            .child(chip("Basic: Vocal + Instrumental", split_tier == "basic",
+                [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                   vik::Context<Studio>& c) { s.split_tier = "basic"; c.notify(); }))
+            .child(chip("Professional: 6 stems", split_tier == "professional",
+                [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                   vik::Context<Studio>& c) {
+                    s.split_tier = "professional";
+                    c.notify();
+                }))
+            .child(chip("Advanced: all detected stems", split_tier == "advanced",
+                [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                   vik::Context<Studio>& c) { s.split_tier = "advanced"; c.notify(); }))
+            .child(chip(split_remove_reverb
+                            ? "[x] Remove reverb and backing vocals"
+                            : "[ ] Remove reverb and backing vocals",
+                        split_remove_reverb,
+                [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                   vik::Context<Studio>& c) {
+                    s.split_remove_reverb = !s.split_remove_reverb;
+                    c.notify();
+                }))
+            .into_any();
+        return tool_modal(cx, "Stem Splitter",
+                          "Separate the take into parts you can edit on their own.",
+                          std::move(body), "Split", !open_project_id.empty(),
+                          [](Studio& s, vik::App& app) { s.run_split(app); });
+    }
+    case Tool::Layer: {
+        auto chips = vik::div().flex_row().wrap().gap_2();
+        for (const char* name : kTrackClasses) {
+            chips = std::move(chips).child(
+                vik::div().id("lc").px_3().py_2().rounded_md().cursor_pointer()
+                    .bg(vik::rgb(0x2c313d))
+                    .border_1().border_color(vik::rgb(0x3b4250))
+                    .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x3a4a68)); })
+                    .on_click(cx.listener([name](Studio& s, const vik::ClickEvent&,
+                                                 vik::Window&,
+                                                 vik::Context<Studio>& c) {
+                        s.tool = Tool::None;
+                        s.add_layer(name, c.app());
+                        c.notify();
+                    }))
+                    .child(vik::text(name).text_color(vik::rgb(0xe6e8ec))));
+        }
+        return tool_modal(cx, "Add a Layer",
+                          "Write a new part against what is already here. Pick an "
+                          "instrument to start.",
+                          std::move(chips).into_any(),
+                          "Pick an instrument above", false,
+                          [](Studio&, vik::App&) {});
+    }
+    case Tool::Inspire:
+        return tool_modal(cx, "Inspire Me",
+                          "Render this part again over the selection, keeping "
+                          "everything outside it.",
+                          vik::div().into_any(), "Generate",
+                          selection.active() && !net_busy,
+                          [](Studio& s, vik::App& app) { s.regenerate(app); });
+    case Tool::Enhance:
+        return tool_modal(cx, "Music Enhancer",
+                          "Clean up this part in place.",
+                          vik::div().into_any(), "Enhance",
+                          selection.active() && !net_busy,
+                          [](Studio& s, vik::App& app) { s.run_isolate(app); });
+    case Tool::Extend: {
+        auto body = vik::div().flex_row().gap_2().items_center()
+            .child(vik::text("bars").text_xs().text_color(vik::rgb(0x6c7383)))
+            .child(chip("4", extend_bars == 4,
+                [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                   vik::Context<Studio>& c) { s.extend_bars = 4; c.notify(); }))
+            .child(chip("8", extend_bars == 8,
+                [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                   vik::Context<Studio>& c) { s.extend_bars = 8; c.notify(); }))
+            .child(chip("16", extend_bars == 16,
+                [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                   vik::Context<Studio>& c) { s.extend_bars = 16; c.notify(); }))
+            .into_any();
+        return tool_modal(cx, "Extend",
+                          "Continue this part past where it ends.",
+                          std::move(body), "Extend",
+                          selection.active() && !net_busy,
+                          [](Studio& s, vik::App& app) { s.run_extend(app); });
+    }
+    case Tool::Voice:
+        return tool_modal(cx, "Voice Changer",
+                          "No voices are loaded from this pod yet, so there is "
+                          "nothing to convert to.",
+                          vik::div().into_any(), "Convert", false,
+                          [](Studio&, vik::App&) {});
+    case Tool::None:
+    default:
+        return vik::div().into_any();
+    }
+}
+
+vik::ui::MenuBuilder Studio::ai_tools_menu(vik::Context<Studio>&) {
+    vik::ui::MenuBuilder menu;
+    const bool connected = !open_project_id.empty() && !net_busy;
+    const bool ranged = connected && selection.active();
+
+    auto entry = [&menu, handle = self](const char* label, bool enabled, Tool which) {
+        if (!enabled) {
+            menu.disabled_item(label);
+            return;
+        }
+        menu.item(label, [handle, which](vik::Window&, vik::App& app) {
+            app.update_entity(handle, [which](Studio& s, vik::Context<Studio>& c) {
+                s.tool = which;
+                c.notify();
+            });
+        });
+    };
+
+    // Ordered as in the reference, and disabled with a reason rather than
+    // hidden: a menu that changes shape with state is harder to learn than one
+    // where an item explains why it cannot run.
+    entry("Inspire Me", ranged, Tool::Inspire);
+    entry("Add a Layer", connected, Tool::Layer);
+    entry("Music Enhancer", ranged, Tool::Enhance);
+    entry("Voice Changer", ranged, Tool::Voice);
+    entry("Stem Splitter", connected, Tool::Splitter);
+    entry("Extend", ranged, Tool::Extend);
+    menu.separator();
+    menu.disabled_item("Vocal to MIDI");        // no endpoint for it yet
+    return menu;
+}
 
 vik::AnyElement Studio::generate_modal(vik::Context<Studio>& cx) {
     auto icon_button = [&cx](const char* id, const char* icon, bool active, auto fn) {
@@ -1740,8 +2226,8 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
     // recognise: a floating pill of icon groups over the canvas rather than a
     // toolbar bolted to an edge. Grouped as in the reference --
     // [record sources] [AI tools] [global] -- with dividers between groups.
-    auto tool = [&cx](const char* id, const char* icon, const char* tip,
-                      bool enabled, auto fn) {
+    auto dock_tool = [&cx](const char* id, const char* icon, const char* tip,
+                           bool enabled, auto fn) {
         auto button = vik::div().id(id).px_3().py_2().rounded_md()
             .flex_row().items_center().justify_center()
             .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x333a4a)); })
@@ -1772,7 +2258,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
                     w.stop_propagation();
                 })
-            .child(tool("t-gen", "sparkle",
+            .child(dock_tool("t-gen", "sparkle",
                         pod_url.empty() ? "Set a pod first (gear, bottom left)"
                                         : "Generate  (G)",
                         !pod_url.empty() && !net_busy,
@@ -1781,20 +2267,20 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                             s.show_generate = true;
                             c.notify();
                         }))
-            .child(tool("t-mic", "microphone-stage", "Record a voice take (not yet)",
+            .child(dock_tool("t-mic", "microphone-stage", "Record a voice take (not yet)",
                         false, [](Studio&, const vik::ClickEvent&, vik::Window&,
                                   vik::Context<Studio>&) {}))
-            .child(tool("t-inst", "guitar", "Instruments (not yet)", false,
+            .child(dock_tool("t-inst", "guitar", "Instruments (not yet)", false,
                         [](Studio&, const vik::ClickEvent&, vik::Window&,
                            vik::Context<Studio>&) {}))
             .child(divider())
-            .child(tool("t-regen", "arrows-clockwise",
+            .child(dock_tool("t-regen", "arrows-clockwise",
                         armed ? "Regenerate the selection  (R)"
                               : "Select a range on a pod track first",
                         armed,
                         [](Studio& s, const vik::ClickEvent&, vik::Window&,
                            vik::Context<Studio>& c) { s.regenerate(c.app()); c.notify(); }))
-            .child(tool("t-layer", "stack-plus",
+            .child(dock_tool("t-layer", "stack-plus",
                         open_project_id.empty()
                             ? "Import a pod project first"
                             : "Add a layer  (L)",
@@ -1804,14 +2290,22 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                             s.show_layers = true;
                             c.notify();
                         }))
-            .child(tool("t-split", "scissors", "Stem splitter (not yet)", false,
+            .child(dock_tool("t-split", "scissors", "Stem splitter (not yet)", false,
                         [](Studio&, const vik::ClickEvent&, vik::Window&,
                            vik::Context<Studio>&) {}))
-            .child(tool("t-more", "dots-three", "More tools (not yet)", false,
-                        [](Studio&, const vik::ClickEvent&, vik::Window&,
-                           vik::Context<Studio>&) {}))
+            .child(dock_tool("t-more", "dots-three",
+                        open_project_id.empty() ? "Generate something first"
+                                                : "AI tools  (right-click too)",
+                        !open_project_id.empty(),
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) {
+                            // Same set as the right-click menu; the reference
+                            // offers both routes to the identical list.
+                            s.show_tool_picker = !s.show_tool_picker;
+                            c.notify();
+                        }))
             .child(divider())
-            .child(tool("t-pod", "globe",
+            .child(dock_tool("t-pod", "globe",
                         open_project_id.empty() ? "Not connected to a pod"
                                                 : "Connected",
                         false,
@@ -2017,8 +2511,18 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
 
     if (show_layers) overlay = layer_modal(cx);
 
-    if (show_settings && !show_layers && !show_generate)
+    if (tool != Tool::None)
+        overlay = current_tool_modal(cx);
+    else if (show_settings && !show_layers && !show_generate)
         overlay = settings_modal(cx);
+
+    // Right-click anywhere on the arrangement opens the tools, which is how the
+    // reference reaches every one of them. vikui's context_menu_area already
+    // does open-at-cursor, submenu flyouts and dismiss-on-escape, so none of
+    // that is ours to write.
+    auto timeline_area =
+        vik::ui::context_menu_area("timeline-tools", ai_tools_menu(cx),
+                                   std::move(timeline).into_any());
 
     return vik::div().size_full().flex_col().relative().bg(vik::rgb(0x14161d))
         .track_focus(keys)
@@ -2052,8 +2556,10 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 // A modal owns the keyboard while it is open. Firing
                 // timeline shortcuts underneath one is the keyboard version of
                 // the click falling through.
-                if (s.show_generate || s.show_layers || s.show_settings) {
+                if (s.tool != Tool::None || s.show_generate ||
+                    s.show_layers || s.show_settings) {
                     if (e.key == "escape") {
+                        s.tool = Tool::None;
                         s.show_generate = s.show_layers = s.show_settings = false;
                         c.notify();
                     }
@@ -2079,7 +2585,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
         .child(vik::div().flex_1().flex_row()
                    .child(std::move(sidebar))
                    .child(std::move(headers))
-                   .child(std::move(timeline)))
+                   .child(std::move(timeline_area)))
         .child(std::move(overlay))
         .into_any();
 }
@@ -2406,6 +2912,7 @@ int main(int argc, char** argv) {
                 app.update_entity(handle, [&](Studio& s, vik::Context<Studio>& c) {
                     s.selftest = selftest;
                     s.keys = key_focus;
+                    s.self = handle;
                     s.settings = mx::Settings::load();
                     // Flags win over stored settings: a scripted run must be
                     // reproducible regardless of what this machine remembers.
@@ -2427,6 +2934,12 @@ int main(int argc, char** argv) {
                     s.show_generate = (open_panel == "generate");
                     s.show_layers   = (open_panel == "layers");
                     s.show_settings = (open_panel == "settings");
+                    if (open_panel == "splitter") s.tool = Tool::Splitter;
+                    else if (open_panel == "inspire") s.tool = Tool::Inspire;
+                    else if (open_panel == "enhance") s.tool = Tool::Enhance;
+                    else if (open_panel == "extend") s.tool = Tool::Extend;
+                    else if (open_panel == "voice") s.tool = Tool::Voice;
+                    else if (open_panel == "tool-layer") s.tool = Tool::Layer;
                     s.stress = stress;
                     // Read the theme once at startup. It is what tooltips
                     // dereference, and a missing one used to surface only when

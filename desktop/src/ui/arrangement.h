@@ -67,6 +67,10 @@ inline float track_top(int index) {
     return kRulerHeight + static_cast<float>(index) * (kTrackHeight + kTrackGap);
 }
 
+/// Where the version badge sits inside a clip's title strip, so the hit-test
+/// and the drawing agree on one rectangle rather than two guesses.
+constexpr float kTitleStrip = 15.0f;
+
 /// Which track lane a y coordinate falls in, or -1. The inverse function again.
 inline int track_at(float y, int track_count) {
     if (y < kRulerHeight) return -1;

@@ -313,9 +313,23 @@ def repaint_stem(project: Project, stem: Stem, start_s: float, end_s: float,
     if report:
         report(0.15, f"repainting {start_s:.2f}s-{end_s:.2f}s")
 
-    engines.music().repaint(dest, src, start_s, end_s,
+    # Render to a scratch file, then splice only the requested window back into
+    # the original.
+    #
+    # ACE-Step re-encodes the whole clip, so the parts nobody asked to change
+    # come back *re-synthesised* -- close to the original but not it. Measured,
+    # that was ~-42 dBFS of drift across untouched seconds: quiet, audible on a
+    # sparse stem, and squarely audio the user asked to keep. Splicing makes
+    # outside the region bit-identical instead of merely similar, which is what
+    # the voice path already does a few functions below.
+    rendered = dest.with_suffix(".render.wav")
+    engines.music().repaint(rendered, src, start_s, end_s,
                             prompt or stem.prompt, project.grid, seed,
                             report=report, **_quality(project))
+    try:
+        audio.splice(src, rendered, dest, start_s, end_s)
+    finally:
+        rendered.unlink(missing_ok=True)
 
     # Prove the untouched region really was untouched, rather than trusting it.
     outside_residual = _outside_residual(src, dest, start_s, end_s)
@@ -325,8 +339,11 @@ def repaint_stem(project: Project, stem: Stem, start_s: float, end_s: float,
                 "seed": seed, "prompt": prompt or stem.prompt,
                 "outside_residual": outside_residual},
         sync=_verify(dest, project.grid),
+        # 0.05 relative RMS is about -26 dB -- it accepted plainly audible
+        # drift. With the splice, anything outside the window should be
+        # identical, so this now only tolerates float noise.
         note=("context preserved" if outside_residual is not None
-              and outside_residual < 0.05 else
+              and outside_residual < 0.001 else
               f"WARNING: audio outside the region changed (residual {outside_residual})"),
     ))
     storage.save(project)

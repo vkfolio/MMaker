@@ -115,9 +115,44 @@ public:
                        const std::string& idempotency_key = {});
 
     /// Separate a rendered take into stems, so each part is editable.
+    ///
+    /// Tiers match the reference dialog: basic (vocal + instrumental),
+    /// professional (6 stems), advanced (everything detected).
     std::optional<JobRef> split(const std::string& project_id,
                                 const std::string& variation_id,
-                                const std::string& tier = "basic");
+                                const std::string& tier = "basic",
+                                bool remove_reverb = false);
+
+    /// The remaining per-stem tools. All take the same shape as repaint: a
+    /// range in seconds where the server accepts one, and an idempotency key,
+    /// because every one of them starts a GPU job that a lost response would
+    /// otherwise duplicate.
+    std::optional<JobRef> vary(const std::string& project_id,
+                               const std::string& stem_id,
+                               const std::string& idempotency_key = {});
+    std::optional<JobRef> extend(const std::string& project_id,
+                                 const std::string& stem_id, int bars,
+                                 const std::string& idempotency_key = {});
+    std::optional<JobRef> isolate(const std::string& project_id,
+                                  const std::string& stem_id,
+                                  const std::string& idempotency_key = {});
+    std::optional<JobRef> change_voice(const std::string& project_id,
+                                       const std::string& stem_id,
+                                       const std::string& voice_id,
+                                       double start_s = -1.0, double end_s = -1.0,
+                                       const std::string& idempotency_key = {});
+
+    /// Make an earlier version current again. Local A/B is instant because
+    /// every version is already cached; this is what makes the choice stick.
+    bool set_version(const std::string& project_id, const std::string& stem_id,
+                     int index);
+
+    struct Voice {
+        std::string id;
+        std::string label;
+        std::string description;
+    };
+    std::vector<Voice> voices();
     std::vector<ProjectSummary> projects();
     std::optional<ProjectDetail> project(const std::string& id);
 
