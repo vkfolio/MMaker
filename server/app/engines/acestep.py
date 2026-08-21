@@ -59,6 +59,25 @@ QUALITY = {
               "installed": False},
 }
 
+# What each checkpoint needs, as opposed to what a tier wants.
+#
+# These are properties of the model, not of the tier, and keeping them apart is
+# what makes a fallback safe. A turbo checkpoint is distilled for 8 steps and
+# overrides CFG; a base checkpoint wants ~50 steps with guidance and produces
+# mush at 8. Sending one model's settings to another is worse than either tier:
+# it happened here, where `high` fell back to xl-base and kept asking for 8
+# steps, so "better model" rendered worse than turbo.
+MODEL_SETTINGS = {
+    "acestep-v15-turbo":    {"inference_steps": 8,  "guidance_scale": None},
+    "acestep-v15-xl-turbo": {"inference_steps": 8,  "guidance_scale": None},
+    "acestep-v15-xl-base":  {"inference_steps": 50, "guidance_scale": 7.0},
+    "acestep-v15-base":     {"inference_steps": 50, "guidance_scale": 7.0},
+}
+
+# Best first. A tier whose checkpoint is absent resolves to the best one that
+# is present, and takes that model's settings with it.
+MODEL_PREFERENCE = ("acestep-v15-xl-base", "acestep-v15-xl-turbo", "acestep-v15-turbo")
+
 # Extra checkpoints a pod can opt into, with their download sizes, so the
 # operator can decide rather than discover.
 OPTIONAL_WEIGHTS = {
@@ -328,9 +347,57 @@ class AceStepEngine:
             "audio_duration": round(grid.duration_s, 3),
         }
 
+    @staticmethod
+    def _resolve_model(wanted: str, present: list[str]) -> str:
+        """Which checkpoint a request for `wanted` will actually render on."""
+        if not present or wanted in present:
+            return wanted
+        for candidate in MODEL_PREFERENCE:
+            if candidate in present:
+                return candidate
+        return wanted
+
+    @staticmethod
+    def installed_models() -> list[str]:
+        """Checkpoints actually on disk.
+
+        ACE-Step runs in this container, so its checkpoint directory is readable
+        here -- which is a far better source of truth than /v1/models, whose
+        list is only what has been lazily *loaded* and is empty until the first
+        render.
+        """
+        root = os.environ.get("ACESTEP_CHECKPOINT_DIR")
+        if not root:
+            base = os.environ.get("ACESTEP_DIR", "/workspace/ACE-Step-1.5")
+            root = os.path.join(base, "checkpoints")
+        try:
+            return sorted(name for name in os.listdir(root)
+                          if os.path.isdir(os.path.join(root, name)))
+        except OSError:
+            return []
+
     def _quality_params(self, quality: str | None = None) -> dict:
         name = (quality or DEFAULT_QUALITY)
-        tier = QUALITY.get(name, QUALITY["high"])
+        tier = dict(QUALITY.get(name, QUALITY["high"]))
+
+        # If the tier's checkpoint is not installed, ACE-Step silently uses its
+        # primary model. Rather than let that happen with the wrong step count,
+        # resolve it here and carry the replacement's settings.
+        present = self.installed_models()
+        fell_back_from = None
+        if present and tier["model"] not in present:
+            for candidate in MODEL_PREFERENCE:
+                if candidate in present:
+                    fell_back_from = tier["model"]
+                    tier["model"] = candidate
+                    tier.update(MODEL_SETTINGS.get(candidate, {}))
+                    break
+        if present and tier["lm"] not in present:
+            for candidate in ("acestep-5Hz-lm-4B", "acestep-5Hz-lm-1.7B",
+                              "acestep-5Hz-lm-0.6B"):
+                if candidate in present:
+                    tier["lm"] = candidate
+                    break
 
         # Record what was asked for, now, rather than hoping the response says.
         # It does not: ACE-Step reports only timing back, so scraping the reply
@@ -343,6 +410,7 @@ class AceStepEngine:
             "requested_lm": tier["lm"],
             "inference_steps": tier["inference_steps"],
             "guidance_scale": tier["guidance_scale"],
+            "fell_back_from": fell_back_from,
         }
 
         params = {
@@ -446,7 +514,15 @@ class AceStepEngine:
         default. This is how that becomes checkable rather than inferred from
         suspiciously equal render times.
         """
+        installed = self.installed_models()
         info: dict = {"requested_tiers": {k: v["model"] for k, v in QUALITY.items()},
+                      # What is on disk, which is the answer to "can this pod
+                      # render that tier". /v1/models only reports what has been
+                      # loaded, and is empty until something renders.
+                      "installed": installed,
+                      "effective_tiers": {
+                          k: self._resolve_model(v["model"], installed)
+                          for k, v in QUALITY.items()},
                       "last_render": dict(self.last_meta)}
         for path in ("/v1/models", "/models"):
             try:
@@ -515,7 +591,7 @@ class AceStepEngine:
         info.setdefault("available", None)
         if info["available"]:
             missing = {tier: model for tier, model in info["requested_tiers"].items()
-                       if model not in info["available"]}
+                       if installed and model not in installed}
             info["tiers_that_would_fall_back"] = missing
             if missing:
                 info["note"] = (
