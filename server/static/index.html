@@ -93,6 +93,18 @@ header.bar {
   font: 500 11px/1 var(--mono); color: var(--ink-dim);
   padding: 5px 9px; border: 1px solid var(--rule); border-radius: var(--radius);
 }
+#jobStrip { display: flex; gap: 6px; align-items: center; }
+.job {
+  display: flex; align-items: center; gap: 8px;
+  border: 1px solid var(--rule-lit); border-radius: var(--radius);
+  padding: 3px 6px 3px 9px; background: var(--panel-2);
+  font-size: 11px; color: var(--ink-dim);
+}
+.job-kind { font: 600 9px/1 var(--sans); letter-spacing: .12em;
+  text-transform: uppercase; color: var(--ochre); }
+.job-msg { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-time { color: var(--ink-faint); }
+
 .led { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-faint); }
 .led.ready { background: var(--sage); }
 .led.working { background: var(--ochre); animation: breathe 1.6s infinite; }
@@ -356,6 +368,7 @@ section { margin-bottom: 30px; }
   <header class="bar">
     <div class="wordmark">music<span>maker</span></div>
     <div class="status-strip">
+      <div id="jobStrip" hidden></div>
       <span class="pill" id="gridPill" hidden></span>
       <span class="pill"><span class="led ready" id="engineLed"></span><span id="engineName">engine</span></span>
     </div>
@@ -427,6 +440,14 @@ section { margin-bottom: 30px; }
     <div class="takes" id="takesList"></div>
     <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
       <button class="btn primary" id="splitGo" disabled>Split into stems</button>
+      <div class="field">
+        <label class="chan" for="splitTier">Stems</label>
+        <select id="splitTier" title="How finely to separate the mix">
+          <option value="basic">Basic — vocal + instrumental</option>
+          <option value="professional" selected>Professional — 6 stems</option>
+          <option value="advanced">Advanced — all detected</option>
+        </select>
+      </div>
       <button class="btn ghost" id="moreTakes">More takes</button>
     </div>
   </section>
@@ -533,17 +554,63 @@ function toast(msg, kind = "") {
 }
 
 /** Follow a job to completion. onProgress(fraction, message). */
+/* Jobs are visible and stoppable. The engine reports no progress signal for a
+   render, so we show elapsed time and queue position rather than a bar that
+   would be inventing a number. */
+const jobs = new Map();   // id -> {kind, started, message, determinate, position, cancelling}
+
+function renderJobs() {
+  const strip = $("#jobStrip");
+  if (!strip) return;
+  const live = [...jobs.entries()];
+  strip.hidden = live.length === 0;
+  strip.replaceChildren(...live.map(([id, j]) => {
+    const row = el("div", "job");
+    const secs = Math.round((Date.now() - j.started) / 1000);
+    const label = j.position > 1 ? `queued #${j.position}` : (j.message || j.kind);
+    row.append(el("span", "job-kind", j.kind));
+    row.append(el("span", "job-msg", label));
+    row.append(el("span", "job-time num", `${secs}s`));
+    const stop = el("button", "btn tiny ghost", j.cancelling ? "stopping…" : "Cancel");
+    stop.disabled = !!j.cancelling;
+    stop.addEventListener("click", async () => {
+      j.cancelling = true; renderJobs();
+      try { await post(`/api/jobs/${id}/cancel`); }
+      catch (err) { toast(err.message, "bad"); }
+    });
+    row.append(stop);
+    return row;
+  }));
+}
+setInterval(renderJobs, 1000);
+
 function follow(job, onProgress) {
+  jobs.set(job.id, {kind: job.kind, started: Date.now(), message: "",
+                    determinate: true, position: job.queue_position || 0});
+  renderJobs();
+  const done = () => { jobs.delete(job.id); renderJobs(); };
+
   return new Promise((resolve, reject) => {
     const src = new EventSource(withToken(`/api/jobs/${job.id}/events`));
     src.onmessage = (ev) => {
       const j = JSON.parse(ev.data);
       if (j.heartbeat) return;
+      const entry = jobs.get(job.id);
+      if (entry) {
+        entry.message = j.message || entry.message;
+        entry.determinate = j.determinate !== false;
+        entry.position = j.queue_position || 0;
+        renderJobs();
+      }
       if (onProgress) onProgress(j.progress, j.message);
-      if (j.status === "done") { src.close(); resolve(j.result); }
-      if (j.status === "error") { src.close(); reject(new Error(j.error)); }
+      if (j.status === "done") { src.close(); done(); resolve(j.result); }
+      if (j.status === "cancelled") { src.close(); done(); reject(new Error("cancelled")); }
+      if (j.status === "error") { src.close(); done(); reject(new Error(j.error)); }
     };
-    src.onerror = () => { src.close(); reject(new Error("lost the connection to the engine")); };
+    src.onerror = () => {
+      src.close(); done();
+      reject(new Error("lost the connection to the engine"));
+    };
   });
 }
 
@@ -883,10 +950,15 @@ function renderStem(stem) {
   if (sel) {
     const btn = el("button", "btn tiny primary",
       `Regenerate bars ${sel.startBar}–${sel.endBar - 1}`);
-    btn.addEventListener("click", () => run(stem,
-      `/api/projects/${p.id}/stems/${stem.id}/repaint`,
-      { start_bar: sel.startBar, end_bar: sel.endBar },
-      () => delete state.selection[stem.id]));
+    btn.addEventListener("click", () => {
+      // Seconds, not bars: the server takes a real range now, and a drag
+      // does not have to land on a bar line.
+      const secsPerBar = 4 * 60 / p.grid.bpm;
+      run(stem, `/api/projects/${p.id}/stems/${stem.id}/repaint`,
+          { start_s: (sel.startBar - 1) * secsPerBar,
+            end_s: (sel.endBar - 1) * secsPerBar },
+          () => delete state.selection[stem.id]);
+    });
     const clear = el("button", "btn tiny ghost", "Clear");
     clear.addEventListener("click", () => { delete state.selection[stem.id]; render(); });
     actions.append(btn, clear);
@@ -1137,7 +1209,8 @@ $("#splitGo").addEventListener("click", async () => {
   btn.disabled = true;
   try {
     const res = await post(`/api/projects/${state.project.id}/split`,
-      { variation_id: state.selectedTake, method: "demucs" });
+      { variation_id: state.selectedTake, method: "demucs",
+        tier: $("#splitTier").value });
     await follow(res.job, (p, m) => { btn.textContent = m || "Splitting…"; });
     await refresh();
     toast("Split into stems.", "good");
@@ -1147,10 +1220,19 @@ $("#splitGo").addEventListener("click", async () => {
 
 $("#addGo").addEventListener("click", async () => {
   const track = $("#addClass").value;
+  // If a range is selected on any lane, the layer goes only there.
+  const sel = Object.values(state.selection)[0];
+  const grid = state.project.grid;
+  const secsPerBar = 4 * 60 / grid.bpm;
+  const region = sel
+    ? { start_s: (sel.startBar - 1) * secsPerBar,
+        end_s: (sel.endBar - 1) * secsPerBar }
+    : {};
   try {
     const res = await post(`/api/projects/${state.project.id}/layers`,
-      { track_class: track, prompt: $("#prompt").value.trim() });
-    toast(`Adding ${track}…`);
+      { track_class: track, prompt: $("#prompt").value.trim(), ...region });
+    toast(sel ? `Adding ${track} to bars ${sel.startBar}-${sel.endBar - 1}…`
+              : `Adding ${track}…`);
     await follow(res.job);
     await refresh();
   } catch (err) { toast(err.message, "bad"); }
@@ -1247,8 +1329,14 @@ async function openVoices(stem) {
         const use = el("button", "btn tiny", "Use");
         use.addEventListener("click", () => {
           closeSheet();
+          const sel = state.selection[stem.id];
+          const secsPerBar = 4 * 60 / state.project.grid.bpm;
+          const region = sel
+            ? { start_s: (sel.startBar - 1) * secsPerBar,
+                end_s: (sel.endBar - 1) * secsPerBar }
+            : {};
           run(stem, `/api/projects/${state.project.id}/stems/${stem.id}/voice`,
-              { voice_id: v.id });
+              { voice_id: v.id, ...region });
         });
         row.append(use);
       }
