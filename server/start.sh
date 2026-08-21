@@ -7,6 +7,17 @@
 # useful for proving the plumbing before waiting on a model download.
 set -euo pipefail
 
+# Where ACE-Step lives depends on how the pod was built: the Dockerfile puts it
+# in /opt, install.sh puts it on the volume, and a crane-appended image keeps
+# whatever path it was tarred from. Look rather than assume.
+if [ -z "${ACESTEP_DIR:-}" ]; then
+  for candidate in /opt/ACE-Step-1.5 /workspace/ACE-Step-1.5                    "${MUSICMAKER_ROOT:-/workspace}/ACE-Step-1.5"                    /data/ACE-Step-1.5 "$HOME/ACE-Step-1.5"; do
+    if [ -d "$candidate" ]; then
+      ACESTEP_DIR="$candidate"
+      break
+    fi
+  done
+fi
 ACESTEP_DIR="${ACESTEP_DIR:-/opt/ACE-Step-1.5}"
 ACESTEP_PORT="${ACESTEP_PORT:-8001}"
 
@@ -43,10 +54,11 @@ if [ "${MUSICMAKER_ENGINE:-}" = "stub" ] || [ "${MUSICMAKER_STUB_MODELS:-0}" = "
   log "stub mode -- not starting ACE-Step"
 else
   if [ ! -d "$ACESTEP_DIR" ]; then
-    log "ERROR: ACE-Step not found at $ACESTEP_DIR"
-    log "Either build the image with the ACE-Step layer, or run with MUSICMAKER_ENGINE=stub."
+    log "ERROR: ACE-Step not found. Looked in /opt, /workspace, /data and \$HOME."
+    log "Set ACESTEP_DIR explicitly, or run with MUSICMAKER_ENGINE=stub."
     exit 1
   fi
+  log "ACE-Step at $ACESTEP_DIR"
 
   log "starting ACE-Step on :${ACESTEP_PORT} (first run downloads weights)"
   (
