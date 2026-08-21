@@ -238,6 +238,19 @@ struct Studio {
     bool             keys_focused = false;
     bool  fitted      = false;
     float timeline_px = 1100.0f;   // last measured canvas width
+    // Where the canvas sits in the window, captured at paint.
+    //
+    // Mouse events arrive in window coordinates, while the view maps frames to
+    // canvas-relative pixels. Using the raw event position put every click off
+    // by the width of everything to the left of the timeline -- the sidebar
+    // plus the track headers -- so the playhead landed nowhere near the pointer.
+    float canvas_x = 0.0f;
+    float canvas_y = 0.0f;
+
+    /// Event position -> canvas position. Every mouse handler goes through
+    /// these, so the mapping cannot drift between them again.
+    float local_x(float window_x) const { return window_x - canvas_x; }
+    float local_y(float window_y) const { return window_y - canvas_y; }
 
     // --- network ------------------------------------------------------------
     // The document is local and is the app's own. The pod is a render service
@@ -1610,6 +1623,8 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             const auto t1 = std::chrono::steady_clock::now();
             self->columns = stats.columns_drawn;
             self->timeline_px = b.size.width;
+            self->canvas_x = b.origin.x;
+            self->canvas_y = b.origin.y;
             self->build_ms = stats.build_ms;
             self->submit_ms = stats.submit_ms;
             self->last_paint_ms =
@@ -1745,8 +1760,8 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                    vik::Context<Studio>& c) {
                     // The canvas fills this div, so the div's origin is the
                     // surface origin; event positions are already local.
-                    const float x = e.position.x;
-                    const float y = e.position.y;
+                    const float x = s.local_x(e.position.x);
+                    const float y = s.local_y(e.position.y);
                     // Click anywhere that is not a clip to move the playhead,
                     // the way every editor does it. Restricting that to a 28px
                     // ruler strip made the playhead feel stuck, because almost
@@ -1784,12 +1799,13 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 [](Studio& s, const vik::MouseMoveEvent& e, vik::Window&,
                    vik::Context<Studio>& c) {
                     if (s.scrubbing) {
-                        s.seek(s.view.frame_at(e.position.x));
+                        s.seek(s.view.frame_at(s.local_x(e.position.x)));
                         c.notify();
                         return;
                     }
                     if (s.selecting) {
-                        s.selection.to = std::max<int64_t>(0, s.view.frame_at(e.position.x));
+                        s.selection.to =
+                            std::max<int64_t>(0, s.view.frame_at(s.local_x(e.position.x)));
                         c.notify();
                         return;
                     }
@@ -1797,7 +1813,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     auto* clip = s.session.find_clip(s.dragging);
                     if (!clip) return;
 
-                    int64_t start = s.view.frame_at(e.position.x) - s.drag_grab;
+                    int64_t start = s.view.frame_at(s.local_x(e.position.x)) - s.drag_grab;
                     start = std::max<int64_t>(0, start);
                     if (start == clip->start_frame) return;
                     clip->start_frame = start;
@@ -1840,7 +1856,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                         // is the behaviour every editor shares, and getting the
                         // direction backwards is instantly wrong to anyone.
                         const double factor = step > 0.0 ? 1.0 / 1.2 : 1.2;
-                        s.view.zoom_about(e.position.x, factor, 4.0, 262144.0);
+                        s.view.zoom_about(s.local_x(e.position.x), factor, 4.0, 262144.0);
                     } else {
                         // Otherwise scroll the timeline horizontally, since that
                         // is the axis a timeline has.

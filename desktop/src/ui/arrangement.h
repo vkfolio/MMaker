@@ -82,11 +82,15 @@ struct Selection {
     int64_t from  = 0;
     int64_t to    = 0;
 
-    bool active() const { return track != 0 && to > from; }
-    void clear() { track = 0; from = to = 0; }
     /// Ordered bounds, so a right-to-left drag means the same as left-to-right.
     int64_t begin() const { return std::min(from, to); }
     int64_t end() const { return std::max(from, to); }
+
+    /// Ordered too. Testing `to > from` made a right-to-left drag report
+    /// itself inactive, and every tool then refused to act on a range the
+    /// user could plainly see.
+    bool active() const { return track != 0 && end() > begin(); }
+    void clear() { track = 0; from = to = 0; }
 };
 
 struct Palette {
