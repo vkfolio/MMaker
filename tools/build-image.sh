@@ -19,7 +19,9 @@
 #     absolute paths into venv shebangs and pyvenv.cfg, so relocating it breaks
 #     it. Keeping /workspace/... means a byte-identical copy that just works.
 #   - our pip packages from the system site-packages
-#   - the app itself
+#   - the app itself, INCLUDING its .git. Without it a pod cannot `git pull`
+#     to pick up fixes made after the image was built, and a start command that
+#     tries will fail and restart-loop the container.
 #
 # WHAT STAYS OUT:
 #   - model weights. They pull from HF at ~1 GB/s on RunPod; a Docker Hub pull
@@ -89,7 +91,7 @@ rm -f "$LAYER"
 # faster from HF), project data, logs, pid files, and the token files -- baking
 # a token into an image would ship a credential to anyone who can pull it.
 tar --create --file "$LAYER" \
-    --exclude='*.pyc' --exclude='__pycache__' --exclude='.git' \
+    --exclude='*.pyc' --exclude='__pycache__' \
     --exclude="$ROOT/models" --exclude="$ROOT/data" \
     --exclude="$ROOT/.env" --exclude="$ROOT/.hf_token" \
     --exclude="$ROOT/.musicmaker_token" \

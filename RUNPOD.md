@@ -107,8 +107,12 @@ so the image inherits RunPod's default command rather than `start.sh`. Set the
 pod's start command to:
 
 ```
-bash -c 'cd /workspace/MMaker/server && MUSICMAKER_MODELS_DIR=/data/models MUSICMAKER_DATA_DIR=/data/data MUSICMAKER_API_TOKEN=<your-token> ./start.sh'
+bash -c 'cd /workspace && { [ -d MMaker/.git ] || { rm -rf MMaker && git clone https://github.com/vkfolio/MMaker.git MMaker; }; }; cd /workspace/MMaker && git pull || true; cd server && chmod +x start.sh && MUSICMAKER_MODELS_DIR=/data/models MUSICMAKER_DATA_DIR=/data/data MUSICMAKER_API_TOKEN=<your-token> ./start.sh'
 ```
+
+Note the `;` and `|| true`: a failed update must never stop the engine from
+starting. Images built before this fix have no `.git`, so the clone branch is
+what runs there -- and a plain `git pull` would fail and restart-loop the pod.
 
 Or leave the default command and run that line yourself in the pod terminal.
 
