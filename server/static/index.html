@@ -119,6 +119,19 @@ section { margin-bottom: 30px; }
   border-radius: var(--radius); color: var(--ink);
 }
 .idea textarea::placeholder { color: var(--ink-faint); }
+#lyrics { min-height: 92px; font-size: 13px; }
+#lyrics[hidden] { display: none; }
+
+/* segmented control: the vocals/instrumental choice is the first real
+   decision, so it reads as a switch rather than a checkbox afterthought */
+.seg { display: inline-flex; border: 1px solid var(--rule-lit); border-radius: var(--radius); overflow: hidden; }
+.seg-btn {
+  background: none; border: 0; padding: 6px 12px; font-size: 12px;
+  color: var(--ink-dim); border-right: 1px solid var(--rule-lit);
+}
+.seg-btn:last-child { border-right: 0; }
+.seg-btn[aria-pressed=true] { background: var(--ochre); color: #17130c; font-weight: 600; }
+.seg-btn:hover:not([aria-pressed=true]) { background: var(--panel-2); color: var(--ink); }
 .field { display: flex; align-items: center; gap: 7px; }
 .field input, .field select {
   background: var(--ground); border: 1px solid var(--rule);
@@ -356,6 +369,14 @@ section { margin-bottom: 30px; }
     </div>
     <div class="panel idea">
       <textarea id="prompt" placeholder="A slow indie soul groove — brushed drums, warm rhodes, room for a vocal."></textarea>
+      <div class="idea-row" style="gap:14px">
+        <div class="seg" role="group" aria-label="Vocals or instrumental">
+          <button type="button" class="seg-btn" id="modeSong" aria-pressed="true">Song with vocals</button>
+          <button type="button" class="seg-btn" id="modeInst" aria-pressed="false">Instrumental</button>
+        </div>
+        <span class="hint" id="modeHint">Leave lyrics blank and it writes its own.</span>
+      </div>
+      <textarea id="lyrics" placeholder="[verse]&#10;Slow light on the kitchen floor&#10;I am not in a hurry anymore&#10;&#10;[chorus]&#10;..."></textarea>
       <div class="idea-row">
         <div class="field">
           <label class="chan" for="style">Style</label>
@@ -448,7 +469,7 @@ const el = (t, cls, txt) => { const n = document.createElement(t);
 
 const state = {
   project: null, styles: [], voices: [], engine: null,
-  selectedTake: null, selection: {},        // stemId -> {startBar, endBar}
+  selectedTake: null, selection: {}, instrumental: false,
   busy: {},                                  // stemId -> {progress, message}
   waveCache: new Map(), wavePending: new Set(),
 };
@@ -577,6 +598,19 @@ async function start() {
 }
 
 // ── idea ───────────────────────────────────────────────────────────────────
+function setMode(instrumental) {
+  state.instrumental = instrumental;
+  $("#modeSong").setAttribute("aria-pressed", String(!instrumental));
+  $("#modeInst").setAttribute("aria-pressed", String(instrumental));
+  $("#lyrics").hidden = instrumental;
+  $("#modeHint").textContent = instrumental
+    ? "No vocals. Add them later per stem if you change your mind."
+    : "Leave lyrics blank and it writes its own.";
+}
+$("#modeSong").addEventListener("click", () => setMode(false));
+$("#modeInst").addEventListener("click", () => setMode(true));
+setMode(false);
+
 $("#style").addEventListener("change", (e) => {
   const preset = state.styles.find(s => s.id === e.target.value);
   if (preset) { $("#bpm").value = preset.bpm; $("#key").value = preset.key_scale; }
@@ -590,6 +624,8 @@ $("#go").addEventListener("click", async () => {
       title: ($("#prompt").value.trim().slice(0, 40) || "Untitled"),
       prompt: $("#prompt").value.trim(),
       style: $("#style").value,
+      lyrics: state.instrumental ? "" : $("#lyrics").value,
+      instrumental: !!state.instrumental,
       bpm: +$("#bpm").value, key_scale: $("#key").value,
       bars: +$("#bars").value, variations: +$("#takes").value,
     };
@@ -628,6 +664,7 @@ async function upload(file) {
   fd.append("title", file.name.replace(/\.[^.]+$/, ""));
   fd.append("prompt", $("#prompt").value.trim());
   fd.append("style", $("#style").value);
+  fd.append("lyrics", state.instrumental ? "" : $("#lyrics").value);
   fd.append("bars", $("#bars").value);
   drop.textContent = "Reading…";
   try {

@@ -65,9 +65,17 @@ def detect_grid(project: Project, source: Path) -> dict:
 
 
 def generate_variations(project: Project, count: int, report=None) -> list[dict]:
-    """N renders on one grid, differing only by seed."""
+    """N renders on one grid, differing only by seed.
+
+    ACE-Step sings whenever lyrics are supplied, and writes its own words when
+    the prompt implies vocals. Instrumental is therefore an explicit choice,
+    not the default -- we say so in the prompt and withhold lyrics.
+    """
     engine = engines.music()
     prompt = presets.compose_prompt(project.prompt, project.style)
+    lyrics = "" if project.instrumental else project.lyrics
+    if project.instrumental and "instrumental" not in prompt.lower():
+        prompt = f"{prompt}, instrumental, no vocals".lstrip(", ")
     src = _abs(project, project.source_audio) if project.source_audio else None
 
     out_dir = storage.project_dir(project.id) / "variations"
@@ -80,7 +88,7 @@ def generate_variations(project: Project, count: int, report=None) -> list[dict]
         seed = _seed()
         dest = out_dir / f"var_{i + 1}_{seed}.wav"
         engine.generate(dest, prompt=prompt, grid=project.grid, seed=seed,
-                        lyrics=project.lyrics, vocal_language=project.vocal_language,
+                        lyrics=lyrics, vocal_language=project.vocal_language,
                         src_audio=src)
         variation = Variation(seed=seed, audio=_rel(project, dest), prompt=prompt)
         project.variations.append(variation)
