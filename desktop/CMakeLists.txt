@@ -40,13 +40,18 @@ add_executable(musicx
     src/app_main.cpp
     src/audio/device.cpp
     src/media/bounce.cpp
+    src/net/api.cpp
+    src/net/http.cpp
     src/media/decode.cpp
     src/media/peaks.cpp
     src/ui/arrangement.cpp
     src/miniaudio_impl.c
 )
 target_include_directories(musicx PRIVATE src third_party)
-target_link_libraries(musicx PRIVATE mx_audio vik_components)
+find_package(CURL REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+target_link_libraries(musicx PRIVATE mx_audio vik_components
+                      CURL::libcurl nlohmann_json::nlohmann_json)
 if(WIN32)
     target_link_libraries(musicx PRIVATE ole32 winmm)
 endif()

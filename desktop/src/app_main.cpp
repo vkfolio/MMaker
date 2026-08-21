@@ -30,6 +30,7 @@
 #include "audio/device.h"
 #include "audio/mixer.h"
 #include "media/bounce.h"
+#include "net/api.h"
 #include "media/decode.h"
 #include "session.h"
 #include "ui/arrangement.h"
@@ -685,21 +686,113 @@ int bounce_offline(const fs::path& folder, const fs::path& out) {
     return 0;
 }
 
+/// Connect to a pod and report what is there. No window.
+///
+/// The point is to make the whole network path checkable from a terminal before
+/// any UI depends on it: TLS backend, auth, project listing, and a real audio
+/// download with its throughput.
+int connect_probe(const std::string& url, const std::string& token,
+                  const std::string& project_id) {
+    mx::net::ApiClient api;
+    api.set_base(url);
+    api.set_token(token);
+
+    std::printf("tls backend : %s\n", mx::net::tls_backend().c_str());
+    std::printf("pod         : %s\n", api.base().c_str());
+
+    const auto health = api.health();
+    if (!health.reachable) {
+        std::printf("unreachable : %s\n", api.last_error().c_str());
+        return 1;
+    }
+    std::printf("status      : %s%s  gpu=%s\n", health.status.c_str(),
+                health.auth_required ? "  (token required)" : "",
+                health.gpu.empty() ? "none" : health.gpu.c_str());
+
+    const auto list = api.projects();
+    std::printf("projects    : %zu\n", list.size());
+    if (list.empty()) {
+        std::printf("  %s\n", api.last_error().c_str());
+        return 1;
+    }
+
+    std::string want = project_id;
+    if (want.empty()) {
+        for (const auto& p : list) {
+            auto detail = api.project(p.id);
+            if (detail && !detail->stems.empty()) { want = p.id; break; }
+        }
+        if (want.empty()) want = list.front().id;
+    }
+
+    auto detail = api.project(want);
+    if (!detail) {
+        std::printf("cannot open %s: %s\n", want.c_str(), api.last_error().c_str());
+        return 1;
+    }
+    std::printf("opened      : %s  (%s)\n", detail->summary.title.c_str(),
+                detail->summary.id.c_str());
+    std::printf("  %.0f BPM, %d bars, %zu takes, %zu stems\n",
+                detail->summary.bpm, detail->summary.bars,
+                detail->variations.size(), detail->stems.size());
+
+    for (const auto& stem : detail->stems) {
+        const auto* v = stem.version();
+        std::printf("  %-14s %-10s %s\n", stem.track_class.c_str(),
+                    stem.id.c_str(), v ? v->audio.c_str() : "(no version)");
+    }
+
+    // Download one stem for real: a listing proves parsing, not transfer.
+    for (const auto& stem : detail->stems) {
+        const auto* v = stem.version();
+        if (!v || v->audio.empty()) continue;
+        const auto dest = fs::temp_directory_path() / ("probe_" + stem.id + ".wav");
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!api.fetch_audio(detail->summary.id, v->audio, dest.string())) {
+            std::printf("download    : FAILED %s\n", api.last_error().c_str());
+            return 1;
+        }
+        const double secs = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+        const auto bytes = fs::file_size(dest);
+        std::printf("download    : %s  %.1f MB in %.1fs (%.1f MB/s)\n",
+                    stem.track_class.c_str(), bytes / 1e6, secs,
+                    bytes / 1e6 / std::max(1e-6, secs));
+
+        mx::Media media = mx::decode_file(dest, 48000);
+        if (!media.ok()) {
+            std::printf("decode      : FAILED %s\n", media.error.c_str());
+            return 1;
+        }
+        std::printf("decode      : %.1fs of audio, source %u Hz, %zu pyramid levels\n",
+                    media.seconds, media.source_rate, media.peaks.levels.size());
+        fs::remove(dest);
+        break;
+    }
+    std::printf("\nconnected end to end.\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     fs::path folder;
     fs::path render_to;
     fs::path bounce_to;
+    std::string pod_url, pod_token, pod_project;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--selftest") selftest = true;
         else if (arg == "--render" && i + 1 < argc) render_to = argv[++i];
         else if (arg == "--bounce" && i + 1 < argc) bounce_to = argv[++i];
+        else if (arg == "--connect" && i + 1 < argc) pod_url = argv[++i];
+        else if (arg == "--token" && i + 1 < argc) pod_token = argv[++i];
+        else if (arg == "--project" && i + 1 < argc) pod_project = argv[++i];
         else folder = arg;
     }
 
     if (!render_to.empty()) return render_png(folder, render_to, 1600, 900);
     if (!bounce_to.empty()) return bounce_offline(folder, bounce_to);
+    if (!pod_url.empty()) return connect_probe(pod_url, pod_token, pod_project);
 
     if (!g_device.start(g_mixer, 48000))
         std::printf("audio: %s\n", g_device.error().c_str());

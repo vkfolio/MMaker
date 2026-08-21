@@ -1,0 +1,273 @@
+#include "api.h"
+
+#include <chrono>
+#include <thread>
+
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+
+namespace mx::net {
+namespace {
+
+using json = nlohmann::json;
+
+/// Reads a field without trusting it to be there or to be the right type.
+/// Every one of these came back wrong at least once while this was built:
+/// ids arrive namespaced, numbers arrive as strings, objects arrive as null.
+template <typename T>
+T field(const json& j, const char* key, T fallback) {
+    if (!j.is_object()) return fallback;
+    auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return fallback;
+    try {
+        return it->get<T>();
+    } catch (const json::exception&) {
+        return fallback;
+    }
+}
+
+std::optional<json> parse(const Response& r, std::string& error) {
+    if (!r.ok()) {
+        if (!r.error.empty()) {
+            error = r.error;
+        } else {
+            error = "HTTP " + std::to_string(r.status);
+            // FastAPI puts the useful part in `detail`; surfacing "HTTP 401"
+            // alone tells the user nothing they can act on.
+            try {
+                const json body = json::parse(r.body);
+                const std::string detail = field<std::string>(body, "detail", "");
+                if (!detail.empty()) error += ": " + detail;
+            } catch (const json::exception&) {
+                if (!r.body.empty()) error += ": " + r.body.substr(0, 160);
+            }
+        }
+        return std::nullopt;
+    }
+    try {
+        return json::parse(r.body);
+    } catch (const json::exception& e) {
+        error = std::string("malformed JSON: ") + e.what();
+        return std::nullopt;
+    }
+}
+
+VersionRef read_version(const json& j) {
+    VersionRef v;
+    v.id = field<std::string>(j, "id", "");
+    v.audio = field<std::string>(j, "audio", "");
+    v.op = field<std::string>(j, "op", "");
+    v.note = field<std::string>(j, "note", "");
+    return v;
+}
+
+StemRef read_stem(const json& j) {
+    StemRef s;
+    s.id = field<std::string>(j, "id", "");
+    s.track_class = field<std::string>(j, "track_class", "");
+    s.label = field<std::string>(j, "label", s.track_class);
+    s.split_id = field<std::string>(j, "split_id", "");
+    s.gain_db = field<float>(j, "gain_db", 0.0f);
+    s.pan = field<float>(j, "pan", 0.0f);
+    s.muted = field<bool>(j, "muted", false);
+    s.soloed = field<bool>(j, "soloed", false);
+    s.current = field<int>(j, "current", 0);
+    if (auto it = j.find("versions"); it != j.end() && it->is_array())
+        for (const auto& v : *it) s.versions.push_back(read_version(v));
+    return s;
+}
+
+JobRef read_job(const json& j) {
+    JobRef job;
+    job.id = field<std::string>(j, "id", "");
+    job.kind = field<std::string>(j, "kind", "");
+    job.status = field<std::string>(j, "status", "");
+    job.message = field<std::string>(j, "message", "");
+    job.error = field<std::string>(j, "error", "");
+    job.queue_position = field<int>(j, "queue_position", 0);
+    return job;
+}
+
+}  // namespace
+
+std::string tls_backend() {
+    const curl_version_info_data* info = curl_version_info(CURLVERSION_NOW);
+    return (info && info->ssl_version) ? info->ssl_version : "none";
+}
+
+void ApiClient::set_base(std::string url) {
+    while (!url.empty() && (url.back() == '/' || url.back() == ' ')) url.pop_back();
+    if (!url.empty() && url.rfind("http", 0) != 0) url = "https://" + url;
+    base_ = std::move(url);
+}
+
+Health ApiClient::health() {
+    Health h;
+    const Response r = http_.get(url("/health"));
+    auto body = parse(r, last_error_);
+    if (!body) { h.message = last_error_; return h; }
+
+    h.reachable = true;
+    h.status = field<std::string>(*body, "status", "");
+    h.ready = (h.status == "ready");
+    h.auth_required = field<bool>(*body, "auth_required", false);
+    h.message = field<std::string>(*body, "message", "");
+    if (auto it = body->find("gpu"); it != body->end() && it->is_object())
+        h.gpu = field<std::string>(*it, "name", "");
+    return h;
+}
+
+std::vector<ProjectSummary> ApiClient::projects() {
+    std::vector<ProjectSummary> out;
+    const Response r = http_.get(url("/api/projects"));
+    auto body = parse(r, last_error_);
+    if (!body) return out;
+
+    auto it = body->find("projects");
+    if (it == body->end() || !it->is_array()) return out;
+    for (const auto& p : *it) {
+        ProjectSummary s;
+        s.id = field<std::string>(p, "id", "");
+        s.title = field<std::string>(p, "title", "Untitled");
+        if (auto g = p.find("grid"); g != p.end() && g->is_object()) {
+            s.bpm = field<double>(*g, "bpm", 120.0);
+            s.bars = field<int>(*g, "bars", 32);
+            s.key_scale = field<std::string>(*g, "key_scale", "");
+        }
+        if (!s.id.empty()) out.push_back(std::move(s));
+    }
+    return out;
+}
+
+std::optional<ProjectDetail> ApiClient::project(const std::string& id) {
+    const Response r = http_.get(url("/api/projects/" + url_escape(id)));
+    auto body = parse(r, last_error_);
+    if (!body) return std::nullopt;
+
+    auto p = body->find("project");
+    if (p == body->end() || !p->is_object()) {
+        last_error_ = "the response had no project";
+        return std::nullopt;
+    }
+
+    ProjectDetail d;
+    d.summary.id = field<std::string>(*p, "id", id);
+    d.summary.title = field<std::string>(*p, "title", "Untitled");
+    if (auto g = p->find("grid"); g != p->end() && g->is_object()) {
+        d.summary.bpm = field<double>(*g, "bpm", 120.0);
+        d.summary.bars = field<int>(*g, "bars", 32);
+        d.summary.key_scale = field<std::string>(*g, "key_scale", "");
+    }
+    if (auto v = p->find("variations"); v != p->end() && v->is_array()) {
+        for (const auto& item : *v) {
+            VariationRef ref;
+            ref.id = field<std::string>(item, "id", "");
+            ref.audio = field<std::string>(item, "audio", "");
+            ref.seed = field<int64_t>(item, "seed", 0);
+            d.variations.push_back(std::move(ref));
+        }
+    }
+    if (auto s = p->find("stems"); s != p->end() && s->is_array())
+        for (const auto& item : *s) d.stems.push_back(read_stem(item));
+    return d;
+}
+
+std::string ApiClient::audio_url(const std::string& project_id,
+                                 const std::string& rel) const {
+    // The path is several segments ("stems/split_x/vocals.wav"), so the
+    // separators must survive escaping while the segments themselves are
+    // escaped. Escaping the whole string would turn the path into one segment.
+    std::string encoded;
+    std::string segment;
+    for (char c : rel) {
+        if (c == '/') {
+            encoded += url_escape(segment) + "/";
+            segment.clear();
+        } else {
+            segment += c;
+        }
+    }
+    encoded += url_escape(segment);
+    return base_ + "/api/projects/" + url_escape(project_id) + "/audio/" + encoded;
+}
+
+bool ApiClient::fetch_audio(const std::string& project_id, const std::string& rel,
+                            const std::string& dest, ProgressFn progress) {
+    const Response r =
+        http_.download(audio_url(project_id, rel), dest, std::move(progress));
+    if (!r.ok()) {
+        last_error_ = r.error.empty() ? ("HTTP " + std::to_string(r.status)) : r.error;
+        return false;
+    }
+    return true;
+}
+
+std::optional<JobRef> ApiClient::job(const std::string& job_id) {
+    const Response r = http_.get(url("/api/jobs/" + url_escape(job_id)));
+    auto body = parse(r, last_error_);
+    if (!body) return std::nullopt;
+    return read_job(*body);
+}
+
+bool ApiClient::cancel(const std::string& job_id) {
+    const Response r = http_.post(url("/api/jobs/" + url_escape(job_id) + "/cancel"), "{}");
+    if (!r.ok()) {
+        last_error_ = r.error.empty() ? ("HTTP " + std::to_string(r.status)) : r.error;
+        return false;
+    }
+    return true;
+}
+
+JobRef ApiClient::follow(const std::string& job_id,
+                         const std::function<bool(const JobRef&)>& on_update) {
+    JobRef last;
+    last.id = job_id;
+    bool finished = false;
+    bool keep_going = true;
+    int events = 0;
+
+    const Response stream = http_.stream_events(
+        url("/api/jobs/" + url_escape(job_id) + "/events"),
+        [&](const std::string& payload) {
+            json parsed;
+            try {
+                parsed = json::parse(payload);
+            } catch (const json::exception&) {
+                return true;                       // not ours; keep listening
+            }
+            // Heartbeats keep the connection open and carry no state.
+            if (field<bool>(parsed, "heartbeat", false)) return true;
+            ++events;
+            last = read_job(parsed);
+            if (last.id.empty()) last.id = job_id;
+            keep_going = on_update(last);
+            finished = (last.status == "done" || last.status == "error" ||
+                        last.status == "cancelled");
+            return keep_going && !finished;
+        });
+
+    if (finished || !keep_going) return last;
+
+    // The stream told us nothing useful -- buffered by a proxy, dropped, or
+    // never supported. Poll instead. This is a fallback, not a race: it only
+    // starts once the stream has stopped.
+    if (events == 0 && !stream.error.empty()) last.message = "streaming unavailable";
+    while (keep_going) {
+        auto polled = job(job_id);
+        if (!polled) {
+            last.status = "error";
+            last.error = last_error_;
+            on_update(last);
+            return last;
+        }
+        last = *polled;
+        keep_going = on_update(last);
+        if (last.status == "done" || last.status == "error" ||
+            last.status == "cancelled")
+            return last;
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    return last;
+}
+
+}  // namespace mx::net
