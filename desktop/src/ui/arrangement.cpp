@@ -1,6 +1,7 @@
 #include "arrangement.h"
 
 #include <chrono>
+#include <cstring>
 #include <format>
 
 namespace mx {
@@ -10,7 +11,13 @@ namespace {
 /// nearest a pixel. Reading a coarser level and stretching it is what makes a
 /// zoomed-out track cheap; reading a finer one and averaging would put the cost
 /// back.
-int64_t draw_waveform(SkCanvas* c, const SkRect& lane, float origin_x,
+/// One vertical line per pixel column, per channel.
+///
+/// Two channels drawn in their own bands rather than summed into one shape.
+/// ACE Studio draws stereo this way and it is not decoration: a summed
+/// waveform hides the thing you most want to see on a stem -- whether the two
+/// sides differ at all.
+int64_t draw_waveform(SkCanvas* c, const SkRect& body, float origin_x,
                       const Clip& clip, const Source& src, const View& view,
                       SkColor color, DrawStats& stats) {
     if (!src.loaded() || src.peaks.levels.empty()) return 0;
@@ -18,54 +25,53 @@ int64_t draw_waveform(SkCanvas* c, const SkRect& lane, float origin_x,
 
     // View coordinates are canvas-relative; lane rects are in window
     // coordinates. Mixing the two silently shifts every waveform by the width
-    // of whatever sits to the left of the canvas -- here the track headers,
-    // which is why the audio played correctly while the drawing read from the
-    // wrong place.
-    const float x_from = std::max(lane.left(), origin_x + view.x_of(clip.start_frame));
-    const float x_to   = std::min(lane.right(),
+    // of whatever sits to the left of the canvas.
+    const float x_from = std::max(body.left(), origin_x + view.x_of(clip.start_frame));
+    const float x_to   = std::min(body.right(),
                                   origin_x + view.x_of(clip.start_frame + clip.length));
     if (x_to <= x_from) return 0;
 
     const int level_index = src.peaks.level_for(view.frames_per_pixel);
     const PeakLevel& level = src.peaks.levels[level_index];
-    const int64_t ch = src.peaks.channels;
+    const int64_t channels = std::max<int64_t>(1, src.peaks.channels);
+    const int64_t shown = std::min<int64_t>(channels, 2);
 
-    const float mid  = lane.centerY();
-    const float half = lane.height() * 0.42f;
-
+    const float band = body.height() / static_cast<float>(shown);
     std::vector<SkPoint> lines;
-    lines.reserve(static_cast<size_t>((x_to - x_from) * 2.0f) + 4);
+    lines.reserve(static_cast<size_t>((x_to - x_from) * 2.0f * shown) + 8);
 
-    for (float x = std::floor(x_from); x < x_to; x += 1.0f) {
-        // Timeline -> source frame -> bucket. Analytic the whole way; no
-        // transform is ever pushed onto the canvas.
-        const int64_t t0 = view.frame_at(x - origin_x);
-        const int64_t t1 = view.frame_at(x + 1.0f - origin_x);
-        const int64_t s0 = clip.source_offset + (t0 - clip.start_frame);
-        const int64_t s1 = clip.source_offset + (t1 - clip.start_frame);
-        if (s1 <= 0) continue;
+    for (int64_t ch = 0; ch < shown; ++ch) {
+        const float mid = body.top() + band * (ch + 0.5f);
+        const float half = band * 0.44f;
 
-        int64_t b0 = s0 / level.frames_per_bucket;
-        int64_t b1 = std::max(b0 + 1, s1 / level.frames_per_bucket);
-        b0 = std::clamp<int64_t>(b0, 0, level.buckets - 1);
-        b1 = std::clamp<int64_t>(b1, b0 + 1, level.buckets);
+        for (float x = std::floor(x_from); x < x_to; x += 1.0f) {
+            const int64_t t0 = view.frame_at(x - origin_x);
+            const int64_t t1 = view.frame_at(x + 1.0f - origin_x);
+            const int64_t s0 = clip.source_offset + (t0 - clip.start_frame);
+            const int64_t s1 = clip.source_offset + (t1 - clip.start_frame);
+            if (s1 <= 0) continue;
 
-        float lo = 0.0f, hi = 0.0f;
-        for (int64_t b = b0; b < b1; ++b) {
-            for (int64_t k = 0; k < ch; ++k) {
-                lo = std::min(lo, level.lo[static_cast<size_t>(b * ch + k)]);
-                hi = std::max(hi, level.hi[static_cast<size_t>(b * ch + k)]);
+            int64_t b0 = s0 / level.frames_per_bucket;
+            int64_t b1 = std::max(b0 + 1, s1 / level.frames_per_bucket);
+            b0 = std::clamp<int64_t>(b0, 0, level.buckets - 1);
+            b1 = std::clamp<int64_t>(b1, b0 + 1, level.buckets);
+
+            float lo = 0.0f, hi = 0.0f;
+            for (int64_t b = b0; b < b1; ++b) {
+                const auto i = static_cast<size_t>(b * channels + ch);
+                lo = std::min(lo, level.lo[i]);
+                hi = std::max(hi, level.hi[i]);
             }
+
+            // A silent column still deserves a mark, or a quiet passage looks
+            // like a hole in the clip rather than quiet audio.
+            float y0 = mid - hi * half;
+            float y1 = mid - lo * half;
+            if (y1 - y0 < 1.0f) { y0 = mid - 0.5f; y1 = mid + 0.5f; }
+
+            lines.push_back(SkPoint::Make(x + 0.5f, y0));
+            lines.push_back(SkPoint::Make(x + 0.5f, y1));
         }
-
-        // A silent column still deserves a mark, or a quiet passage looks like
-        // a hole in the clip rather than quiet audio.
-        float y0 = mid - hi * half;
-        float y1 = mid - lo * half;
-        if (y1 - y0 < 1.0f) { y0 = mid - 0.5f; y1 = mid + 0.5f; }
-
-        lines.push_back(SkPoint::Make(x + 0.5f, y0));
-        lines.push_back(SkPoint::Make(x + 0.5f, y1));
     }
 
     const auto t_submit = std::chrono::steady_clock::now();
@@ -205,21 +211,38 @@ DrawStats draw_arrangement(SkCanvas* c, const SkRect& bounds, Session& session,
                                   session.tracks[index].color});
     }
 
+    // A clip is a solid coloured block with a title strip along the top and the
+    // waveform below it, the way ACE Studio draws them. The title travels with
+    // the clip rather than living in the track header, which is what makes a
+    // lane of several clips readable -- each one says what produced it.
+    const float kTitle = 15.0f;
+
     // pass 1: bodies
     fill.setAntiAlias(false);
     for (const Visible& v : visible) {
-        fill.setColor(SkColorSetARGB(0x38, (v.color >> 16) & 0xff,
-                                     (v.color >> 8) & 0xff, v.color & 0xff));
-        c->drawRoundRect(v.lane, 3.0f, 3.0f, fill);
+        const uint8_t r = (v.color >> 16) & 0xff, g = (v.color >> 8) & 0xff,
+                      b = v.color & 0xff;
+        // Body first, then a brighter strip on top of it.
+        fill.setColor(SkColorSetARGB(0x55, r, g, b));
+        c->drawRect(v.lane, fill);
+        fill.setColor(SkColorSetARGB(0xff, r, g, b));
+        c->drawRect(SkRect::MakeLTRB(v.lane.left(), v.lane.top(),
+                                     v.lane.right(),
+                                     std::min(v.lane.bottom(), v.lane.top() + kTitle)),
+                    fill);
     }
 
-    // pass 2: waveforms
+    // pass 2: waveforms, below the title strip
     for (const Visible& v : visible) {
         if (!v.src) continue;
-        const SkColor wave = SkColorSetARGB(0xdd, (v.color >> 16) & 0xff,
-                                            (v.color >> 8) & 0xff, v.color & 0xff);
+        SkRect body = v.lane;
+        body.fTop = std::min(body.fBottom, body.fTop + kTitle);
+        if (body.height() <= 2.0f) continue;
+        // Near-black over the clip colour, as in the reference: the waveform
+        // reads as a shape cut out of the block rather than a line drawn on it.
+        const SkColor wave = SkColorSetARGB(0xdd, 0x0d, 0x0f, 0x14);
         stats.columns_drawn +=
-            draw_waveform(c, v.lane, bounds.left(), *v.clip, *v.src, view, wave, stats);
+            draw_waveform(c, body, bounds.left(), *v.clip, *v.src, view, wave, stats);
     }
 
     // pass 3: borders
@@ -229,27 +252,51 @@ DrawStats draw_arrangement(SkCanvas* c, const SkRect& bounds, Session& session,
         border.setAntiAlias(true);
         for (const Visible& v : visible) {
             const bool sel = v.clip->id == selected;
-            border.setStrokeWidth(sel ? 2.0f : 1.0f);
-            border.setColor(sel ? SkColorSetRGB(0xff, 0xd5, 0x8a)
-                                : SkColorSetARGB(0x88, 0xff, 0xff, 0xff));
-            c->drawRoundRect(v.lane, 3.0f, 3.0f, border);
+            if (!sel) continue;          // only the selected clip is outlined
+            border.setStrokeWidth(2.0f);
+            border.setColor(SkColorSetRGB(0xff, 0xd5, 0x8a));
+            c->drawRect(v.lane, border);
         }
     }
 
     // pass 4: labels
     text_paint.setColor(SkColorSetARGB(0xcc, 0xff, 0xff, 0xff));
+    // Dark text on the bright title strip, not white on colour: the strips are
+    // fully saturated, and white on yellow is unreadable.
+    text_paint.setColor(SkColorSetARGB(0xee, 0x10, 0x12, 0x18));
     for (const Visible& v : visible) {
         if (!can_draw_text) break;
         if (v.lane.width() <= 40.0f || v.clip->name.empty()) continue;
         c->save();
-        c->clipRect(v.lane);
+        c->clipRect(SkRect::MakeLTRB(v.lane.left(), v.lane.top(),
+                                     v.lane.right() - 3.0f, v.lane.top() + kTitle));
         c->drawSimpleText(v.clip->name.c_str(), v.clip->name.size(),
                           SkTextEncoding::kUTF8, v.lane.left() + 5.0f,
-                          v.lane.top() + 13.0f, font, text_paint);
+                          v.lane.top() + 11.0f, font, text_paint);
         c->restore();
     }
     text_paint.setColor(pal.text);
     stats.clips_drawn = static_cast<int>(visible.size());
+
+    // --- empty state ---------------------------------------------------------
+    // The reference says "Double click to start, or select a template" in the
+    // middle of an empty canvas. Same idea, different next step: here the
+    // content comes from the pod, so the sentence points at that.
+    if (visible.empty() && can_draw_text) {
+        SkFont big;
+        big.setSize(13.0f);
+        const char* line = session.tracks.empty()
+            ? "Pick a project on the left, or start musicx with a folder of stems"
+            : "No audio on the timeline yet";
+        SkPaint hint;
+        hint.setAntiAlias(true);
+        hint.setColor(SkColorSetARGB(0x88, 0x8d, 0x94, 0xa3));
+        const float width = big.measureText(line, std::strlen(line),
+                                            SkTextEncoding::kUTF8);
+        c->drawSimpleText(line, std::strlen(line), SkTextEncoding::kUTF8,
+                          bounds.centerX() - width * 0.5f, bounds.centerY(),
+                          big, hint);
+    }
 
     // --- selection ----------------------------------------------------------
     // Over the waveform rather than under it: what is selected has to stay

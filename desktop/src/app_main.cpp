@@ -787,47 +787,64 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
     const int64_t beat = session.frames_per_bar() > 0
                              ? (playhead() % session.frames_per_bar()) / beat_frames : 0;
 
+    auto pill = [](std::string text, uint32_t tint = 0xe6e8ec) {
+        return vik::div().px_2().py_1().rounded_md().bg(vik::rgb(0x21252f))
+            .child(vik::text(std::move(text)).text_color(vik::rgb(tint)));
+    };
+
+    // ACE Studio puts the transport in the middle of the title bar with the
+    // project on the left and Export on the right, and keeps it to a handful of
+    // glyphs. Following that: the numbers that change while you work sit beside
+    // the buttons, and diagnostics move out of the way rather than competing
+    // with them.
     auto transport =
-        vik::div().flex_row().items_center().gap_4().px_4().py_2()
+        vik::div().flex_row().items_center().px_3().py_2()
             .bg(vik::rgb(0x1b1e27)).border_1().border_color(vik::rgb(0x2c313d))
-            .child(icon_button("rtz", "skip-back", false,
-                [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                   vik::Context<Studio>& c) { s.seek(0); c.notify(); }))
-            .child(icon_button("play", playing ? "pause" : "play", playing,
-                [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                   vik::Context<Studio>& c) { s.toggle_play(); c.notify(); }))
-            .child(icon_button("loop", "repeat",
-                               g_mixer.transport.looping.load(),
-                [](Studio&, const vik::ClickEvent&, vik::Window&,
-                   vik::Context<Studio>& c) {
-                    auto& t = g_mixer.transport;
-                    t.looping.store(!t.looping.load());
-                    c.notify();
-                }))
-            .child(readout("position", std::format("{:.2f}s", pos_s)))
-            .child(readout("bar.beat", std::format("{}.{}", bar + 1, beat + 1)))
-            .child(readout("selection", selection.active()
-                ? std::format("{:.2f}-{:.2f}s",
-                              static_cast<double>(selection.begin()) / session.rate,
-                              static_cast<double>(selection.end()) / session.rate)
-                : std::string("shift-drag")))
-            .child(readout("tempo", std::format("{:.0f} BPM", session.bpm)))
-            .child(readout("device", g_device.running()
-                                         ? std::format("{} {} Hz", g_device.backend(),
-                                                       g_device.rate())
-                                         : std::string("no output")))
-            .child(readout("latency", std::format("{:.1f} ms",
-                1000.0 * g_device.latency_frames() / std::max(1u, g_device.rate()))))
-            // An xrun counter that is always visible, per the plan. A number you
-            // have to go looking for is a number nobody looks at.
-            .child(readout("xruns", std::to_string(g_mixer.xruns())))
-            .child(readout("peak", std::format("{:.2f}", meter)))
-            .child(readout("paint", std::format("{:.2f} ms", last_paint_ms)))
-            .child(vik::div().flex_row().gap_2()
-                .child(icon_button("regen", "sparkle", false,
+            .child(vik::div().flex_row().items_center().gap_2().w_px(260.0f)
+                .child(vik::text(session.title.empty() ? "Untitled Project"
+                                                       : session.title)
+                           .text_color(vik::rgb(0xe6e8ec)))
+                .child(vik::text(open_project_id.empty() ? "local" : "pod")
+                           .text_xs().text_color(vik::rgb(0x6c7383))))
+
+            // centre cluster
+            .child(vik::div().flex_1().flex_row().items_center().justify_center().gap_2()
+                .child(pill(std::format("{:.1f}", session.bpm)))
+                .child(pill(std::format("{} / 4", session.beats_per_bar), 0x8d94a3))
+                .child(icon_button("rtz", "skip-back", false,
                     [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                       vik::Context<Studio>& c) { s.regenerate(c.app()); c.notify(); }))
-                .child(icon_button("export", "download-simple", false,
+                       vik::Context<Studio>& c) { s.seek(0); c.notify(); }))
+                .child(icon_button("play", playing ? "pause" : "play", playing,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) { s.toggle_play(); c.notify(); }))
+                .child(icon_button("loop", "repeat",
+                                   g_mixer.transport.looping.load(),
+                    [](Studio&, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) {
+                        auto& t = g_mixer.transport;
+                        t.looping.store(!t.looping.load());
+                        c.notify();
+                    }))
+                .child(vik::div().flex_col().items_center().ml(10.0f)
+                    .child(vik::text(std::format("{}:{:04.1f}", static_cast<int>(pos_s) / 60,
+                                                 std::fmod(pos_s, 60.0)))
+                               .text_color(vik::rgb(0xe6e8ec)))
+                    .child(vik::text(std::format("{}.{}", bar + 1, beat + 1))
+                               .text_xs().text_color(vik::rgb(0x6c7383)))))
+
+            // right: export, then the diagnostics that must stay visible
+            .child(vik::div().flex_row().items_center().justify_end().gap_3().w_px(260.0f)
+                .child(vik::text(std::format("xruns {}", g_mixer.xruns()))
+                           .text_xs()
+                           .text_color(vik::rgb(g_mixer.xruns() ? 0xe05c72 : 0x4a5060)))
+                .child(vik::text(selection.active()
+                           ? std::format("sel {:.2f}-{:.2f}s",
+                                         static_cast<double>(selection.begin()) / session.rate,
+                                         static_cast<double>(selection.end()) / session.rate)
+                           : std::string("shift-drag to select"))
+                           .text_xs()
+                           .text_color(vik::rgb(selection.active() ? 0xffd58a : 0x6c7383)))
+                .child(icon_button("export", "export", false,
                     [](Studio& s, const vik::ClickEvent&, vik::Window&,
                        vik::Context<Studio>& c) { s.export_mix(); c.notify(); })));
 
@@ -901,9 +918,67 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
         });
     }).size_full();
 
+    // The bottom dock, which is the piece of ACE Studio's layout people
+    // recognise: a floating pill of icon groups over the canvas rather than a
+    // toolbar bolted to an edge. Grouped as in the reference --
+    // [record sources] [AI tools] [global] -- with dividers between groups.
+    auto tool = [&cx](const char* id, const char* icon, const char* tip,
+                      bool enabled, auto fn) {
+        auto button = vik::div().id(id).px_3().py_2().rounded_md()
+            .flex_row().items_center().justify_center()
+            .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x333a4a)); })
+            .child(vik::ui::phosphor(icon, vik::ui::PhWeight::Regular)
+                       .size(17.0f)
+                       .color(vik::rgb(enabled ? 0xe6e8ec : 0x565c6b)));
+        button = std::move(button).tooltip(tip);
+        if (enabled) button = std::move(button).cursor_pointer().on_click(cx.listener(fn));
+        return button;
+    };
+    auto divider = [] {
+        return vik::div().w_px(1.0f).h_px(20.0f).bg(vik::rgb(0x3b4250)).mx(4.0f);
+    };
+
+    const bool armed = selection.active() && !open_project_id.empty() && !net_busy;
+
+    auto dock = vik::div().absolute().bottom(18.0f).left(0.0f).right(0.0f)
+        .flex_row().justify_center()
+        .child(vik::div().flex_row().items_center().gap_1().px_2().py_1()
+            .rounded_lg().bg(vik::rgb(0x232834))
+            .border_1().border_color(vik::rgb(0x3b4250))
+            .child(tool("t-mic", "microphone-stage", "Record a voice take (not yet)",
+                        false, [](Studio&, const vik::ClickEvent&, vik::Window&,
+                                  vik::Context<Studio>&) {}))
+            .child(tool("t-inst", "guitar", "Instruments (not yet)", false,
+                        [](Studio&, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>&) {}))
+            .child(divider())
+            .child(tool("t-regen", "sparkle",
+                        armed ? "Regenerate the selection  (R)"
+                              : "Select a range on a pod track first",
+                        armed,
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) { s.regenerate(c.app()); c.notify(); }))
+            .child(tool("t-layer", "stack-plus", "Add a layer (not yet)", false,
+                        [](Studio&, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>&) {}))
+            .child(tool("t-split", "scissors", "Stem splitter (not yet)", false,
+                        [](Studio&, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>&) {}))
+            .child(tool("t-more", "dots-three", "More tools (not yet)", false,
+                        [](Studio&, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>&) {}))
+            .child(divider())
+            .child(tool("t-pod", "globe",
+                        open_project_id.empty() ? "Not connected to a pod"
+                                                : "Connected",
+                        false,
+                        [](Studio&, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>&) {})));
+
     auto timeline =
         vik::div().flex_1().relative().overflow_hidden()
             .child(std::move(surface))
+            .child(std::move(dock))
             .on_mouse_down(vik::MouseButton::Left, cx.listener(
                 [](Studio& s, const vik::MouseDownEvent& e, vik::Window&,
                    vik::Context<Studio>& c) {
@@ -1312,7 +1387,7 @@ int main(int argc, char** argv) {
 
     vik::App::run([&](vik::App& app) {
         app.open_window(
-            vik::WindowOptions{.title = "musicX Studio", .size = {1280.0f, 800.0f}},
+            vik::WindowOptions{.title = "musicX Studio", .size = {1200.0f, 720.0f}},
             [&](vik::Window&, vik::App& app) {
                 auto handle = app.add_entity<Studio>();
                 app.update_entity(handle, [&](Studio& s, vik::Context<Studio>& c) {
