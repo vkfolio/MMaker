@@ -18,7 +18,10 @@ set -euo pipefail
 
 TIER="${1:-high}"
 ACESTEP_DIR="${ACESTEP_DIR:-/opt/ACE-Step-1.5}"
-CKPT_DIR="${ACESTEP_CHECKPOINT_DIR:-/workspace/models/acestep}"
+# ACE-Step loads from its own checkpoints/ directory, and start.sh reads the
+# same place when deciding which model slots to register. A checkpoint
+# anywhere else is invisible to both.
+CKPT_DIR="${ACESTEP_CHECKPOINT_DIR:-${ACESTEP_DIR:-/workspace/ACE-Step-1.5}/checkpoints}"
 
 case "$TIER" in
     high)  REPOS=(acestep-v15-xl-turbo) ;;
@@ -64,7 +67,13 @@ dest = root / repo
 path = snapshot_download(
     repo_id=f"ACE-Step/{repo}",
     local_dir=str(dest),
-    allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model", "*.yaml"],
+    # The XL repos carry no .bin duplicates, so the download is the four
+    # shards plus small files -- and those small files matter: ACE-Step loads
+    # the checkpoint through its own modeling_*.py / configuration_*.py, and
+    # silence_latent.pt is needed at inference. Filtering to safetensors and
+    # json fetches 20 GB of weights that then will not load.
+    allow_patterns=["*.safetensors", "*.json", "*.py", "*.pt",
+                    "*.txt", "*.model", "*.yaml"],
 )
 size = sum(f.stat().st_size for f in pathlib.Path(path).rglob("*") if f.is_file())
 print(f"{repo}: {size/1e9:.2f} GB at {path}")
@@ -72,7 +81,10 @@ PY
 done
 
 echo
-echo "Downloaded. Restart ACE-Step so it rescans its checkpoint directory, then:"
+echo "Downloaded. ACE-Step does NOT rescan -- its model registry is fixed at"
+echo "startup. Restart the server so start.sh registers the new model slot:"
+echo "  pkill -f acestep-api && pkill -f 'uvicorn app.main'   # supervisor restarts both"
+echo
 echo "  curl -s -H \"X-API-Token: \$TOKEN\" http://localhost:8000/api/engine"
 echo
 echo "'available' should now list them, and 'tiers_that_would_fall_back' should"

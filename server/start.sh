@@ -60,6 +60,30 @@ else
   fi
   log "ACE-Step at $ACESTEP_DIR"
 
+  # Register the quality tiers' checkpoints as model slots.
+  #
+  # ACE-Step's model registry is fixed at startup and is NOT a scan of the
+  # checkpoints directory. Downloading acestep-v15-xl-turbo is not enough: a
+  # request naming it gets
+  #     Model 'acestep-v15-xl-turbo' not found in ['acestep-v15-turbo'],
+  #     using primary: acestep-v15-turbo
+  # and renders at turbo quality without failing. Slots 2 and 3 exist for
+  # exactly this and are enabled only by these env vars, so they are set here
+  # from whatever is actually on disk.
+  CKPT_DIR="${ACESTEP_CHECKPOINT_DIR:-$ACESTEP_DIR/checkpoints}"
+  for slot_spec in "2:acestep-v15-xl-turbo" "3:acestep-v15-xl-base"; do
+    slot="${slot_spec%%:*}"
+    model="${slot_spec#*:}"
+    if [ -d "$CKPT_DIR/$model" ]; then
+      export "ACESTEP_CONFIG_PATH${slot}=$model"
+      log "model slot ${slot}: $model"
+    fi
+  done
+  if [ -z "${ACESTEP_CONFIG_PATH2:-}" ]; then
+    log "only acestep-v15-turbo present -- 'high' and 'ultra' will render as 'fast'"
+    log "  fetch them with: bash tools/fetch-quality-weights.sh high"
+  fi
+
   log "starting ACE-Step on :${ACESTEP_PORT} (first run downloads weights)"
   (
     cd "$ACESTEP_DIR"

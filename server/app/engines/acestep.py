@@ -450,13 +450,42 @@ class AceStepEngine:
                 else:
                     entries = body.get("models") or []
 
+                # The live shape is OpenAI-style and differs from the docs:
+                #   {"object":"list","data":[{"id":"acestep/acestep-v15-turbo",
+                #                             "name":"ACE-Step acestep-v15-turbo"}]}
+                # `id` is namespaced and `name` is prose, so neither compares
+                # equal to the bare checkpoint name a tier asks for. Both get
+                # normalised rather than trusted.
+                def _bare(value: str) -> str:
+                    value = value.strip()
+                    if "/" in value:
+                        value = value.rsplit("/", 1)[-1]
+                    for prefix in ("ACE-Step ", "acestep "):
+                        if value.startswith(prefix):
+                            value = value[len(prefix):]
+                    return value.strip()
+
                 names = []
                 for entry in entries:
                     if isinstance(entry, dict):
-                        names.append(entry.get("name") or entry.get("id"))
+                        raw = entry.get("id") or entry.get("name") or ""
                     elif isinstance(entry, str):
-                        names.append(entry)
-                info["available"] = [n for n in names if n]
+                        raw = entry
+                    else:
+                        continue
+                    if raw:
+                        names.append(_bare(raw))
+                info["available"] = names
+
+                # This endpoint reports models that are *loaded*, not models
+                # that exist. ACE-Step lazy-loads on first request, so a freshly
+                # restarted pod returns an empty list and every tier would look
+                # like it falls back. Say so, rather than reporting a scary
+                # inventory that is merely early.
+                info["lists"] = "loaded models, not installed ones"
+                if not names:
+                    info["hint"] = ("nothing loaded yet -- ACE-Step lazy-loads on "
+                                    "first request; render once, then re-check")
                 info["source"] = path
                 if not info["available"]:
                     # An empty list and an unparsed response look identical from
