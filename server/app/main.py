@@ -93,6 +93,19 @@ def _gpu_info():
     }
 
 
+@app.get("/api/engine")
+def engine_info():
+    """What the render engine can actually do, for diagnosing silent fallbacks."""
+    engine = engines.music()
+    body = {"engine": engine.name}
+    if hasattr(engine, "available_models"):
+        try:
+            body.update(engine.available_models())
+        except Exception as exc:                              # noqa: BLE001
+            body["error"] = f"{type(exc).__name__}: {exc}"
+    return body
+
+
 @app.get("/api/info")
 def info():
     """What this engine can do right now. The UI uses it to hide unbuilt features."""

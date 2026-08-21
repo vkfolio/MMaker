@@ -391,6 +391,40 @@ class AceStepEngine:
     def sfx(self, dest, prompt, duration_s, seed):
         raise NotSupported("use Stable Audio 3 for sound effects")
 
+    def available_models(self) -> dict:
+        """What the pod can actually render with.
+
+        Asking for a model that is not present makes ACE-Step fall back
+        silently, so a quality tier can look like it worked while producing the
+        default. This is how that becomes checkable rather than inferred from
+        suspiciously equal render times.
+        """
+        info: dict = {"requested_tiers": {k: v["model"] for k, v in QUALITY.items()},
+                      "last_render": dict(self.last_meta)}
+        for path in ("/v1/models", "/models"):
+            try:
+                resp = requests.get(f"{self.base_url}{path}", timeout=15)
+                if resp.status_code != 200:
+                    continue
+                body = resp.json()
+                names = []
+                for entry in (body.get("data") or body.get("models") or []):
+                    if isinstance(entry, dict):
+                        names.append(entry.get("id") or entry.get("name"))
+                    elif isinstance(entry, str):
+                        names.append(entry)
+                info["available"] = [n for n in names if n]
+                info["source"] = path
+                break
+            except (requests.RequestException, ValueError):
+                continue
+        info.setdefault("available", None)
+        if info["available"]:
+            missing = [tier for tier, model in info["requested_tiers"].items()
+                       if model not in info["available"]]
+            info["tiers_that_would_fall_back"] = missing
+        return info
+
     def ping(self) -> bool:
         try:
             requests.get(f"{self.base_url}/openapi.json", timeout=10)

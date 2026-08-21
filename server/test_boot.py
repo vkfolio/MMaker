@@ -55,6 +55,16 @@ def test_capabilities_track_ready_models():
         assert info["engines"]["music"] == "stub"
 
 
+def test_engine_endpoint_reports_tier_models():
+    """The tiers we would ask for must be inspectable, so a silent fallback to
+    the default model is checkable rather than inferred from timings."""
+    with TestClient(app) as client:
+        _wait_ready(client)
+        body = client.get("/api/engine").json()
+        assert body["engine"] == "stub"          # stub has no model list
+        assert "requested_tiers" not in body or body["requested_tiers"]
+
+
 def test_ui_is_served():
     with TestClient(app) as client:
         res = client.get("/")
