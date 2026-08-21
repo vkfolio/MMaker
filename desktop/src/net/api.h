@@ -105,6 +105,17 @@ public:
     bool fetch_audio(const std::string& project_id, const std::string& rel,
                      const std::string& dest, ProgressFn progress = {});
 
+    /// Regenerate a time range of one stem, in seconds.
+    ///
+    /// Seconds, not bars: the server used to quantise to whole bars, which made
+    /// "regenerate this bit" mean "regenerate the bar it lands in". A selection
+    /// the user dragged has to survive the trip.
+    std::optional<JobRef> repaint(const std::string& project_id,
+                                  const std::string& stem_id,
+                                  double start_s, double end_s,
+                                  const std::string& prompt = {},
+                                  const std::string& idempotency_key = {});
+
     std::optional<JobRef> job(const std::string& job_id);
     bool cancel(const std::string& job_id);
 

@@ -87,7 +87,7 @@ int64_t draw_waveform(SkCanvas* c, const SkRect& lane, float origin_x,
 
 DrawStats draw_arrangement(SkCanvas* c, const SkRect& bounds, Session& session,
                            const View& view, int64_t playhead, ClipId selected,
-                           const Palette& pal) {
+                           const Selection& range, const Palette& pal) {
     DrawStats stats;
 
     SkPaint fill;
@@ -250,6 +250,40 @@ DrawStats draw_arrangement(SkCanvas* c, const SkRect& bounds, Session& session,
     }
     text_paint.setColor(pal.text);
     stats.clips_drawn = static_cast<int>(visible.size());
+
+    // --- selection ----------------------------------------------------------
+    // Over the waveform rather than under it: what is selected has to stay
+    // legible against whatever it is covering, and a wash beneath the clip body
+    // disappears entirely on a dense stem.
+    if (range.active()) {
+        int index = -1;
+        for (int i = 0; i < track_count; ++i)
+            if (session.tracks[i].id == range.track) { index = i; break; }
+        if (index >= 0) {
+            const float x0 = bounds.left() + view.x_of(range.begin());
+            const float x1 = bounds.left() + view.x_of(range.end());
+            const float top = bounds.top() + track_top(index);
+            const SkRect box = SkRect::MakeLTRB(
+                std::max(bounds.left(), x0), top,
+                std::min(bounds.right(), x1), top + kTrackHeight);
+            if (box.width() > 0.0f) {
+                fill.setColor(pal.selection);
+                fill.setAntiAlias(false);
+                c->drawRect(box, fill);
+
+                // Hard edges: a soft wash alone makes it impossible to tell
+                // exactly what will be regenerated.
+                line.setColor(pal.selection_edge);
+                line.setStrokeWidth(1.0f);
+                if (x0 >= bounds.left())
+                    c->drawLine(std::floor(x0) + 0.5f, top,
+                                std::floor(x0) + 0.5f, top + kTrackHeight, line);
+                if (x1 <= bounds.right())
+                    c->drawLine(std::floor(x1) + 0.5f, top,
+                                std::floor(x1) + 0.5f, top + kTrackHeight, line);
+            }
+        }
+    }
 
     // --- playhead ------------------------------------------------------------
     const float px = bounds.left() + view.x_of(playhead);

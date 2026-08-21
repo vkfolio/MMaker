@@ -74,6 +74,21 @@ inline int track_at(float y, int track_count) {
     return (i >= 0 && i < track_count) ? i : -1;
 }
 
+/// A time range on one track. This is what every AI tool acts on -- the plan
+/// calls it "the defining interaction" -- so it is a first-class thing the
+/// drawing and the tools both read, not state hidden inside a mouse handler.
+struct Selection {
+    TrackId track = 0;
+    int64_t from  = 0;
+    int64_t to    = 0;
+
+    bool active() const { return track != 0 && to > from; }
+    void clear() { track = 0; from = to = 0; }
+    /// Ordered bounds, so a right-to-left drag means the same as left-to-right.
+    int64_t begin() const { return std::min(from, to); }
+    int64_t end() const { return std::max(from, to); }
+};
+
 struct Palette {
     SkColor bg        = SkColorSetRGB(0x14, 0x16, 0x1d);
     SkColor lane      = SkColorSetRGB(0x1a, 0x1d, 0x26);
@@ -83,7 +98,8 @@ struct Palette {
     SkColor ruler     = SkColorSetRGB(0x1b, 0x1e, 0x27);
     SkColor text      = SkColorSetRGB(0x8d, 0x94, 0xa3);
     SkColor playhead  = SkColorSetRGB(0xff, 0x6b, 0x4a);
-    SkColor selection = SkColorSetARGB(0x30, 0x4f, 0x8e, 0xf7);
+    SkColor selection = SkColorSetARGB(0x38, 0xff, 0xd5, 0x8a);
+    SkColor selection_edge = SkColorSetARGB(0xcc, 0xff, 0xd5, 0x8a);
 };
 
 struct DrawStats {
@@ -101,6 +117,6 @@ struct DrawStats {
 /// render position puts the line visibly ahead of the sound.
 DrawStats draw_arrangement(SkCanvas* c, const SkRect& bounds, Session& session,
                            const View& view, int64_t playhead, ClipId selected,
-                           const Palette& pal = {});
+                           const Selection& range = {}, const Palette& pal = {});
 
 }  // namespace mx

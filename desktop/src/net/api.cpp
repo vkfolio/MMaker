@@ -202,6 +202,34 @@ bool ApiClient::fetch_audio(const std::string& project_id, const std::string& re
     return true;
 }
 
+std::optional<JobRef> ApiClient::repaint(const std::string& project_id,
+                                         const std::string& stem_id,
+                                         double start_s, double end_s,
+                                         const std::string& prompt,
+                                         const std::string& idempotency_key) {
+    json body;
+    body["start_s"] = start_s;
+    body["end_s"] = end_s;
+    if (!prompt.empty()) body["prompt"] = prompt;
+
+    // An idempotency key matters more here than anywhere else: a POST whose
+    // response is lost has still started a GPU job, and without the key a retry
+    // starts a second one while the first is still running.
+    const Response r = http_.post(
+        url("/api/projects/" + url_escape(project_id) + "/stems/" +
+            url_escape(stem_id) + "/repaint"),
+        body.dump(), idempotency_key);
+    auto parsed = parse(r, last_error_);
+    if (!parsed) return std::nullopt;
+
+    auto it = parsed->find("job");
+    if (it == parsed->end() || !it->is_object()) {
+        last_error_ = "the server accepted the repaint but named no job";
+        return std::nullopt;
+    }
+    return read_job(*it);
+}
+
 std::optional<JobRef> ApiClient::job(const std::string& job_id) {
     const Response r = http_.get(url("/api/jobs/" + url_escape(job_id)));
     auto body = parse(r, last_error_);

@@ -91,13 +91,21 @@ struct MsgStemArrived {
     bool        from_cache = false;
 };
 
+/// A stem whose audio was replaced by a server-side render.
+struct MsgStemUpdated {
+    mx::TrackId  track_id = 0;
+    mx::SourceId source_id = 0;
+    std::string  version_id;
+    mx::Media    media;
+};
+
 struct MsgStatus {
     std::string text;
     bool        error = false;
 };
 
 using UiMessage = std::variant<MsgDecoded, MsgProjects, MsgProjectOpened,
-                               MsgStemArrived, MsgStatus>;
+                               MsgStemArrived, MsgStemUpdated, MsgStatus>;
 
 class Inbox {
 public:
@@ -164,6 +172,9 @@ struct Studio {
     // Drag state. Held here rather than in the graph, so a drag in progress is
     // a property of the UI and cannot reach the audio thread half-applied.
     mx::ClipId dragging     = 0;
+    // The selection every AI tool acts on, and the drag that builds it.
+    mx::Selection selection;
+    bool          selecting = false;
     int64_t    drag_grab    = 0;     // offset from clip start to grab point
     bool       scrubbing    = false;
 
@@ -194,6 +205,11 @@ struct Studio {
 
     bool selftest = false;
     int  reports  = 0;
+    // Drives the select-and-regenerate loop without a mouse, so the milestone
+    // is checkable from a terminal rather than only by hand.
+    double regen_from = -1.0, regen_to = -1.0;
+    bool   regen_fired = false;
+    bool   regen_done = false;
 
     // -- content ------------------------------------------------------------
 
@@ -403,6 +419,145 @@ struct Studio {
         }).detach();
     }
 
+    /// Regenerate the selected range of the selected track, on the pod.
+    ///
+    /// This is the loop the whole product rests on: drag a range, hit a tool,
+    /// hear the result. Everything it needs already exists -- the server takes
+    /// second-precision ranges, versions are append-only, and the client can
+    /// follow a job with cancel -- so this is the wiring, not new machinery.
+    void regenerate(vik::App& app) {
+        if (net_busy || !selection.active() || open_project_id.empty()) return;
+
+        // Which stem is this? The session keeps provenance for exactly this
+        // question; without a stem id there is nothing to ask the server about.
+        const mx::Clip* clip = nullptr;
+        for (const auto& candidate : session.clips)
+            if (candidate.track_id == selection.track) { clip = &candidate; break; }
+        if (!clip) return;
+        mx::Source* source = session.find_source(clip->source_id);
+        if (!source || source->stem_id.empty()) {
+            net_status = "that track did not come from the pod";
+            net_error = true;
+            return;
+        }
+
+        const double rate = static_cast<double>(session.rate);
+        const double start_s = static_cast<double>(selection.begin()) / rate;
+        const double end_s = static_cast<double>(selection.end()) / rate;
+
+        net_busy = true;
+        net_error = false;
+        net_status = "regenerating…";
+
+        auto* platform = &app.platform();
+        std::thread([url = pod_url, token = pod_token, project = open_project_id,
+                     stem = source->stem_id, source_id = source->id,
+                     track_id = selection.track, start_s, end_s,
+                     rate = session.rate, platform] {
+            mx::net::ApiClient api;
+            api.set_base(url);
+            api.set_token(token);
+
+            // A key derived from the request itself: if the response is lost
+            // and this is retried, the server recognises it as the same work
+            // rather than starting a second GPU job.
+            const std::string key = project + ":" + stem + ":" +
+                                    std::to_string(static_cast<int64_t>(start_s * 1000)) +
+                                    ":" + std::to_string(static_cast<int64_t>(end_s * 1000));
+
+            auto job = api.repaint(project, stem, start_s, end_s, {}, key);
+            if (!job) {
+                g_inbox.push(MsgStatus{"repaint refused: " + api.last_error(), true});
+                platform->wake();
+                return;
+            }
+
+            const auto finished = api.follow(job->id, [&](const mx::net::JobRef& j) {
+                std::string note = j.queue_position > 1
+                    ? ("queued #" + std::to_string(j.queue_position))
+                    : (j.message.empty() ? j.status : j.message);
+                g_inbox.push(MsgStatus{note, false});
+                platform->wake();
+                return true;
+            });
+            if (finished.status != "done") {
+                g_inbox.push(MsgStatus{
+                    "repaint " + finished.status +
+                        (finished.error.empty() ? "" : ": " + finished.error), true});
+                platform->wake();
+                return;
+            }
+
+            // The result is a NEW version, not a rewritten file -- so re-read
+            // the project and take whatever is current now. Guessing the path
+            // would assume the server mutates audio in place, which is exactly
+            // the thing it was fixed not to do.
+            auto detail = api.project(project);
+            if (!detail) {
+                g_inbox.push(MsgStatus{"rendered, but cannot re-read the project: " +
+                                       api.last_error(), true});
+                platform->wake();
+                return;
+            }
+            const mx::net::VersionRef* version = nullptr;
+            for (const auto& st : detail->stems)
+                if (st.id == stem) version = st.version();
+            if (!version || version->audio.empty()) {
+                g_inbox.push(MsgStatus{"rendered, but the stem has no current version", true});
+                platform->wake();
+                return;
+            }
+
+            const uint64_t ckey = mx::net::cache_key(project, version->id, version->audio);
+            const auto cached = mx::net::cache_path(ckey);
+            if (!std::filesystem::exists(cached) &&
+                !api.fetch_audio(project, version->audio, cached.string())) {
+                g_inbox.push(MsgStatus{"cannot fetch the new take: " + api.last_error(), true});
+                platform->wake();
+                return;
+            }
+            mx::Media media = mx::decode_file(cached, rate);
+            if (!media.ok()) {
+                std::error_code ec;
+                std::filesystem::remove(cached, ec);
+                g_inbox.push(MsgStatus{"new take will not decode: " + media.error, true});
+                platform->wake();
+                return;
+            }
+            g_inbox.push(MsgStemUpdated{track_id, source_id, version->id, std::move(media)});
+            platform->wake();
+        }).detach();
+    }
+
+    /// Mix the session to a file next to the cache, and say where it went.
+    ///
+    /// No file dialog: vikui has no native picker, and writing one is its own
+    /// job. A known location plus the path on screen beats a half-built dialog.
+    void export_mix() {
+        if (session.clips.empty()) {
+            net_status = "nothing to export";
+            net_error = true;
+            return;
+        }
+        auto dir = mx::net::cache_root().parent_path() / "exports";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        std::string name = session.title.empty() ? "mix" : session.title;
+        for (char& c : name)
+            if (std::strchr("\/:*?\"<>|", c)) c = '_';
+        const auto out = dir / (name + ".wav");
+
+        const auto result = mx::bounce(session, out);
+        net_error = !result.ok;
+        net_status = result.ok
+            ? ("exported " + out.filename().string() + "  " +
+               std::to_string(static_cast<int>(result.seconds)) + "s")
+            : ("export failed: " + result.error);
+        if (result.ok)
+            std::printf("exported %s (%.1fs, %.0fx realtime)\n",
+                        out.string().c_str(), result.seconds, result.realtime_ratio);
+    }
+
     /// Places a stem that a worker finished. Ids are minted here, on the UI
     /// thread, which is the only place they may be.
     void place_stem(MsgStemArrived& msg) {
@@ -493,6 +648,24 @@ struct Studio {
                     last_decode_ms = m.fetch_ms;
                     net_status = "loaded " + std::to_string(stems_arrived) + "/" +
                                  std::to_string(std::max(stems_expected, stems_arrived));
+                    changed = true;
+
+                } else if constexpr (std::is_same_v<T, MsgStemUpdated>) {
+                    // Swap the audio under the existing clip. The clip, its
+                    // track and its position are untouched -- only the source
+                    // buffer changes, so a regenerate cannot quietly move
+                    // anything on the timeline.
+                    if (mx::Source* src = session.find_source(m.source_id)) {
+                        src->buffer = m.media.buffer;
+                        src->peaks = std::move(m.media.peaks);
+                        src->version_id = m.version_id;
+                        for (auto& clip : session.clips)
+                            if (clip.source_id == src->id)
+                                clip.length = std::min(clip.length, src->buffer->frames);
+                    }
+                    net_busy = false;
+                    net_status = "regenerated";
+                    if (selftest) regen_done = true;
                     changed = true;
 
                 } else if constexpr (std::is_same_v<T, MsgStatus>) {
@@ -633,6 +806,11 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 }))
             .child(readout("position", std::format("{:.2f}s", pos_s)))
             .child(readout("bar.beat", std::format("{}.{}", bar + 1, beat + 1)))
+            .child(readout("selection", selection.active()
+                ? std::format("{:.2f}-{:.2f}s",
+                              static_cast<double>(selection.begin()) / session.rate,
+                              static_cast<double>(selection.end()) / session.rate)
+                : std::string("shift-drag")))
             .child(readout("tempo", std::format("{:.0f} BPM", session.bpm)))
             .child(readout("device", g_device.running()
                                          ? std::format("{} {} Hz", g_device.backend(),
@@ -644,7 +822,14 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             // have to go looking for is a number nobody looks at.
             .child(readout("xruns", std::to_string(g_mixer.xruns())))
             .child(readout("peak", std::format("{:.2f}", meter)))
-            .child(readout("paint", std::format("{:.2f} ms", last_paint_ms)));
+            .child(readout("paint", std::format("{:.2f} ms", last_paint_ms)))
+            .child(vik::div().flex_row().gap_2()
+                .child(icon_button("regen", "sparkle", false,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) { s.regenerate(c.app()); c.notify(); }))
+                .child(icon_button("export", "download-simple", false,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) { s.export_mix(); c.notify(); })));
 
     // --- track headers: real elements, because they are chrome --------------
     auto headers = vik::div().flex_col().w_px(160.0f)
@@ -702,7 +887,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             c->save();
             c->clipRect(rect);
             const auto stats = mx::draw_arrangement(c, rect, self->session, self->view,
-                                                    head, self->selected);
+                                                    head, self->selected, self->selection);
             c->restore();
             const auto t1 = std::chrono::steady_clock::now();
             self->columns = stats.columns_drawn;
@@ -729,6 +914,18 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     if (y < mx::kRulerHeight) {
                         s.scrubbing = true;
                         s.seek(s.view.frame_at(x));
+                    } else if (e.modifiers.shift) {
+                        // Shift-drag selects a time range on the track under
+                        // the cursor. Plain drag still moves the clip, so the
+                        // two never fight over the same gesture.
+                        const int lane = mx::track_at(
+                            y, static_cast<int>(s.session.tracks.size()));
+                        if (lane >= 0) {
+                            s.selecting = true;
+                            s.selection.track = s.session.tracks[lane].id;
+                            s.selection.from = s.selection.to =
+                                std::max<int64_t>(0, s.view.frame_at(x));
+                        }
                     } else if (const mx::ClipId id = s.clip_at(x, y)) {
                         s.selected = id;
                         s.dragging = id;
@@ -736,6 +933,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                             s.drag_grab = s.view.frame_at(x) - clip->start_frame;
                     } else {
                         s.selected = 0;
+                        s.selection.clear();
                     }
                     c.notify();
                 }))
@@ -744,6 +942,11 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                    vik::Context<Studio>& c) {
                     if (s.scrubbing) {
                         s.seek(s.view.frame_at(e.position.x));
+                        c.notify();
+                        return;
+                    }
+                    if (s.selecting) {
+                        s.selection.to = std::max<int64_t>(0, s.view.frame_at(e.position.x));
                         c.notify();
                         return;
                     }
@@ -765,9 +968,16 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             .capture_mouse_up(vik::MouseButton::Left, cx.listener(
                 [](Studio& s, const vik::MouseUpEvent&, vik::Window&,
                    vik::Context<Studio>& c) {
-                    if (s.dragging || s.scrubbing) {
+                    if (s.dragging || s.scrubbing || s.selecting) {
                         s.dragging = 0;
                         s.scrubbing = false;
+                        // A selection thinner than a few pixels is a misclick,
+                        // not a range; keeping it would arm a tool over nothing.
+                        if (s.selecting &&
+                            std::llabs(s.selection.to - s.selection.from) <
+                                static_cast<int64_t>(4 * s.view.frames_per_pixel))
+                            s.selection.clear();
+                        s.selecting = false;
                         s.session.loop_end = s.session.length_frames();
                         c.notify();
                     }
@@ -848,6 +1058,9 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             [](Studio& s, const vik::KeyDownEvent& e, vik::Window&,
                vik::Context<Studio>& c) {
                 if (e.key == "space") s.toggle_play();
+                else if (e.key == "r") s.regenerate(c.app());
+                else if (e.key == "e") s.export_mix();
+                else if (e.key == "escape") s.selection.clear();
                 else if (e.key == "home") s.seek(0);
                 else if (e.key == "l") {
                     auto& t = g_mixer.transport;
@@ -1067,6 +1280,7 @@ int main(int argc, char** argv) {
     fs::path bounce_to;
     std::string pod_url, pod_token, pod_project;
     bool probe_only = false;
+    double regen_from = -1.0, regen_to = -1.0;
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -1075,6 +1289,14 @@ int main(int argc, char** argv) {
         else if (arg == "--bounce" && i + 1 < argc) bounce_to = argv[++i];
         else if (arg == "--connect" && i + 1 < argc) pod_url = argv[++i];
         else if (arg == "--probe") probe_only = true;
+        else if (arg == "--regen" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            const size_t colon = spec.find(':');
+            if (colon != std::string::npos) {
+                regen_from = std::stod(spec.substr(0, colon));
+                regen_to = std::stod(spec.substr(colon + 1));
+            }
+        }
         else if (arg == "--token" && i + 1 < argc) pod_token = argv[++i];
         else if (arg == "--project" && i + 1 < argc) pod_project = argv[++i];
         else folder = arg;
@@ -1097,6 +1319,8 @@ int main(int argc, char** argv) {
                     s.selftest = selftest;
                     s.pod_url = pod_url;
                     s.pod_token = pod_token;
+                    s.regen_from = regen_from;
+                    s.regen_to = regen_to;
                     // The device decides the rate; the session follows it,
                     // because everything decoded is resampled to it once.
                     if (g_device.running()) s.session.rate = g_device.rate();
@@ -1121,6 +1345,24 @@ int main(int argc, char** argv) {
                 app.set_interval(std::chrono::milliseconds(16), [handle](vik::App& a) {
                     a.update_entity(handle, [](Studio& s, vik::Context<Studio>& c) {
                         const bool landed = s.pump();
+
+                        // Fire the scripted regenerate once, once content is
+                        // actually present -- doing it earlier would test the
+                        // empty-session path instead.
+                        if (s.regen_from >= 0.0 && !s.regen_fired && !s.net_busy &&
+                            s.stems_arrived > 0 && !s.session.tracks.empty()) {
+                            s.regen_fired = true;
+                            s.selection.track = s.session.tracks.front().id;
+                            s.selection.from =
+                                static_cast<int64_t>(s.regen_from * s.session.rate);
+                            s.selection.to =
+                                static_cast<int64_t>(s.regen_to * s.session.rate);
+                            std::printf("REGEN selecting %.2f-%.2fs on track %u\n",
+                                        s.regen_from, s.regen_to, s.selection.track);
+                            std::fflush(stdout);
+                            s.regenerate(c.app());
+                        }
+
                         const bool rolling = g_mixer.transport.playing.load();
                         g_mixer.collect(g_device.running());
                         if (landed || rolling || s.meter > 0.001f) c.notify();
@@ -1135,7 +1377,10 @@ int main(int argc, char** argv) {
                     bool done = false;
                     a.update_entity(handle, [&](Studio& s, vik::Context<Studio>&) {
                         s.report();
-                        done = s.selftest && ++s.reports >= 8;
+                        const int budget = s.regen_from >= 0.0 ? 180 : 8;
+                        ++s.reports;
+                        done = s.selftest &&
+                               (s.regen_done || (s.reports >= budget && !s.net_busy));
                     });
                     if (done) a.quit();
                     return !done;
