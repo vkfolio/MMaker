@@ -311,6 +311,39 @@ def test_repaint_preserves_audio_outside_the_region():
     assert inside > 1e-4, "repaint did not change the requested region"
 
 
+def test_repaint_accepts_seconds_not_just_bars():
+    """A timeline drag lands anywhere; whole-bar quantisation was ours, not the
+    model's -- ACE-Step's repaint takes seconds."""
+    pid = make_project(bars=16)
+    stems = split(pid)
+    job = client.post(f"/api/projects/{pid}/stems/{stems[0]['id']}/repaint",
+                      json={"start_s": 3.75, "end_s": 7.25}).json()["job"]
+    version = wait_job(job["id"])["result"]
+    assert version["op"] == "repaint"
+    assert version["params"]["start_s"] == 3.75
+    assert version["params"]["end_s"] == 7.25
+
+
+def test_repaint_without_a_range_is_rejected():
+    pid = make_project(bars=8)
+    stems = split(pid)
+    res = client.post(f"/api/projects/{pid}/stems/{stems[0]['id']}/repaint",
+                      json={"prompt": "no range given"})
+    assert res.status_code == 422
+
+
+def test_progress_is_not_fabricated():
+    """Jobs whose engine reports nothing must say so rather than inventing a
+    percentage; and the queue position must be real."""
+    from app import jobs as jobs_mod
+    q = jobs_mod.JobQueue()
+    j = jobs_mod.Job(id="j1", kind="test")
+    assert j.public()["determinate"] is True
+    j.determinate = False
+    body = j.public()
+    assert body["determinate"] is False and "queue_position" in body
+
+
 def test_repaint_rejects_a_range_past_the_end():
     pid = make_project(bars=8)
     stems = split(pid)

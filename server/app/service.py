@@ -255,26 +255,26 @@ def _next_path(project: Project, stem: Stem, op: str) -> Path:
     return d / f"{stem.id}_{op}_{len(stem.versions)}.wav"
 
 
-def repaint_stem(project: Project, stem: Stem, start_bar: int, end_bar: int,
+def repaint_stem(project: Project, stem: Stem, start_s: float, end_s: float,
                  prompt: str | None = None, seed: int | None = None,
                  report=None) -> dict:
+    """Regenerate a time region. Callers pass seconds; bars are resolved above."""
     _require_confirmed(project)
-    if end_bar <= start_bar:
-        raise NotReady("end_bar must be greater than start_bar")
+    if end_s <= start_s:
+        raise NotReady("the end of the region must come after its start")
 
     src = _abs(project, stem.version.audio)
     duration = audio.describe(src)["duration_s"]
-    start_s = project.grid.bar_to_seconds(start_bar)
-    end_s = min(project.grid.bar_to_seconds(end_bar), duration)
+    end_s = min(end_s, duration)
     if start_s >= duration:
         raise NotReady(
-            f"bar {start_bar} starts at {start_s:.1f}s but the stem is only "
-            f"{duration:.1f}s long")
+            f"the region starts at {start_s:.2f}s but the stem is only "
+            f"{duration:.2f}s long")
 
     seed = _seed(seed)
     dest = _next_path(project, stem, "repaint")
     if report:
-        report(0.15, f"repainting bars {start_bar}-{end_bar}")
+        report(0.15, f"repainting {start_s:.2f}s-{end_s:.2f}s")
 
     engines.music().repaint(dest, src, start_s, end_s,
                             prompt or stem.prompt, project.grid, seed,
@@ -284,8 +284,8 @@ def repaint_stem(project: Project, stem: Stem, start_bar: int, end_bar: int,
     outside_residual = _outside_residual(src, dest, start_s, end_s)
     version = stem.add(StemVersion(
         audio=_rel(project, dest), op="repaint",
-        params={"start_bar": start_bar, "end_bar": end_bar, "seed": seed,
-                "prompt": prompt or stem.prompt,
+        params={"start_s": round(start_s, 3), "end_s": round(end_s, 3),
+                "seed": seed, "prompt": prompt or stem.prompt,
                 "outside_residual": outside_residual},
         sync=_verify(dest, project.grid),
         note=("context preserved" if outside_residual is not None

@@ -172,10 +172,26 @@ class SplitRequest(BaseModel):
 
 
 class RepaintRequest(BaseModel):
-    start_bar: int = Field(..., ge=1)
-    end_bar: int = Field(..., ge=2)
+    """A region to regenerate, in bars or in seconds.
+
+    ACE-Step's repaint takes seconds, so whole-bar quantisation was ours, not
+    the model's. A timeline drag lands anywhere, so seconds are the honest
+    interface; bars stay for callers that think in bars.
+    """
+    start_bar: int | None = Field(None, ge=1)
+    end_bar: int | None = Field(None, ge=2)
+    start_s: float | None = Field(None, ge=0)
+    end_s: float | None = Field(None, gt=0)
     prompt: str | None = None
     seed: int | None = None
+
+    def resolve(self, grid) -> tuple[float, float]:
+        """Seconds win when given; otherwise convert the bar range."""
+        if self.start_s is not None and self.end_s is not None:
+            return float(self.start_s), float(self.end_s)
+        if self.start_bar is not None and self.end_bar is not None:
+            return grid.bar_to_seconds(self.start_bar), grid.bar_to_seconds(self.end_bar)
+        raise ValueError("give either start_bar/end_bar or start_s/end_s")
 
 
 class ExtendRequest(BaseModel):

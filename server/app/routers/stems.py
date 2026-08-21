@@ -34,12 +34,16 @@ def list_stems(project_id: str):
 
 @router.post("/{stem_id}/repaint")
 def repaint(project_id: str, stem_id: str, body: RepaintRequest):
-    _stem(_get(project_id), stem_id)
+    project = _get(project_id)
+    _stem(project, stem_id)
+    try:
+        start_s, end_s = body.resolve(project.grid)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
     def work(report):
-        project = _get(project_id)
-        return service.repaint_stem(project, project.stem(stem_id),
-                                    body.start_bar, body.end_bar,
+        proj = _get(project_id)
+        return service.repaint_stem(proj, proj.stem(stem_id), start_s, end_s,
                                     body.prompt, body.seed, report)
 
     return {"job": jobs.queue.submit("repaint", work, project_id).public()}

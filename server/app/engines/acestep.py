@@ -194,9 +194,9 @@ class AceStepEngine:
                 self._dump("failure", body)
                 raise EngineError(f"ACE-Step task failed: {body!r}")
             if report:
-                # No real progress signal from the server, so report elapsed time
-                # against a nominal ceiling rather than inventing a percentage.
-                report(min(0.95, elapsed / 180.0), f"rendering ({int(elapsed)}s)")
+                # ACE-Step exposes no progress signal. elapsed/180 looked like
+                # information and was not; report indeterminate and show time.
+                report(-1, f"rendering ({int(elapsed)}s)")
             time.sleep(POLL_S)
 
     def _download(self, ref: str, dest: Path) -> Path:
