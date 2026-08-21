@@ -8,12 +8,14 @@
 models:
   - name: acestep
     label: ACE-Step 1.5
-    kind: huggingface
+    # ACE-Step fetches its own checkpoints into ACESTEP_DIR on first use, so a
+    # registry download here would be a second copy of the same ~12 GB.
+    kind: external
     repo_id: ACE-Step/Ace-Step1.5
-    approx_gb: 12
+    approx_gb: 0
     enabled: true
     phase: 2
-    purpose: generation, layering, repaint, extend, extract
+    purpose: generation, layering, repaint, extend, extract (self-managed weights)
 
   - name: demucs
     label: Demucs htdemucs_ft

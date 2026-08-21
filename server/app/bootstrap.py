@@ -137,7 +137,7 @@ def _download_torchhub(model):
         raise RuntimeError(f"no torchhub handler for {model.name}")
 
 
-KNOWN_KINDS = {"huggingface", "torchhub"}
+KNOWN_KINDS = {"huggingface", "torchhub", "external"}
 
 
 def _is_present(model):
@@ -155,6 +155,13 @@ def run():
     for model in state.models:
         if not model.enabled:
             model.status = "skipped"
+            continue
+
+        # Weights someone else manages: nothing to fetch, but the capability
+        # is available, so report ready rather than pending forever.
+        if model.kind == "external":
+            model.status = "ready"
+            model.downloaded_gb = model.approx_gb
             continue
 
         if model.kind == "huggingface" and _is_present(model):

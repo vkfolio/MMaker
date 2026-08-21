@@ -66,6 +66,21 @@ ports, the proxy and the UI are all good, and anything that breaks later is the 
 
 ---
 
+## Bringing a terminated pod back
+
+Terminating deletes the pod *and* its volume, so projects and generated audio
+are gone. The environment is not: it is in the image below, weights included.
+
+1. **RunPod → Settings → SSH Public Keys** — add your key here, not to a running
+   container. Keys added here are injected at pod start and survive restarts.
+2. Create a pod from `vignesh07021990/mmaker:latest` using the table below.
+3. Open the URL the start command prints, or `curl <url>/health` until ready.
+
+First boot is a 34.77 GB image pull. After that there is no install and no
+weight download.
+
+---
+
 ## Path B — start from the prebuilt image (fastest)
 
 An image built from a working pod already exists:
