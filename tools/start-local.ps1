@@ -94,6 +94,8 @@ if (Running "app.main") {
     # already yours, and a password on localhost is friction without a threat.
     Remove-Item Env:\MUSICMAKER_API_TOKEN -ErrorAction SilentlyContinue
 
+    # The same virtualenv ACE-Step uses: it already has torch, and the
+    # server needs torch for separation.
     $py = Join-Path $c.server_venv "Scripts\python.exe"
     Start-Process -FilePath $py `
         -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1",

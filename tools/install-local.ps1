@@ -181,19 +181,27 @@ Step "musicmaker server"
 
 $repo   = Split-Path -Parent $PSScriptRoot
 $server = Join-Path $repo "server"
-$venv   = Join-Path $Root "server-venv"
 
-if (Test-Path (Join-Path $venv "Scripts\python.exe")) {
-    Good "server virtualenv already built"
-} else {
-    Note "creating a 3.12 virtualenv for the API server"
-    & uv venv --python 3.12 $venv
-    if ($LASTEXITCODE -ne 0) { throw "uv venv failed" }
-}
-Note "installing server requirements"
-& uv pip install --python (Join-Path $venv "Scripts\python.exe") `
-    -r (Join-Path $server "requirements.txt")
+# Into ACE-Step's virtualenv, not a second one.
+#
+# It already carries CUDA torch, torchaudio, soundfile, transformers, fastapi,
+# pydantic, numpy and uvicorn -- nearly the whole server requirement -- so a
+# separate venv would mean a second 3 GB copy of torch to no purpose. What is
+# actually missing is demucs, librosa and mido, which are small once torch is
+# present. It also means separation and export work locally rather than failing
+# on an import the first time somebody splits a take.
+$py = Join-Path $acestep ".venv\Scripts\python.exe"
+
+Note "installing the server requirements"
+& uv pip install --python $py -r (Join-Path $server "requirements.txt") | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "server requirements failed" }
+
+Note "installing the audio extras (demucs, librosa, mido)"
+# Deliberately not the whole of requirements-pod.txt: diffusers, accelerate and
+# transformers are ACE-Step's business and already pinned in this venv, and
+# re-resolving them here is how a working install gets broken.
+& uv pip install --python $py demucs librosa mido | Out-Null
+if ($LASTEXITCODE -ne 0) { Warn "audio extras failed -- splitting will not work locally" }
 Good "server ready"
 
 # ---------------------------------------------------------------------------
@@ -204,11 +212,15 @@ Step "Recording where everything went"
 $conf = @{
     root        = $Root
     acestep_dir = $acestep
-    server_venv = $venv
+    server_venv = Join-Path $acestep ".venv"
     repo        = $repo
     vram_mib    = $vram
 } | ConvertTo-Json
-Set-Content -Path (Join-Path $Root "local.json") -Value $conf -Encoding utf8
+# UTF-8 without a BOM. PowerShell 5.1's -Encoding utf8 writes one, and a BOM
+# in front of a JSON document is a parse error for anything reading it as plain
+# UTF-8 -- which is every other tool that might want to look at this file.
+[System.IO.File]::WriteAllText((Join-Path $Root "local.json"), $conf,
+                               (New-Object System.Text.UTF8Encoding($false)))
 Good (Join-Path $Root "local.json")
 
 Write-Host "`nDone." -ForegroundColor Green
