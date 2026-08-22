@@ -118,6 +118,11 @@ struct MsgJob {
     bool        finished = false;
 };
 
+/// What the connected engine can actually render.
+struct MsgCapabilities {
+    mx::net::Capabilities caps;
+};
+
 struct MsgStatus {
     std::string text;
     bool        error = false;
@@ -125,7 +130,7 @@ struct MsgStatus {
 
 using UiMessage = std::variant<MsgDecoded, MsgProjects, MsgProjectOpened,
                                MsgStemArrived, MsgStemUpdated, MsgJob,
-                               MsgStatus>;
+                               MsgCapabilities, MsgStatus>;
 
 class Inbox {
 public:
@@ -305,6 +310,7 @@ struct Studio {
     bool        net_busy = false;
     bool        net_error = false;
     std::vector<mx::net::ProjectSummary> projects;
+    mx::net::Capabilities caps;
     std::string open_project_id;
     int         stems_expected = 0;
     int         stems_arrived = 0;
@@ -546,6 +552,12 @@ struct Studio {
             std::string note = health.ready ? "ready" : health.status;
             if (!health.gpu.empty()) note += " · " + health.gpu;
             g_inbox.push(MsgStatus{note, false});
+
+            // Ask what it can render rather than assuming. A tier whose weights
+            // are absent renders as something else without saying so, and that
+            // is now routine: a laptop carries the small tier, a pod may carry
+            // all three.
+            g_inbox.push(MsgCapabilities{api.capabilities()});
             wake_ui(platform);
         }).detach();
     }
@@ -1417,6 +1429,18 @@ struct Studio {
                             m.queue_position, std::chrono::steady_clock::now(), false});
                     }
 
+                } else if constexpr (std::is_same_v<T, MsgCapabilities>) {
+                    caps = std::move(m.caps);
+                    // Never leave the picker on a tier this engine will not
+                    // honour -- offering it is the whole failure being avoided.
+                    if (caps.known && !caps.tier_is_real(gen_quality)) {
+                        for (const char* fallback : {"fast", "high", "ultra"})
+                            if (caps.tier_is_real(fallback)) {
+                                gen_quality = fallback;
+                                break;
+                            }
+                    }
+
                 } else if constexpr (std::is_same_v<T, MsgStatus>) {
                     net_busy = false;
                     if (!m.text.empty()) {
@@ -1515,6 +1539,8 @@ struct Studio {
                                const char* action, bool ready,
                                std::function<void(Studio&, vik::App&)> run);
     vik::AnyElement current_tool_modal(vik::Context<Studio>& cx);
+    vik::AnyElement quality_chip(vik::Context<Studio>& cx, const char* tier,
+                                 bool on);
 };
 
 // ---------------------------------------------------------------------------
@@ -1919,6 +1945,39 @@ vik::ui::MenuBuilder Studio::ai_tools_menu(vik::Context<Studio>&) {
     return menu;
 }
 
+/// One quality chip, greyed and annotated when the engine would substitute.
+vik::AnyElement Studio::quality_chip(vik::Context<Studio>& cx, const char* tier,
+                                     bool on) {
+    const bool real = !caps.known || caps.tier_is_real(tier);
+
+    std::string label = tier;
+    if (!real) {
+        // Say what it would actually be, not merely that it is unavailable.
+        for (const auto& [name, model] : caps.effective) {
+            if (name != tier) continue;
+            std::string shortened = model;
+            const std::string prefix = "acestep-v15-";
+            if (shortened.rfind(prefix, 0) == 0) shortened = shortened.substr(prefix.size());
+            label += "  (renders as " + shortened + ")";
+            break;
+        }
+    }
+
+    auto chip = vik::div().id("qc").px_3().py_1().rounded_md()
+        .bg(vik::rgb(on ? 0x3a4a68 : 0x2c313d))
+        .child(vik::text(label).text_color(
+            vik::rgb(!real ? 0x565c6b : (on ? 0xffffff : 0x8d94a3))));
+    if (real) {
+        chip = std::move(chip).cursor_pointer().on_click(
+            cx.listener([tier](Studio& s, const vik::ClickEvent&, vik::Window&,
+                               vik::Context<Studio>& c) {
+                s.gen_quality = tier;
+                c.notify();
+            }));
+    }
+    return std::move(chip).into_any();
+}
+
 vik::AnyElement Studio::generate_modal(vik::Context<Studio>& cx) {
     auto icon_button = [&cx](const char* id, const char* icon, bool active, auto fn) {
         return vik::div().id(id).px_3().py_2().rounded_md()
@@ -2004,17 +2063,15 @@ vik::AnyElement Studio::generate_modal(vik::Context<Studio>& cx) {
                         })))
                 .child(vik::text(gen_prompt.empty() ? "(pick a style)" : gen_prompt)
                            .text_color(vik::rgb(0xc9cedb)))
+                // A tier the engine cannot honour is shown greyed with what it
+                // would really render, rather than offered and quietly
+                // substituted. On a laptop only the small tier is installed;
+                // on a pod it depends what was downloaded.
                 .child(vik::div().flex_row().gap_2().items_center()
                     .child(vik::text("quality").text_xs().text_color(vik::rgb(0x6c7383)))
-                    .child(chip("fast", gen_quality == "fast",
-                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                           vik::Context<Studio>& c) { s.gen_quality = "fast"; c.notify(); }))
-                    .child(chip("high", gen_quality == "high",
-                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                           vik::Context<Studio>& c) { s.gen_quality = "high"; c.notify(); }))
-                    .child(chip("ultra", gen_quality == "ultra",
-                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                           vik::Context<Studio>& c) { s.gen_quality = "ultra"; c.notify(); })))
+                    .child(quality_chip(cx, "fast", gen_quality == "fast"))
+                    .child(quality_chip(cx, "high", gen_quality == "high"))
+                    .child(quality_chip(cx, "ultra", gen_quality == "ultra")))
                 .child(vik::div().flex_row().gap_2().items_center()
                     .child(vik::text("length").text_xs().text_color(vik::rgb(0x6c7383)))
                     .child(chip("8 bars", gen_bars == 8,

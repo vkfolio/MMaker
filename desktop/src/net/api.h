@@ -13,12 +13,35 @@
 
 #include <cstdint>
 #include <optional>
+#include <utility>
 #include <string>
 #include <vector>
 
 #include "http.h"
 
 namespace mx::net {
+
+/// What the engine on the other end can really render.
+///
+/// A tier whose checkpoint is absent does not fail -- ACE-Step falls back to
+/// its primary and renders anyway. Asking, rather than assuming, is the only
+/// way the app can avoid offering a quality it will not get; local mode makes
+/// this routine rather than exceptional, since a laptop carries the small tier
+/// and a pod may carry all three.
+struct Capabilities {
+    bool                     known = false;
+    std::vector<std::string> installed;
+    /// tier -> the checkpoint that tier will actually use here.
+    std::vector<std::pair<std::string, std::string>> effective;
+    /// Tiers that would quietly render as something else.
+    std::vector<std::string> falls_back;
+
+    bool tier_is_real(const std::string& tier) const {
+        for (const auto& name : falls_back)
+            if (name == tier) return false;
+        return true;
+    }
+};
 
 struct Health {
     bool        reachable = false;
@@ -95,6 +118,7 @@ public:
     const std::string& last_error() const { return last_error_; }
 
     Health health();
+    Capabilities capabilities();
 
     /// Ad-hoc generation. Creates a scratch workspace on the pod and renders
     /// into it.

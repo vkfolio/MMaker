@@ -289,6 +289,27 @@ std::vector<ApiClient::Voice> ApiClient::voices() {
     return out;
 }
 
+Capabilities ApiClient::capabilities() {
+    Capabilities caps;
+    const Response r = http_.get(url("/api/engine"));
+    auto body = parse(r, last_error_);
+    if (!body) return caps;                 // an older engine has no such route
+
+    caps.known = true;
+    if (auto it = body->find("installed"); it != body->end() && it->is_array())
+        for (const auto& name : *it)
+            if (name.is_string()) caps.installed.push_back(name.get<std::string>());
+    if (auto it = body->find("effective_tiers"); it != body->end() && it->is_object())
+        for (auto item = it->begin(); item != it->end(); ++item)
+            if (item.value().is_string())
+                caps.effective.emplace_back(item.key(), item.value().get<std::string>());
+    if (auto it = body->find("tiers_that_would_fall_back");
+        it != body->end() && it->is_object())
+        for (auto item = it->begin(); item != it->end(); ++item)
+            caps.falls_back.push_back(item.key());
+    return caps;
+}
+
 std::vector<ProjectSummary> ApiClient::projects() {
     std::vector<ProjectSummary> out;
     const Response r = http_.get(url("/api/projects"));
