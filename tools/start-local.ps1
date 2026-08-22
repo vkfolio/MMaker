@@ -59,15 +59,41 @@ if (Running "acestep-api") {
     Write-Host "ACE-Step already running" -ForegroundColor DarkGray
 } else {
     Write-Host "starting ACE-Step on :8001" -ForegroundColor Cyan
-    # Only the checkpoint this machine has. Registering a slot for weights that
-    # are not here is how a quality tier silently renders as something else --
-    # the pod taught that lesson the expensive way.
-    $env:ACESTEP_CONFIG_PATH = "acestep-v15-turbo"
-    Remove-Item Env:\ACESTEP_CONFIG_PATH2 -ErrorAction SilentlyContinue
-    Remove-Item Env:\ACESTEP_CONFIG_PATH3 -ErrorAction SilentlyContinue
+    # Register whatever checkpoints are actually on disk, best first -- the same
+    # rule the pod uses, for the same reason. Slot 1 is also the fallback for a
+    # model ACE-Step does not recognise, so best-first means an unmatched
+    # request degrades toward quality rather than away from it.
+    #
+    # This is deliberately not a fixed list. An earlier version hardcoded turbo
+    # on the assumption that 9 GB of XL weights could not run on an 8 GB card.
+    # ACE-Step's own tier table says otherwise: below 20 GB it turns on CPU
+    # offload and INT8 quantisation, so the DiT streams from system RAM. It is
+    # slower, not impossible -- and deciding that for the user by leaving the
+    # weights unregistered was the wrong call.
+    $ckpt = Join-Path $c.acestep_dir "checkpoints"
+    $slot = 1
+    foreach ($model in @("acestep-v15-xl-base", "acestep-v15-xl-turbo",
+                         "acestep-v15-turbo")) {
+        if (-not (Test-Path (Join-Path $ckpt $model))) { continue }
+        if ($slot -gt 3) { continue }
+        $name = if ($slot -eq 1) { "ACESTEP_CONFIG_PATH" }
+                else { "ACESTEP_CONFIG_PATH$slot" }
+        Set-Item -Path "Env:\$name" -Value $model
+        Write-Host "  model slot ${slot}: $model" -ForegroundColor DarkGray
+        $slot++
+    }
+    for ($i = $slot; $i -le 3; $i++) {
+        Remove-Item "Env:\ACESTEP_CONFIG_PATH$i" -ErrorAction SilentlyContinue
+    }
+    if ($slot -eq 1) { throw "no checkpoints in $ckpt -- run install-local.ps1" }
+
     # vLLM has no Windows build; the torch backend is the one that runs here.
     $env:ACESTEP_LM_BACKEND = "pt"
-    $env:ACESTEP_LM_MODEL_PATH = "acestep-5Hz-lm-0.6B"
+    # ACE-Step caps this VRAM tier at the 0.6B LM itself, so use the largest
+    # one present that it will actually accept.
+    $lm = @("acestep-5Hz-lm-0.6B", "acestep-5Hz-lm-1.7B") |
+          Where-Object { Test-Path (Join-Path $ckpt $_) } | Select-Object -First 1
+    if ($lm) { $env:ACESTEP_LM_MODEL_PATH = $lm }
 
     $exe = Join-Path $c.acestep_dir ".venv\Scripts\acestep-api.exe"
     if (-not (Test-Path $exe)) { throw "acestep-api not found -- rerun install-local.ps1" }

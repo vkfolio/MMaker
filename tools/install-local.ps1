@@ -5,13 +5,19 @@
 # and every edit is a push-pull-restart round trip. Local mode is slower per
 # render and immediate for everything else.
 #
-# What this installs is deliberately the *small* tier -- acestep-v15-turbo
-# (0.6B) plus the 0.6B LM -- because that is what fits an 8 GB laptop GPU
-# comfortably. The XL checkpoints are 20 GB each and want far more VRAM; those
-# stay a cloud-mode thing, and the app says so rather than offering a quality
-# tier this machine cannot render.
+# -Tier small (default) installs acestep-v15-turbo plus the 0.6B LM: about
+# 8 GB, and the configuration an 8 GB laptop GPU runs comfortably and quickly.
+#
+# -Tier all adds the XL checkpoints, ~40 GB more, so local mode has the same
+# quality tiers as a pod. That is not free and not fast: XL weights are 9 GB in
+# bf16, so on a card smaller than that ACE-Step streams the DiT from system RAM
+# with INT8 quantisation. It works -- its own tier table turns both on below
+# 20 GB -- but every render pays PCIe transfer on top of 4B of compute. Whether
+# that is worth it is a measurement, so the option is here rather than a
+# decision made on your behalf.
 #
 #   pwsh -ExecutionPolicy Bypass -File tools\install-local.ps1
+#   ... -Tier all                     # add the XL checkpoints (~40 GB more)
 #   ... -Root D:\musicmaker\local     # where it goes (default)
 #   ... -SkipModels                   # code and venv only
 #
@@ -21,6 +27,8 @@
 [CmdletBinding()]
 param(
     [string] $Root = "D:\musicmaker\local",
+    [ValidateSet("small", "all")]
+    [string] $Tier = "small",
     [switch] $SkipModels
 )
 
@@ -75,8 +83,9 @@ if ($vram -eq 0) {
 }
 
 $free = [math]::Round((Get-PSDrive -Name $Root.Substring(0,1)).Free / 1GB)
-Note "$free GB free on $($Root.Substring(0,1)):  (about 12 GB is needed)"
-if ($free -lt 14) { Write-Host "`nNot enough disk space." -ForegroundColor Red; exit 1 }
+$needed = if ($Tier -eq "all") { 54 } else { 14 }
+Note "$free GB free on $($Root.Substring(0,1)):  (about $needed GB is needed for -Tier $Tier)"
+if ($free -lt $needed) { Write-Host "`nNot enough disk space." -ForegroundColor Red; exit 1 }
 
 New-Item -ItemType Directory -Force -Path $Root | Out-Null
 $acestep = Join-Path $Root "ACE-Step-1.5"
@@ -173,7 +182,41 @@ else:
     Set-Content -Path $tmp -Value $script -Encoding utf8
     & $py $tmp $ckpt
     if ($LASTEXITCODE -ne 0) { throw "model download failed" }
-    Good "models in place"
+    Good "small tier in place"
+
+    if ($Tier -eq "all") {
+        Note "fetching the XL checkpoints (~40 GB) -- these give local mode the"
+        Note "same tiers as a pod, at the cost of CPU offload on every render"
+        $xl = @'
+import os, sys, pathlib
+try:
+    import hf_transfer                      # noqa: F401
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+except ImportError:
+    os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+from huggingface_hub import snapshot_download
+
+dest = pathlib.Path(sys.argv[1])
+for repo in ("acestep-v15-xl-turbo", "acestep-v15-xl-base"):
+    out = dest / repo
+    if out.exists() and any(out.glob("*.safetensors")):
+        print(f"  {repo}: already present")
+        continue
+    # The .py and .pt files matter: ACE-Step loads the checkpoint through its
+    # own modeling_*.py, and silence_latent.pt is needed at inference. A
+    # safetensors-only filter fetches 20 GB that will not load.
+    p = snapshot_download(repo_id=f"ACE-Step/{repo}", local_dir=str(out),
+                          allow_patterns=["*.safetensors", "*.json", "*.py", "*.pt",
+                                          "*.txt", "*.model", "*.yaml"])
+    size = sum(f.stat().st_size for f in pathlib.Path(p).rglob("*") if f.is_file())
+    print(f"  {repo}: {size/1e9:.2f} GB")
+'@
+        $tmp2 = Join-Path $env:TEMP "mm_fetch_xl.py"
+        Set-Content -Path $tmp2 -Value $xl -Encoding utf8
+        & $py $tmp2 $ckpt
+        if ($LASTEXITCODE -ne 0) { throw "XL download failed" }
+        Good "XL checkpoints in place"
+    }
 }
 
 # ---------------------------------------------------------------------------

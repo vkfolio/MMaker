@@ -1623,9 +1623,9 @@ vik::AnyElement Studio::settings_modal(vik::Context<Studio>& cx) {
             // so a mode is which URL -- not a second implementation, and not a
             // reason to retype the pod address every time you switch back.
             .child(vik::div().flex_row().gap_2()
-                .child(mode_chip("Local", "this laptop, turbo tier", !cloud,
+                .child(mode_chip("Local", "this laptop", !cloud,
                                  mx::Mode::Local))
-                .child(mode_chip("Cloud", "RunPod, all tiers", cloud,
+                .child(mode_chip("Cloud", "a RunPod pod", cloud,
                                  mx::Mode::Cloud)))
 
             .child(vik::text(pod_url.empty() ? "no address set" : pod_url)
