@@ -51,6 +51,13 @@ public:
     /// transient the meter existed to show.
     float take_peak() { return peak_.exchange(0.0f, std::memory_order_acq_rel); }
 
+    /// The loudest sample of the whole take, never cleared.
+    ///
+    /// A take that came back at denormal level is a muted or blocked input,
+    /// not a quiet performance, and saying so beats handing back a clip that
+    /// looks like a recording and plays as nothing.
+    float session_peak() const { return loudest_.load(std::memory_order_relaxed); }
+
 private:
     void drain_loop();
 
@@ -61,6 +68,7 @@ private:
     std::atomic<int64_t>  written_{0};
     std::atomic<uint64_t> overruns_{0};
     std::atomic<float>    peak_{0.0f};
+    std::atomic<float>    loudest_{0.0f};
 
     ma_encoder*  encoder_ = nullptr;
     std::thread  writer_;

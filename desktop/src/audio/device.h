@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "mixer.h"
 #include "recorder.h"
@@ -34,11 +35,19 @@ public:
     /// drifting one lands progressively further from the beat -- audible over
     /// a minute and impossible to fix afterwards.
     bool start(Mixer& mixer, uint32_t preferred_rate = 48000,
-               Recorder* recorder = nullptr);
+               Recorder* recorder = nullptr, int capture_index = -1);
+
+    /// Names of the capture devices, in the order `start` indexes them.
+    ///
+    /// A DAW that cannot choose its input is not usable on a laptop, where the
+    /// default is routinely an array microphone the OS has muted and the one
+    /// you want is third in the list.
+    static std::vector<std::string> capture_devices();
 
     /// Whether the device opened with an input side.
     bool capturing() const { return capture_channels_ > 0; }
     uint32_t capture_channels() const { return capture_channels_; }
+    const std::string& capture_name() const { return capture_name_; }
     void stop();
 
     bool        running() const { return running_; }
@@ -57,6 +66,7 @@ private:
     uint32_t    channels_ = 2;
     uint32_t    latency_frames_ = 0;
     uint32_t    capture_channels_ = 0;
+    std::string capture_name_;
     std::string backend_;
     std::string error_;
 };

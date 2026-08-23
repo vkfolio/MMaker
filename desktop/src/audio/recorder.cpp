@@ -45,6 +45,7 @@ bool Recorder::start(const std::filesystem::path& path, uint32_t rate,
     written_.store(0, std::memory_order_relaxed);
     overruns_.store(0, std::memory_order_relaxed);
     peak_.store(0.0f, std::memory_order_relaxed);
+    loudest_.store(0.0f, std::memory_order_relaxed);
 
     recording_.store(true, std::memory_order_release);
     writer_ = std::thread([this] { drain_loop(); });
@@ -109,6 +110,12 @@ void Recorder::push(const float* input, int64_t frames, uint32_t channels) {
     // Accumulate rather than store: at 375 blocks a second against a 60 Hz
     // reader, a plain store loses five of every six blocks -- exactly the
     // transients a peak meter exists to catch.
+    float loud = loudest_.load(std::memory_order_relaxed);
+    while (peak > loud &&
+           !loudest_.compare_exchange_weak(loud, peak, std::memory_order_acq_rel,
+                                           std::memory_order_relaxed)) {
+    }
+
     float seen = peak_.load(std::memory_order_relaxed);
     while (peak > seen &&
            !peak_.compare_exchange_weak(seen, peak, std::memory_order_acq_rel,

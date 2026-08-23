@@ -34,6 +34,10 @@ struct Settings {
     /// existing Claude Code login on this machine when there is one, which is
     /// why this is not a precondition for the feature.
     std::string ai_key;
+    /// Which capture device to record from, by index. -1 is the system
+    /// default, which on a laptop is routinely an array microphone the OS has
+    /// muted -- so this being settable is what makes recording usable at all.
+    int         input_device = -1;
     bool        auto_connect = false;
     std::string last_document;      // reopened on launch when present
 

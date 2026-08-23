@@ -29,7 +29,22 @@ void on_data(ma_device* device, void* out, const void* in, ma_uint32 frames) {
 
 Device::~Device() { stop(); }
 
-bool Device::start(Mixer& mixer, uint32_t preferred_rate, Recorder* recorder) {
+std::vector<std::string> Device::capture_devices() {
+    std::vector<std::string> out;
+    ma_context ctx;
+    if (ma_context_init(nullptr, 0, nullptr, &ctx) != MA_SUCCESS) return out;
+    ma_device_info* playback = nullptr;
+    ma_device_info* capture = nullptr;
+    ma_uint32 pn = 0, cn = 0;
+    if (ma_context_get_devices(&ctx, &playback, &pn, &capture, &cn) == MA_SUCCESS)
+        for (ma_uint32 i = 0; i < cn; ++i)
+            out.emplace_back(capture[i].name);
+    ma_context_uninit(&ctx);
+    return out;
+}
+
+bool Device::start(Mixer& mixer, uint32_t preferred_rate, Recorder* recorder,
+                   int capture_index) {
     stop();
 
     const bool want_capture = recorder != nullptr;
@@ -37,7 +52,23 @@ bool Device::start(Mixer& mixer, uint32_t preferred_rate, Recorder* recorder) {
         want_capture ? ma_device_type_duplex : ma_device_type_playback);
     cfg.playback.format   = ma_format_f32;
     cfg.playback.channels = channels_;
+    // Held for as long as the config points into it.
+    ma_context ctx;
+    bool have_ctx = false;
+    ma_device_info* dev_capture = nullptr;
+    ma_uint32 capture_count = 0;
+    if (want_capture && capture_index >= 0 &&
+        ma_context_init(nullptr, 0, nullptr, &ctx) == MA_SUCCESS) {
+        have_ctx = true;
+        ma_device_info* playback = nullptr;
+        ma_uint32 pn = 0;
+        ma_context_get_devices(&ctx, &playback, &pn, &dev_capture, &capture_count);
+    }
+
     if (want_capture) {
+        if (dev_capture && capture_index >= 0 &&
+            capture_index < static_cast<int>(capture_count))
+            cfg.capture.pDeviceID = &dev_capture[capture_index].id;
         cfg.capture.format = ma_format_f32;
         // 0 means "whatever the device has". Asking for two on a mono
         // interface is how an input device fails to open at all.
@@ -61,6 +92,7 @@ bool Device::start(Mixer& mixer, uint32_t preferred_rate, Recorder* recorder) {
             delete sides_;
             sides_ = nullptr;
             capture_channels_ = 0;
+            if (have_ctx) ma_context_uninit(&ctx);
             const bool ok = start(mixer, preferred_rate, nullptr);
             if (ok) error_ = "no input device -- recording is unavailable";
             return ok;
@@ -73,7 +105,9 @@ bool Device::start(Mixer& mixer, uint32_t preferred_rate, Recorder* recorder) {
         return false;
     }
     capture_channels_ = want_capture ? device_->capture.channels : 0;
+    capture_name_ = want_capture ? device_->capture.name : std::string{};
     sides_->capture_channels = capture_channels_;
+    if (have_ctx) ma_context_uninit(&ctx);
 
     // What the device actually gave us, which need not be what was asked for.
     rate_     = device_->sampleRate;
@@ -117,6 +151,7 @@ void Device::stop() {
     sides_ = nullptr;
     running_ = false;
     capture_channels_ = 0;
+    capture_name_.clear();
     mixer_ = nullptr;
 }
 

@@ -30,6 +30,8 @@
 #include <vector>
 
 #include "audio/device.h"
+#include "miniaudio.h"
+
 #include "audio/midi_in.h"
 #include "audio/recorder.h"
 #include "audio/mixer.h"
@@ -1205,6 +1207,19 @@ struct Studio {
             return;
         }
 
+        // Denormal-level output is a muted or blocked input, not a quiet
+        // performance. Saying so beats handing back a clip that looks like a
+        // recording and plays as nothing -- which is exactly how this was found.
+        const float loudest = g_recorder.session_peak();
+        record_error.clear();
+        if (loudest < 1e-5f)
+            record_error = std::format(
+                "the take is silent from \"{}\" -- Windows may be blocking "
+                "microphone access, or the device is muted. Pick another input "
+                "in Settings.",
+                g_device.capture_name().empty() ? std::string("the default input")
+                                                : g_device.capture_name());
+
         // The take is on disk either way; placing it is a document edit and
         // therefore undoable.
         push_undo("record");
@@ -1212,10 +1227,13 @@ struct Studio {
         pending_import[src.id] = Placement{record_track, record_from};
         spawn_decode(src.id, path, app);
 
-        doc_status = dropped
-            ? std::format("take recorded, but {} block(s) were dropped", dropped)
-            : std::format("take recorded ({:.1f}s)",
-                          static_cast<double>(frames) / session.rate);
+        doc_status = !record_error.empty()
+            ? record_error
+            : dropped
+                ? std::format("take recorded, but {} block(s) were dropped", dropped)
+                : std::format("take recorded ({:.1f}s, peak {:.1f} dBFS)",
+                              static_cast<double>(frames) / session.rate,
+                              20.0 * std::log10(std::max(loudest, 1e-9f)));
         after_edit(doc_status);
     }
 
@@ -2494,6 +2512,7 @@ struct Studio {
     vik::AnyElement new_clip_menu(vik::Context<Studio>& cx);
     vik::AnyElement home_screen(vik::Context<Studio>& cx);
     vik::AnyElement inspire_modal(vik::Context<Studio>& cx);
+    vik::AnyElement input_picker(vik::Context<Studio>& cx);
     vik::AnyElement quality_chip(vik::Context<Studio>& cx, const char* tier,
                                  bool on);
 };
@@ -2668,6 +2687,16 @@ vik::AnyElement Studio::settings_modal(vik::Context<Studio>& cx) {
                        .text_xs().text_color(vik::rgb(0x6c7383)))
             .child(vik::text(net_status).text_xs()
                        .text_color(vik::rgb(net_error ? 0xe05c72 : 0x8d94a3)))
+
+            // --- input -------------------------------------------------
+            // Which device a take is recorded from. The default is whatever
+            // Windows nominates, which on a laptop is routinely an array
+            // microphone the OS has muted -- the reason the first take here
+            // came back silent.
+            .child(vik::div().h_px(1.0f).my(2.0f).bg(vik::rgb(0x2c313d)))
+            .child(vik::text("Recording input").text_xs()
+                       .text_color(vik::rgb(0x8d94a3)))
+            .child(input_picker(cx))
 
             .child(vik::div().flex_row().items_center().gap_2()
                 .child(icon_button("s-conn", "plugs-connected", false,
@@ -3103,6 +3132,81 @@ vik::AnyElement Studio::pianoroll_panel(vik::Context<Studio>& cx) {
 ///
 /// The proposal is shown, never applied silently. Generating from words the
 /// user has not read is how you get a song nobody asked for.
+
+/// The list of capture devices, with the live one marked.
+///
+/// Enumerated on every open rather than cached: devices appear and disappear
+/// with USB interfaces, and a list that was right when the app started is the
+/// kind of thing that sends someone hunting for a bug in the recorder.
+///
+/// Changing it takes effect on the next launch. Reopening the audio device
+/// while the mixer is publishing into it is a real piece of work -- the
+/// callback would have to be stopped, the graph retired and the rate possibly
+/// changed underneath every decoded buffer -- and doing it badly is worse than
+/// asking for a restart.
+vik::AnyElement Studio::input_picker(vik::Context<Studio>& cx) {
+    const auto devices = mx::Device::capture_devices();
+
+    auto column = vik::div().flex_col().gap_1();
+    if (devices.empty())
+        return std::move(column)
+            .child(vik::text("No capture device. Windows has none enabled, or it "
+                             "is denying microphone access.")
+                       .text_xs().text_color(vik::rgb(0xe05c72)))
+            .into_any();
+
+    auto row = [&cx](const std::string& id, const std::string& label, bool on,
+                     bool live, int index) {
+        return vik::div().id(id).flex_row().items_center().gap_2()
+            .px_3().py_1().rounded_md().cursor_pointer()
+            .bg(vik::rgb(on ? 0x3a4a68 : 0x2c313d))
+            .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x3a4150)); })
+            .on_click(cx.listener([index](Studio& s, const vik::ClickEvent&,
+                                          vik::Window&, vik::Context<Studio>& c) {
+                s.settings.input_device = index;
+                s.settings.save();
+                s.doc_status = "input set -- restart to record from it";
+                c.notify();
+            }))
+            .child(vik::ui::phosphor(on ? "check-circle" : "circle",
+                                     vik::ui::PhWeight::Regular)
+                       .size(13.0f).color(vik::rgb(on ? 0x9b93ff : 0x6c7383)))
+            .child(vik::text(label)
+                       .text_xs()
+                       .text_color(vik::rgb(on ? 0xffffff : 0xc9cedb)))
+            .child(vik::div().flex_1())
+            .child(vik::text(live ? "in use" : "")
+                       .text_xs().text_color(vik::rgb(0x56c08a)));
+    };
+
+    column = std::move(column).child(
+        row("in-default", "System default", settings.input_device < 0,
+            settings.input_device < 0 && g_device.capturing(), -1));
+
+    for (size_t i = 0; i < devices.size(); ++i) {
+        const bool chosen = settings.input_device == static_cast<int>(i);
+        column = std::move(column).child(
+            row(std::format("in-{}", i), devices[i], chosen,
+                g_device.capturing() && g_device.capture_name() == devices[i],
+                static_cast<int>(i)));
+    }
+
+    // What is actually open right now, which is the only thing that explains a
+    // silent take.
+    column = std::move(column).child(
+        vik::text(g_device.capturing()
+                      ? "recording from: " + g_device.capture_name()
+                      : std::string("no input open -- recording is unavailable"))
+            .text_xs()
+            .text_color(vik::rgb(g_device.capturing() ? 0x6c7383 : 0xe05c72)));
+
+    if (!record_error.empty())
+        column = std::move(column).child(
+            vik::text(record_error).text_xs().text_color(vik::rgb(0xd9903c)));
+
+    return std::move(column).into_any();
+}
+
 vik::AnyElement Studio::inspire_modal(vik::Context<Studio>& cx) {
     if (!inspire_inputs_ready) {
         idea_input = vik::ui::text_input_state(cx.app());
@@ -4805,6 +4909,123 @@ int bounce_offline(const fs::path& folder, const fs::path& out) {
 /// The point is to make the whole network path checkable from a terminal before
 /// any UI depends on it: TLS backend, auth, project listing, and a real audio
 /// download with its throughput.
+/// Diagnose the input path without the app around it.
+///
+/// Lists every capture device, then opens the default one on its own -- not
+/// duplex -- and reports the peak it sees each second. A blank take has three
+/// plausible causes that look identical from the outside: Windows refusing the
+/// app microphone access, the default device being something that never
+/// carries signal, and the duplex device opening an input side that is never
+/// filled. This separates them.
+int mic_check(double seconds, int device_index = -1) {
+    ma_context context;
+    if (ma_context_init(nullptr, 0, nullptr, &context) != MA_SUCCESS) {
+        std::printf("cannot initialise an audio context\n");
+        return 1;
+    }
+
+    ma_device_info* playback = nullptr;
+    ma_device_info* capture = nullptr;
+    ma_uint32 playback_count = 0, capture_count = 0;
+    if (ma_context_get_devices(&context, &playback, &playback_count, &capture,
+                               &capture_count) != MA_SUCCESS) {
+        std::printf("cannot enumerate devices\n");
+        ma_context_uninit(&context);
+        return 1;
+    }
+
+    std::printf("capture devices : %u\n", capture_count);
+    for (ma_uint32 i = 0; i < capture_count; ++i)
+        std::printf("  [%u]%s %s\n", i, capture[i].isDefault ? " *" : "  ",
+                    capture[i].name);
+    if (capture_count == 0) {
+        std::printf("\nNo capture device at all. Windows has none enabled, or the\n"
+                    "app is being denied access (Settings > Privacy > Microphone).\n");
+        ma_context_uninit(&context);
+        return 1;
+    }
+
+    struct Probe {
+        std::atomic<float>   peak{0.0f};
+        std::atomic<int64_t> frames{0};
+        std::atomic<int64_t> nonzero{0};
+    } probe;
+
+    ma_device_config cfg = ma_device_config_init(ma_device_type_capture);
+    if (device_index >= 0 && device_index < static_cast<int>(capture_count))
+        cfg.capture.pDeviceID = &capture[device_index].id;
+    cfg.capture.format   = ma_format_f32;
+    cfg.capture.channels = 0;            // whatever the device has
+    cfg.sampleRate       = 48000;
+    cfg.pUserData        = &probe;
+    cfg.dataCallback = [](ma_device* d, void*, const void* in, ma_uint32 frames) {
+        auto* p = static_cast<Probe*>(d->pUserData);
+        const auto* f = static_cast<const float*>(in);
+        if (!p || !f) return;
+        const ma_uint32 ch = d->capture.channels;
+        float peak = 0.0f;
+        int64_t nonzero = 0;
+        for (ma_uint32 i = 0; i < frames * ch; ++i) {
+            peak = std::max(peak, std::fabs(f[i]));
+            if (f[i] != 0.0f) ++nonzero;
+        }
+        float seen = p->peak.load();
+        while (peak > seen && !p->peak.compare_exchange_weak(seen, peak)) {}
+        p->frames.fetch_add(frames);
+        p->nonzero.fetch_add(nonzero);
+    };
+
+    ma_device device;
+    if (ma_device_init(&context, &cfg, &device) != MA_SUCCESS) {
+        std::printf("\nThe default capture device would not open.\n");
+        ma_context_uninit(&context);
+        return 1;
+    }
+    std::printf("\nopened          : %s  (%u ch @ %u Hz)\n", device.capture.name,
+                device.capture.channels, device.sampleRate);
+    if (ma_device_start(&device) != MA_SUCCESS) {
+        std::printf("the device would not start\n");
+        ma_device_uninit(&device);
+        ma_context_uninit(&context);
+        return 1;
+    }
+
+    std::printf("\nlistening for %.0fs -- make some noise\n\n", seconds);
+    for (int i = 0; i < static_cast<int>(seconds); ++i) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        const float peak = probe.peak.exchange(0.0f);
+        const double db = peak > 0.0f ? 20.0 * std::log10(peak) : -999.0;
+        std::printf("  t+%2ds  peak %.5f (%.1f dBFS)  frames %lld  nonzero %lld\n",
+                    i + 1, peak, db,
+                    static_cast<long long>(probe.frames.load()),
+                    static_cast<long long>(probe.nonzero.load()));
+        std::fflush(stdout);
+    }
+
+    const int64_t frames = probe.frames.load();
+    const int64_t nonzero = probe.nonzero.load();
+    ma_device_uninit(&device);
+    ma_context_uninit(&context);
+
+    std::printf("\n");
+    if (frames == 0) {
+        std::printf("VERDICT: the callback never ran. The device opened but delivered\n"
+                    "nothing -- usually a driver or exclusive-mode problem.\n");
+        return 1;
+    }
+    if (nonzero == 0) {
+        std::printf("VERDICT: %lld frames arrived and every sample was exactly zero.\n"
+                    "That is Windows muting the stream rather than a quiet room --\n"
+                    "check Settings > Privacy > Microphone, and that the device is\n"
+                    "not muted in Sound settings.\n",
+                    static_cast<long long>(frames));
+        return 1;
+    }
+    std::printf("VERDICT: input is live -- %lld frames, %lld non-zero samples.\n",
+                static_cast<long long>(frames), static_cast<long long>(nonzero));
+    return 0;
+}
+
 int connect_probe(const std::string& url, const std::string& token,
                   const std::string& project_id) {
     mx::net::ApiClient api;
@@ -5013,7 +5234,14 @@ int main(int argc, char** argv) {
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--record" && i + 1 < argc) record_secs = std::stod(argv[++i]);
+        if (arg == "--miccheck") {
+            const double secs = (i + 1 < argc && argv[i+1][0] != '-')
+                                    ? std::stod(argv[++i]) : 5.0;
+            const int dev = (i + 1 < argc && argv[i+1][0] != '-')
+                                ? std::stoi(argv[++i]) : -1;
+            return mic_check(secs, dev);
+        }
+        else if (arg == "--record" && i + 1 < argc) record_secs = std::stod(argv[++i]);
         else if (arg == "--selftest") selftest = true;
         else if (arg == "--render" && i + 1 < argc) render_to = argv[++i];
         else if (arg == "--bounce" && i + 1 < argc) bounce_to = argv[++i];
@@ -5048,7 +5276,8 @@ int main(int argc, char** argv) {
     // Duplex from the start. Opening the input only when recording begins
     // would mean the first take waits on a device that takes a moment to
     // start, and the input meter could never show anything beforehand.
-    if (!g_device.start(g_mixer, 48000, &g_recorder))
+    if (!g_device.start(g_mixer, 48000, &g_recorder,
+                        mx::Settings::load().input_device))
         std::printf("audio: %s\n", g_device.error().c_str());
 
     vik::App::run([&](vik::App& app) {
