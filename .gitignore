@@ -13,3 +13,4 @@ server/out/
 # Local engine install: a cloned ACE-Step checkout plus ~10 GB of checkpoints
 # and rendered projects. Machine-specific, and far too large for a repo.
 local/
+desktop/ai/sidecar/node_modules/

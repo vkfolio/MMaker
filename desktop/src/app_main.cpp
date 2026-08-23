@@ -68,9 +68,21 @@ std::string trimmed(const std::string& text) {
 
 /// Trimmed, and without the trailing slash that would double up in every
 /// path we build by concatenation.
+/// Whether a field holds nothing but whitespace -- an empty lyrics box means
+/// instrumental, and a box holding a stray space should mean the same.
+bool mx_trimmed_empty(const std::string& text) { return trimmed(text).empty(); }
+
 std::string clean_url(const std::string& text) {
     std::string url = trimmed(text);
     while (!url.empty() && url.back() == '/') url.pop_back();
+    // A pasted host with no scheme is the commonest way to get this wrong, and
+    // it fails as a redirect or a 404 rather than as "you missed the https".
+    // Loopback is the one case where http is meant.
+    if (!url.empty() && url.find("://") == std::string::npos) {
+        const bool loopback = url.rfind("127.0.0.1", 0) == 0 ||
+                              url.rfind("localhost", 0) == 0;
+        url = (loopback ? "http://" : "https://") + url;
+    }
     return url;
 }
 
@@ -509,6 +521,12 @@ struct Studio {
     vik::Handle<vik::ui::TextInputState> url_input;
     vik::Handle<vik::ui::TextInputState> token_input;
     bool inputs_ready = false;
+    /// The Generate panel's own fields. The style chips were shortcuts that
+    /// became the only way in: there was no way to describe anything the four
+    /// presets did not already say.
+    vik::Handle<vik::ui::TextInputState> prompt_input;
+    vik::Handle<vik::ui::TextInputState> lyrics_input;
+    bool gen_inputs_ready = false;
 
     /// What the pod is doing for us right now.
     ///
@@ -2027,6 +2045,14 @@ vik::AnyElement Studio::settings_modal(vik::Context<Studio>& cx) {
                                c.notify();
                            })))
 
+            // What the client will actually call, after trimming and adding a
+            // scheme. The field shows what was typed; this shows what it
+            // became, which is the difference that makes a wrong address
+            // obvious instead of mysterious.
+            .child(vik::text(pod_url.empty()
+                                 ? std::string("no address set")
+                                 : "connects to  " + pod_url + "/health")
+                       .text_xs().text_color(vik::rgb(0x6c7383)))
             .child(vik::text(net_status).text_xs()
                        .text_color(vik::rgb(net_error ? 0xe05c72 : 0x8d94a3)))
 
@@ -2871,6 +2897,21 @@ vik::AnyElement Studio::quality_chip(vik::Context<Studio>& cx, const char* tier,
 }
 
 vik::AnyElement Studio::generate_modal(vik::Context<Studio>& cx) {
+    // Created on first open: text_input_state needs an App, which Studio has
+    // no access to when it is constructed.
+    if (!gen_inputs_ready) {
+        prompt_input = vik::ui::text_input_state(cx.app());
+        lyrics_input = vik::ui::text_input_state(cx.app());
+        const std::string seed_prompt = gen_prompt;
+        cx.app().update_entity(prompt_input,
+            [&seed_prompt](vik::ui::TextInputState& t,
+                           vik::Context<vik::ui::TextInputState>&) {
+                t.content = seed_prompt;
+                t.move_end(false);
+            });
+        gen_inputs_ready = true;
+    }
+
     auto icon_button = [&cx](const char* id, const char* icon, bool active, auto fn) {
         return vik::div().id(id).px_3().py_2().rounded_md()
             .flex_row().items_center().justify_center()
@@ -2953,8 +2994,30 @@ vik::AnyElement Studio::generate_modal(vik::Context<Studio>& cx) {
                             s.gen_prompt = "children's lullaby, music box, celesta, gentle";
                             c.notify();
                         })))
-                .child(vik::text(gen_prompt.empty() ? "(pick a style)" : gen_prompt)
-                           .text_color(vik::rgb(0xc9cedb)))
+                // A real field. The chips above fill it in; they are a
+                // starting point rather than the whole vocabulary, which is
+                // what they had become.
+                .child(vik::ui::text_input("g-prompt", prompt_input)
+                           .placeholder("describe it -- genre, instruments, mood, tempo")
+                           .w_full()
+                           .on_change(cx.listener(
+                               [](Studio& s, const std::string& value, vik::Window&,
+                                  vik::Context<Studio>& c) {
+                                   s.gen_prompt = value;
+                                   c.notify();
+                               })))
+                .child(vik::text("Lyrics -- leave empty for an instrumental")
+                           .text_xs().text_color(vik::rgb(0x8d94a3)))
+                .child(vik::ui::text_input("g-lyrics", lyrics_input)
+                           .placeholder("[verse] ...")
+                           .w_full()
+                           .on_change(cx.listener(
+                               [](Studio& s, const std::string& value, vik::Window&,
+                                  vik::Context<Studio>& c) {
+                                   s.gen_lyrics = value;
+                                   s.gen_instrumental = mx_trimmed_empty(value);
+                                   c.notify();
+                               })))
                 // A tier the engine cannot honour is shown greyed with what it
                 // would really render, rather than offered and quietly
                 // substituted. On a laptop only the small tier is installed;
