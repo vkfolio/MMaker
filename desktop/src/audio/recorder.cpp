@@ -73,6 +73,21 @@ void Recorder::stop() {
 
 void Recorder::push(const float* input, int64_t frames, uint32_t channels) {
     if (!input || frames <= 0) return;
+
+    // The meter runs whether or not a take is being written. Testing an input
+    // by recording something and listening back is the loop this exists to
+    // break: you should be able to see the level before committing.
+    {
+        float peak = 0.0f;
+        for (int64_t i = 0; i < frames * static_cast<int64_t>(channels); ++i)
+            peak = std::max(peak, std::fabs(input[i]));
+        float seen = peak_.load(std::memory_order_relaxed);
+        while (peak > seen &&
+               !peak_.compare_exchange_weak(seen, peak, std::memory_order_acq_rel,
+                                            std::memory_order_relaxed)) {
+        }
+    }
+
     if (!recording_.load(std::memory_order_acquire)) return;
 
     const uint32_t ch = channels_;
@@ -116,11 +131,6 @@ void Recorder::push(const float* input, int64_t frames, uint32_t channels) {
                                            std::memory_order_relaxed)) {
     }
 
-    float seen = peak_.load(std::memory_order_relaxed);
-    while (peak > seen &&
-           !peak_.compare_exchange_weak(seen, peak, std::memory_order_acq_rel,
-                                        std::memory_order_relaxed)) {
-    }
 }
 
 void Recorder::drain_loop() {

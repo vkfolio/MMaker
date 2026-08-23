@@ -1156,9 +1156,68 @@ struct Studio {
 
     bool can_record() const { return g_device.capturing(); }
 
+    /// Reopen the audio device on a different input.
+    ///
+    /// Done live rather than at next launch so an input can be tried and heard
+    /// on the meter immediately -- picking a device blind and relaunching to
+    /// find out is the loop this whole panel exists to break. The transport is
+    /// stopped first: prepare() resets the mixer's rate and per-clip state, and
+    /// doing that under a running callback is how a device change turns into a
+    /// click or a crash.
+    void use_input(int index) {
+        const bool was_playing = g_mixer.transport.playing.load();
+        if (was_playing) g_mixer.transport.playing.store(false);
+        if (recording) stop_record_quiet();
+
+        settings.input_device = index;
+        settings.save();
+
+        g_device.stop();
+        if (!g_device.start(g_mixer, session.rate ? session.rate : 48000,
+                            &g_recorder, index)) {
+            record_error = g_device.error().empty() ? "that input would not open"
+                                                    : g_device.error();
+            // Fall back to the default rather than leaving the app deaf.
+            g_device.start(g_mixer, 48000, &g_recorder, -1);
+        } else {
+            record_error.clear();
+        }
+        if (g_device.running()) session.rate = g_device.rate();
+        publish();
+        input_level = 0.0f;
+    }
+
+    /// Stop a take without placing it -- used when the device is being pulled
+    /// out from under it.
+    void stop_record_quiet() {
+        recording = false;
+        g_recorder.stop();
+    }
+
+    /// Smoothed input level, updated on the UI tick.
+    ///
+    /// Peak alone flickers too fast to read; this falls at a fixed rate so a
+    /// transient is visible for long enough to see, which is the whole job of
+    /// a meter.
+    float input_level = 0.0f;
+
+    void pump_meter() {
+        const float peak = g_recorder.take_peak();
+        input_level = peak > input_level ? peak : input_level * 0.85f;
+        if (input_level < 1e-6f) input_level = 0.0f;
+    }
+
+    bool show_record = false;
+
+    /// The record button opens the panel; it does not start a take.
+    ///
+    /// Choosing an input, seeing it move, and only then committing is the
+    /// difference between a take and a blank file discovered later. Once
+    /// rolling, the same button stops -- a modal in the way of stopping would
+    /// be worse than useless.
     void toggle_record(vik::App& app) {
         if (recording) { stop_record(app); return; }
-        start_record(app);
+        show_record = true;
     }
 
     void start_record(vik::App& app) {
@@ -2498,13 +2557,14 @@ struct Studio {
             job_note = " [" + jobs.front().kind + " " + std::to_string(secs) + "s]";
         }
         std::printf(
-            "STUDIO device=%s rate=%u latency_ms=%.1f in=%uch%s | sources=%d pending=%d "
+            "STUDIO device=%s rate=%u latency_ms=%.1f in=%uch%s lvl=%.0fdB | sources=%d pending=%d "
             "decode_ms=%.0f | tracks=%zu clips=%zu | playhead=%.2fs xruns=%u "
             "| theme=%d keys=%d net=%s stems=%d/%d cached=%d jobs=%zu%s | paint_ms=%.2f (build %.2f skia %.2f) worst=%.2f frames=%d columns=%lld\n",
             g_device.running() ? g_device.backend().c_str() : "NONE",
             g_device.rate(), 1000.0 * g_device.latency_frames() /
                 std::max(1u, g_device.rate()),
             g_device.capture_channels(), recording ? " REC" : "",
+            input_level > 0.0f ? 20.0 * std::log10(input_level) : -120.0,
             loaded_sources, g_pending.load(), last_decode_ms,
             session.tracks.size(), session.clips.size(),
             static_cast<double>(playhead()) / std::max(1u, session.rate),
@@ -2535,6 +2595,7 @@ struct Studio {
     vik::AnyElement home_screen(vik::Context<Studio>& cx);
     vik::AnyElement inspire_modal(vik::Context<Studio>& cx);
     vik::AnyElement input_picker(vik::Context<Studio>& cx);
+    vik::AnyElement record_modal(vik::Context<Studio>& cx);
     vik::AnyElement quality_chip(vik::Context<Studio>& cx, const char* tier,
                                  bool on);
 };
@@ -3235,6 +3296,149 @@ vik::AnyElement Studio::input_picker(vik::Context<Studio>& cx) {
     return std::move(column).into_any();
 }
 
+
+/// Choose an input, watch it move, then record.
+///
+/// The panel exists because a microphone that is present, active and muted
+/// looks exactly like a quiet room from inside the audio callback -- it
+/// delivers full-rate frames of digital silence. The only way to know before
+/// committing a performance is to see the level move, so that is what this
+/// puts in front of the button.
+vik::AnyElement Studio::record_modal(vik::Context<Studio>& cx) {
+    const auto devices = mx::Device::capture_devices();
+    const bool muted = mx::Device::input_muted();
+    const bool live = g_device.capturing();
+
+    // -60 dBFS to 0, which is the range a voice actually occupies. Linear
+    // amplitude would leave everything below a shout invisible.
+    const float db = input_level > 0.0f ? 20.0f * std::log10(input_level) : -120.0f;
+    const float fill = std::clamp((db + 60.0f) / 60.0f, 0.0f, 1.0f);
+    const bool hearing = db > -50.0f;
+
+    auto meter =
+        vik::div().flex_col().gap_1()
+            .child(vik::div().h_px(14.0f).w_full().rounded_sm()
+                .bg(vik::rgb(0x15181f))
+                .child(vik::div().h_full()
+                           .w(vik::Length::percent(fill * 100.0f))
+                           .rounded_sm()
+                           .bg(vik::rgb(db > -3.0f ? 0xe05c72
+                                                   : (hearing ? 0x56c08a : 0x3a4150)))))
+            .child(vik::text(
+                       !live ? std::string("no input open")
+                             : hearing
+                                   ? std::format("hearing you -- {:.0f} dBFS", db)
+                                   : std::string("silent -- say something"))
+                       .text_xs()
+                       .text_color(vik::rgb(!live ? 0xe05c72
+                                                  : (hearing ? 0x56c08a : 0x8d94a3))));
+
+    auto body = vik::div().flex_col().gap_3().p_4().w_px(460.0f)
+        .occlude()
+        .on_mouse_down(vik::MouseButton::Left,
+            [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
+                w.stop_propagation();
+            })
+        .rounded_lg().bg(vik::rgb(0x232834))
+        .border_1().border_color(vik::rgb(0x3b4250))
+        .child(vik::div().flex_row().items_center().justify_between()
+            .child(vik::text("Record").text_xl().text_color(vik::white()))
+            .child(vik::div().id("rec-close").px_3().py_2().rounded_md()
+                .cursor_pointer().bg(vik::rgb(0x21252f))
+                .on_click(cx.listener([](Studio& s, const vik::ClickEvent&,
+                                         vik::Window&, vik::Context<Studio>& c) {
+                    s.show_record = false;
+                    c.notify();
+                }))
+                .child(vik::ui::phosphor("x", vik::ui::PhWeight::Regular)
+                           .size(15.0f).color(vik::rgb(0xc9cedb)))))
+        .child(vik::text("Input").text_xs().text_color(vik::rgb(0x8d94a3)));
+
+    if (devices.empty()) {
+        body = std::move(body).child(
+            vik::text("No capture device. Windows has none enabled, or it is "
+                      "denying microphone access.")
+                .text_xs().text_color(vik::rgb(0xe05c72)));
+    } else {
+        auto row = [&cx](const std::string& id, const std::string& label, bool on,
+                         int index) {
+            return vik::div().id(id).flex_row().items_center().gap_2()
+                .px_3().py_2().rounded_md().cursor_pointer()
+                .bg(vik::rgb(on ? 0x3a4a68 : 0x2c313d))
+                .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x3a4150)); })
+                // Switched live, so the meter answers immediately rather than
+                // at the next launch.
+                .on_click(cx.listener([index](Studio& s, const vik::ClickEvent&,
+                                              vik::Window&, vik::Context<Studio>& c) {
+                    s.use_input(index);
+                    c.notify();
+                }))
+                .child(vik::ui::phosphor(on ? "check-circle" : "circle",
+                                         vik::ui::PhWeight::Regular)
+                           .size(14.0f).color(vik::rgb(on ? 0x9b93ff : 0x6c7383)))
+                .child(vik::text(label).text_xs()
+                           .text_color(vik::rgb(on ? 0xffffff : 0xc9cedb)));
+        };
+        body = std::move(body).child(
+            row("rec-in-default", "System default", settings.input_device < 0, -1));
+        for (size_t i = 0; i < devices.size(); ++i)
+            body = std::move(body).child(
+                row(std::format("rec-in-{}", i), devices[i],
+                    settings.input_device == static_cast<int>(i),
+                    static_cast<int>(i)));
+    }
+
+    body = std::move(body).child(std::move(meter));
+
+    // The one thing a meter cannot tell you, because a muted endpoint and a
+    // silent room look identical from here.
+    if (muted)
+        body = std::move(body).child(
+            vik::div().flex_col().gap_1().px_3().py_2().rounded_md()
+                .bg(vik::rgb(0x3a2a2e))
+                .child(vik::text("This input is muted in Windows")
+                           .text_color(vik::rgb(0xe05c72)))
+                .child(vik::text("Sound settings > Recording > the device > "
+                                 "Levels, or the microphone key on the keyboard. "
+                                 "A muted input still records -- as silence.")
+                           .text_xs().text_color(vik::rgb(0xc9a0a6))));
+
+    if (!record_error.empty())
+        body = std::move(body).child(
+            vik::text(record_error).text_xs().text_color(vik::rgb(0xd9903c)));
+
+    body = std::move(body).child(
+        vik::div().flex_row().items_center().gap_2()
+            .child(vik::text(record_track ? "" : "a new track will be added")
+                       .text_xs().text_color(vik::rgb(0x6c7383)))
+            .child(vik::div().flex_1())
+            .child(vik::div().id("rec-go").px_4().py_2().rounded_md()
+                .cursor_pointer()
+                .bg(vik::rgb(live ? 0xe05c72 : 0x3a4150))
+                .on_click(cx.listener([](Studio& s, const vik::ClickEvent&,
+                                         vik::Window&, vik::Context<Studio>& c) {
+                    if (!g_device.capturing()) return;
+                    s.show_record = false;
+                    s.start_record(c.app());
+                    c.notify();
+                }))
+                .child(vik::text(live ? "Start recording" : "No input")
+                           .text_color(vik::white()))));
+
+    return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
+        .flex_row().items_center().justify_center()
+        .occlude()
+        .on_mouse_down(vik::MouseButton::Left, cx.listener(
+            [](Studio& s, const vik::MouseDownEvent&, vik::Window&,
+               vik::Context<Studio>& c) {
+                s.show_record = false;
+                c.notify();
+            }))
+        .bg(vik::rgba(0x00000099))
+        .child(std::move(body))
+        .into_any();
+}
+
 vik::AnyElement Studio::inspire_modal(vik::Context<Studio>& cx) {
     if (!inspire_inputs_ready) {
         idea_input = vik::ui::text_input_state(cx.app());
@@ -3393,6 +3597,7 @@ vik::AnyElement Studio::inspire_modal(vik::Context<Studio>& cx) {
                         // Into the Generate panel, where it can be edited and
                         // the quality and length chosen before anything runs.
                         s.show_inspire = false;
+                        s.show_record = false;
                         s.show_generate = true;
                         c.notify();
                     }))
@@ -4666,6 +4871,8 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
 
     if (show_inspire) overlay = inspire_modal(cx);
 
+    if (show_record) overlay = record_modal(cx);
+
     if (tool != Tool::None)
         overlay = current_tool_modal(cx);
     else if (show_settings && !show_layers && !show_generate)
@@ -4746,7 +4953,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 }
 
                 if (s.tool != Tool::None || s.show_generate || s.show_inspire ||
-                    s.show_layers || s.show_settings) {
+                    s.show_record || s.show_layers || s.show_settings) {
                     if (e.key == "escape") {
                         s.tool = Studio::Tool::None;
                         s.show_generate = s.show_layers = s.show_settings = false;
@@ -5425,6 +5632,7 @@ int main(int argc, char** argv) {
                     else if (open_panel == "tool-layer") s.tool = Studio::Tool::Layer;
                     else if (open_panel == "home") s.show_home = true;
                     else if (open_panel == "inspire") s.show_inspire = true;
+                    else if (open_panel == "record") s.show_record = true;
                     s.stress = stress;
                     // Read the theme once at startup. It is what tooltips
                     // dereference, and a missing one used to surface only when
@@ -5476,6 +5684,7 @@ int main(int argc, char** argv) {
                 app.set_interval(std::chrono::milliseconds(16), [handle](vik::App& a) {
                     a.update_entity(handle, [](Studio& s, vik::Context<Studio>& c) {
                         const bool landed = s.pump() | s.pump_ai(c.app()) | s.pump_midi();
+                        s.pump_meter();
                         s.maybe_autosave();
 
                         if (!s.scripted_prompt.empty() && !s.regen_fired &&
