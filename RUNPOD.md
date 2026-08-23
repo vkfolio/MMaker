@@ -116,6 +116,23 @@ what runs there -- and a plain `git pull` would fail and restart-loop the pod.
 
 Or leave the default command and run that line yourself in the pod terminal.
 
+### What a pod needs, and what it recovers by itself
+
+Nothing on a pod is irreplaceable, which is deliberate — the pod renders audio,
+it is not where work lives. Stopping a pod keeps its disk; terminating one loses
+it, and this is what that costs:
+
+| | Size | Recovery |
+|---|---|---|
+| `MMaker` checkout | 43 MB | `git pull` on boot, already in the start command |
+| ACE-Step + checkpoints | 49 GB | `bash tools/fetch-quality-weights.sh ultra`, plus `acestep-download --model acestep-v15-base` |
+| FluidSynth + soundfont | ~150 MB | installed by `start.sh` on boot if missing |
+| `/data` project data | ~100 MB | scratch by design; the desktop's `.mmproj` is the document |
+
+The checkpoints are the only slow part. `acestep-v15-base` (4.8 GB) is what makes
+`lego`, `complete` and `extract` work at all; `acestep-v15-xl-base` (19 GB) is
+what makes `ultra` the 4B model. Both download in minutes on a pod.
+
 Rebuild the image after changing anything, from a pod that works:
 
 ```bash

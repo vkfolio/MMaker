@@ -118,6 +118,23 @@ else
                 log "  fetch better weights: bash tools/fetch-quality-weights.sh all" ;;
   esac
 
+  # FluidSynth, if it is not already here.
+  #
+  # Rendering a score needs it, and it is apt-installed rather than baked into
+  # the image -- so a pod started from a clean image, or one that was
+  # terminated and recreated, would otherwise lose the piano roll's only way of
+  # making sound with no error until someone drew notes. Twenty seconds at boot
+  # is a better trade than a feature that silently disappears.
+  if ! command -v fluidsynth >/dev/null 2>&1; then
+    log "installing fluidsynth (needed to play a score)"
+    if apt-get update -qq >/dev/null 2>&1 &&
+       apt-get install -y -qq fluidsynth fluid-soundfont-gm >/dev/null 2>&1; then
+      log "fluidsynth $(fluidsynth --version 2>&1 | head -1)"
+    else
+      log "WARNING: fluidsynth could not be installed -- scores will not render"
+    fi
+  fi
+
   log "starting ACE-Step on :${ACESTEP_PORT} (first run downloads weights)"
   (
     cd "$ACESTEP_DIR"
