@@ -260,6 +260,14 @@ struct Studio {
     mx::Selection selection;
     bool          selecting = false;
     int64_t    drag_grab    = 0;     // offset from clip start to grab point
+    /// Which part of a clip the pointer took hold of.
+    ///
+    /// The same idea as the piano roll's note grab: a band at each edge trims,
+    /// the body moves. Sized in pixels rather than frames so a short clip stays
+    /// trimmable when zoomed out and a long one does not become mostly handle.
+    enum class ClipGrab { Move, TrimStart, TrimEnd };
+    ClipGrab   clip_grab    = ClipGrab::Move;
+    bool       drag_changed = false;   // has this drag actually moved anything
     bool       scrubbing    = false;
 
     double last_paint_ms  = 0.0;
@@ -863,6 +871,162 @@ struct Studio {
         net_status = pod_url.empty() ? "no address set" : "not connected";
         if (!pod_url.empty()) connect(app);
     }
+
+    // --- undo --------------------------------------------------------------
+    //
+    // Whole-Session snapshots. A Session is vectors of small structs plus
+    // shared_ptrs to the decoded audio, so a copy is cheap and shares the
+    // buffers rather than duplicating them -- a 40-track project snapshots in
+    // microseconds and costs kilobytes. Per-command inverse operations would
+    // be smaller still and are a much better way to get undo subtly wrong.
+    std::vector<mx::Session> undo_stack;
+    std::vector<mx::Session> redo_stack;
+    std::string              last_edit;      // shown in the status line
+
+    static constexpr size_t kUndoDepth = 64;
+
+    /// Snapshot before mutating. Call this first, always.
+    void push_undo(std::string what) {
+        undo_stack.push_back(session);
+        if (undo_stack.size() > kUndoDepth) undo_stack.erase(undo_stack.begin());
+        redo_stack.clear();     // a new edit forks history; the old future is gone
+        last_edit = std::move(what);
+        dirty = true;
+    }
+
+    void undo() {
+        if (undo_stack.empty()) {
+            doc_status = "nothing to undo";
+            return;
+        }
+        redo_stack.push_back(session);
+        session = std::move(undo_stack.back());
+        undo_stack.pop_back();
+        after_edit("undo " + last_edit);
+    }
+
+    void redo() {
+        if (redo_stack.empty()) {
+            doc_status = "nothing to redo";
+            return;
+        }
+        undo_stack.push_back(session);
+        session = std::move(redo_stack.back());
+        redo_stack.pop_back();
+        after_edit("redo");
+    }
+
+    /// Everything an edit has to do afterwards, in one place.
+    ///
+    /// Forgetting publish() leaves the mixer playing the old arrangement while
+    /// the screen shows the new one, which is the single easiest bug to
+    /// introduce here and the hardest to attribute.
+    void after_edit(std::string status) {
+        if (!session.find_clip(selected)) selected = 0;
+        if (editing_clip && !session.find_clip(editing_clip)) close_editor();
+        dirty = true;
+        doc_status = std::move(status);
+        publish();
+    }
+
+    // --- clip commands ------------------------------------------------------
+
+    mx::Clip* selected_clip() { return session.find_clip(selected); }
+
+    /// Snapshot once per drag, on the first movement that changes anything.
+    ///
+    /// Not on mouse-down: a click that selects a clip without moving it would
+    /// otherwise fill the undo stack with entries that undo nothing, and the
+    /// first real Ctrl+Z would appear to do nothing at all.
+    void begin_drag_edit(std::string what) {
+        if (drag_changed) return;
+        push_undo(std::move(what));
+        drag_changed = true;
+    }
+
+    void delete_selected() {
+        if (!selected_clip()) { doc_status = "select a clip first"; return; }
+        push_undo("delete");
+        session.remove_clip(selected);
+        selected = 0;
+        after_edit("deleted");
+    }
+
+    /// Split at the playhead, as every DAW does.
+    ///
+    /// The playhead rather than the pointer, because a cut you can see the
+    /// position of beforehand is one you can place accurately.
+    void split_at_playhead() {
+        const int64_t at = playhead();
+        mx::Clip* c = selected_clip();
+        // With nothing selected, cut whatever the playhead is actually over on
+        // the selected clip's track, or on any track if there is no selection.
+        if (!c) {
+            for (auto& clip : session.clips)
+                if (at > clip.start_frame && at < clip.start_frame + clip.length &&
+                    clip.score_id == 0) {
+                    c = &clip;
+                    break;
+                }
+        }
+        if (!c) { doc_status = "move the playhead over a clip to split it"; return; }
+        if (c->score_id != 0) { doc_status = "note clips cannot be split yet"; return; }
+        if (at <= c->start_frame || at >= c->start_frame + c->length) {
+            doc_status = "the playhead is not inside the clip";
+            return;
+        }
+        const mx::ClipId id = c->id;
+        push_undo("split");
+        mx::Clip* right = session.split_clip(id, at);
+        if (right) selected = right->id;
+        after_edit("split");
+    }
+
+    void duplicate_selected() {
+        if (!selected_clip()) { doc_status = "select a clip first"; return; }
+        push_undo("duplicate");
+        mx::Clip* copy = session.duplicate_clip(selected);
+        if (copy) selected = copy->id;
+        after_edit("duplicated");
+    }
+
+    /// Copy and cut share one clipboard entry, since one clip is what the
+    /// timeline can select.
+    void copy_selected() {
+        const mx::Clip* c = selected_clip();
+        if (!c) { doc_status = "select a clip first"; return; }
+        clipboard = *c;
+        has_clipboard = true;
+        doc_status = "copied";
+    }
+
+    void cut_selected() {
+        const mx::Clip* c = selected_clip();
+        if (!c) { doc_status = "select a clip first"; return; }
+        clipboard = *c;
+        has_clipboard = true;
+        delete_selected();
+        doc_status = "cut";
+    }
+
+    /// Paste at the playhead, on the clip's own track when it still exists.
+    void paste_clipboard() {
+        if (!has_clipboard) { doc_status = "nothing to paste"; return; }
+        if (!session.find_track(clipboard.track_id)) {
+            if (session.tracks.empty()) { doc_status = "no track to paste onto"; return; }
+            clipboard.track_id = session.tracks.front().id;
+        }
+        push_undo("paste");
+        mx::Clip c = clipboard;
+        c.id = session.next_clip++;
+        c.start_frame = std::max<int64_t>(0, playhead());
+        session.clips.push_back(c);
+        selected = c.id;
+        after_edit("pasted");
+    }
+
+    mx::Clip clipboard{};
+    bool     has_clipboard = false;
 
     void mark_dirty() { dirty = true; }
 
@@ -3850,8 +4014,20 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     } else if (const mx::ClipId id = s.clip_at(x, y)) {
                         s.selected = id;
                         s.dragging = id;
-                        if (const auto* clip = s.session.find_clip(id))
+                        s.drag_changed = false;
+                        s.clip_grab = Studio::ClipGrab::Move;
+                        if (const auto* clip = s.session.find_clip(id)) {
                             s.drag_grab = s.view.frame_at(x) - clip->start_frame;
+                            // 6 px at each edge, never more than a third of the
+                            // clip, so a short one can still be picked up.
+                            const float w = static_cast<float>(clip->length /
+                                                               s.view.frames_per_pixel);
+                            const float band = std::min(6.0f, w / 3.0f);
+                            const float left = s.view.x_of(clip->start_frame);
+                            const float right = s.view.x_of(clip->start_frame + clip->length);
+                            if (x <= left + band) s.clip_grab = Studio::ClipGrab::TrimStart;
+                            else if (x >= right - band) s.clip_grab = Studio::ClipGrab::TrimEnd;
+                        }
                     } else {
                         // Empty lane: move the playhead and start scrubbing.
                         s.selected = 0;
@@ -3889,10 +4065,23 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     auto* clip = s.session.find_clip(s.dragging);
                     if (!clip) return;
 
-                    int64_t start = s.view.frame_at(s.local_x(e.position.x)) - s.drag_grab;
-                    start = std::max<int64_t>(0, start);
-                    if (start == clip->start_frame) return;
-                    clip->start_frame = start;
+                    const int64_t at = s.view.frame_at(s.local_x(e.position.x));
+                    const mx::ClipId id = s.dragging;
+
+                    if (s.clip_grab == Studio::ClipGrab::TrimStart) {
+                        if (at == clip->start_frame) return;
+                        s.begin_drag_edit("trim");
+                        s.session.trim_start(id, at);
+                    } else if (s.clip_grab == Studio::ClipGrab::TrimEnd) {
+                        if (at == clip->start_frame + clip->length) return;
+                        s.begin_drag_edit("trim");
+                        s.session.trim_end(id, at);
+                    } else {
+                        int64_t start = std::max<int64_t>(0, at - s.drag_grab);
+                        if (start == clip->start_frame) return;
+                        s.begin_drag_edit("move");
+                        clip->start_frame = start;
+                    }
 
                     // A new graph per drag frame. The mixer's generation-based
                     // retirement is what makes that affordable, and its
@@ -3904,6 +4093,10 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 [](Studio& s, const vik::MouseUpEvent&, vik::Window&,
                    vik::Context<Studio>& c) {
                     if (s.dragging || s.scrubbing || s.selecting) {
+                        if (s.drag_changed) {
+                            s.drag_changed = false;
+                            s.after_edit(s.last_edit + "d");
+                        }
                         s.dragging = 0;
                         s.scrubbing = false;
                         // A selection thinner than a few pixels is a misclick,
@@ -4087,6 +4280,28 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                         s.show_home = false;
                         c.notify();
                     }
+                    return;
+                }
+
+                // --- editing ------------------------------------------
+                // Ctrl first: a bare letter is a transport shortcut, and the
+                // two sets must not collide.
+                const bool ctrl = e.modifiers.control;
+                if (ctrl && e.key == "z") {
+                    if (e.modifiers.shift) s.redo(); else s.undo();
+                    c.notify();
+                    return;
+                }
+                if (ctrl && e.key == "y") { s.redo(); c.notify(); return; }
+                if (ctrl && e.key == "d") { s.duplicate_selected(); c.notify(); return; }
+                if (ctrl && e.key == "e") { s.split_at_playhead(); c.notify(); return; }
+                if (ctrl && e.key == "c") { s.copy_selected(); c.notify(); return; }
+                if (ctrl && e.key == "x") { s.cut_selected(); c.notify(); return; }
+                if (ctrl && e.key == "v") { s.paste_clipboard(); c.notify(); return; }
+                if (ctrl && e.key == "s") { s.save_document_now(); c.notify(); return; }
+                if (e.key == "delete" || e.key == "backspace") {
+                    s.delete_selected();
+                    c.notify();
                     return;
                 }
 

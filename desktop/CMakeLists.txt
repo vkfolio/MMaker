@@ -89,6 +89,13 @@ target_include_directories(pianoroll_check PRIVATE src third_party)
 target_link_libraries(pianoroll_check PRIVATE vik_components)
 add_test(NAME pianoroll_coords COMMAND pianoroll_check)
 
+# The editing contract: split arithmetic, trim bounds, id uniqueness. No UI and
+# no audio -- session.h is header-only for exactly this reason.
+add_executable(edit_check tests/edit_check.cpp src/media/peaks.cpp)
+target_include_directories(edit_check PRIVATE src third_party)
+target_link_libraries(edit_check PRIVATE vik_components)
+add_test(NAME clip_editing COMMAND edit_check)
+
 add_executable(mixer_test tests/mixer_test.cpp)
 target_link_libraries(mixer_test PRIVATE mx_audio)
 

@@ -223,6 +223,117 @@ struct Session {
         return clips.back();
     }
 
+
+    // --- editing -----------------------------------------------------------
+    //
+    // Every one of these leaves audio alone. A clip is a window onto a source,
+    // so trimming and splitting move the window; nothing is resampled, nothing
+    // is copied, and undo is a snapshot of this struct rather than of any
+    // audio. Scores are shared by reference on a split, which is why splitting
+    // a score clip is refused below rather than silently giving two clips the
+    // same notes.
+
+    bool remove_clip(ClipId id) {
+        for (auto it = clips.begin(); it != clips.end(); ++it) {
+            if (it->id != id) continue;
+            clips.erase(it);
+            return true;
+        }
+        return false;
+    }
+
+    /// Split at an absolute timeline frame. Returns the new right-hand clip.
+    ///
+    /// The right half keeps reading the same source further in -- that is what
+    /// source_offset is for -- so the two halves play exactly what the whole
+    /// did. A cut outside the clip, or flush against either edge, does nothing:
+    /// it would otherwise make a zero-length clip that draws as a sliver and
+    /// can never be grabbed again.
+    Clip* split_clip(ClipId id, int64_t at) {
+        Clip* left = find_clip(id);
+        if (!left) return nullptr;
+        if (left->score_id != 0) return nullptr;      // notes are not divisible here
+        if (at <= left->start_frame || at >= left->start_frame + left->length)
+            return nullptr;
+
+        const int64_t taken = at - left->start_frame;
+        Clip right = *left;
+        right.id = next_clip++;
+        right.start_frame = at;
+        right.length = left->length - taken;
+        right.source_offset = left->source_offset + taken;
+        // A fade belongs to the edge it was drawn on. The new inner edges get
+        // none, or the cut would fade out and back in at a join meant to be
+        // seamless.
+        right.fade_in = 0;
+        left->length = taken;
+        left->fade_out = 0;
+
+        clips.push_back(right);
+        return &clips.back();
+    }
+
+    /// A copy on the same track, starting where the original ends.
+    Clip* duplicate_clip(ClipId id) {
+        Clip* src = find_clip(id);
+        if (!src) return nullptr;
+        Clip copy = *src;
+        copy.id = next_clip++;
+        copy.start_frame = src->start_frame + src->length;
+        clips.push_back(copy);
+        return &clips.back();
+    }
+
+    /// Move the left edge, keeping the audio under it still.
+    ///
+    /// The window slides and the content does not: source_offset moves with
+    /// the start, so trimming reveals or hides material rather than sliding
+    /// the whole take about. Clamped so a clip cannot invert or read before
+    /// the beginning of its source.
+    void trim_start(ClipId id, int64_t to) {
+        Clip* c = find_clip(id);
+        if (!c) return;
+        const int64_t end = c->start_frame + c->length;
+        int64_t start = std::clamp(to, c->start_frame - c->source_offset, end - 1);
+        if (start < 0) start = 0;
+        const int64_t delta = start - c->start_frame;
+        c->start_frame = start;
+        c->length -= delta;
+        c->source_offset += delta;
+    }
+
+    void trim_end(ClipId id, int64_t to) {
+        Clip* c = find_clip(id);
+        if (!c) return;
+        c->length = std::max<int64_t>(1, to - c->start_frame);
+    }
+
+    /// Drop a track and everything on it.
+    void remove_track(TrackId id) {
+        std::erase_if(clips, [id](const Clip& c) { return c.track_id == id; });
+        std::erase_if(tracks, [id](const Track& t) { return t.id == id; });
+    }
+
+    /// Clips on one track, left to right. Used by the edit commands to find
+    /// what a keystroke should act on.
+    std::vector<Clip*> clips_on(TrackId track) {
+        std::vector<Clip*> out;
+        for (auto& c : clips)
+            if (c.track_id == track) out.push_back(&c);
+        std::sort(out.begin(), out.end(),
+                  [](const Clip* a, const Clip* b) { return a->start_frame < b->start_frame; });
+        return out;
+    }
+
+    /// The clip under a point on a track, if any.
+    Clip* clip_at_frame(TrackId track, int64_t frame) {
+        for (auto& c : clips)
+            if (c.track_id == track && frame >= c.start_frame &&
+                frame < c.start_frame + c.length)
+                return &c;
+        return nullptr;
+    }
+
     Score* find_score(ScoreId id) {
         if (id == 0) return nullptr;
         for (auto& s : scores)
