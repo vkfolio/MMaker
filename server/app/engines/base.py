@@ -17,8 +17,12 @@ class Engine(Protocol):
 
     def generate(self, dest: Path, prompt: str, grid: Grid, seed: int,
                  lyrics: str = "", vocal_language: str = "en",
-                 src_audio: Path | None = None) -> Path:
-        """text2music, or cover when src_audio is given."""
+                 src_audio: Path | None = None,
+                 cover: dict | None = None) -> Path:
+        """text2music, or cover when src_audio is given.
+
+        `cover` carries the audio-conditioning strengths for the cover case.
+        """
 
     def layer(self, dest: Path, track_class: str, src_audio: Path, prompt: str,
               grid: Grid, seed: int, lyrics: str = "",

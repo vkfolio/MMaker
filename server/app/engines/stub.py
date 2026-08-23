@@ -101,7 +101,10 @@ class StubEngine:
     name = "stub"
 
     def generate(self, dest, prompt, grid, seed, lyrics="", vocal_language="en",
-                 src_audio=None, report=None, quality=None):
+                 src_audio=None, report=None, quality=None, cover=None):
+        # `cover` is the real engine's conditioning strength. There is nothing
+        # to condition on here, but the signature has to match or stub mode
+        # stops being a drop-in replacement -- which is its whole purpose.
         return audio.write(dest, _render("mix", grid, seed, grid.duration_s), SR)
 
     def layer(self, dest, track_class, src_audio, prompt, grid, seed,

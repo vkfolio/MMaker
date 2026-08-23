@@ -204,6 +204,68 @@ class RepaintRequest(BaseModel):
         raise ValueError("give either start_bar/end_bar or start_s/end_s")
 
 
+class CoverRequest(BaseModel):
+    """Reimagine existing audio, with a dial for how far to stray.
+
+    This is the answer to "here is my idea, play with it". ACE-Step's cover
+    task conditions generation on source audio, and two parameters control how
+    tightly: audio_cover_strength (the docs suggest ~0.2 for style transfer,
+    1.0 to stay close) and cover_noise_strength (0 starts from pure noise, 1
+    stays nearest the source). Both were previously left at their API defaults,
+    which is the maximally faithful corner -- so every "variation" was a near
+    copy and there was no way to ask for anything looser.
+
+    One `strength` in 0..1 drives both, because they are not independent in
+    any way a person would want to reason about: what is being asked for is a
+    single "how much of my performance survives".
+
+    A region is optional. Given one, only that slice is covered and spliced
+    back, so a variation can apply to four bars of one layer.
+    """
+    prompt: str | None = None
+    # 0 = improvise freely on the idea, 1 = stay faithful to the recording.
+    strength: float = Field(0.5, ge=0.0, le=1.0)
+    seed: int | None = None
+    start_s: float | None = Field(None, ge=0)
+    end_s: float | None = Field(None, gt=0)
+
+    def region(self) -> tuple[float, float] | None:
+        """The slice to cover, or None for the whole stem."""
+        if self.start_s is None or self.end_s is None:
+            return None
+        if self.end_s <= self.start_s:
+            raise ValueError("end_s must be greater than start_s")
+        return float(self.start_s), float(self.end_s)
+
+    # Diagnostic overrides. The two model parameters interact in ways the
+    # single dial cannot express -- audio_cover_strength below 1.0 switches on
+    # an extra text-conditioning branch, and cover_noise_strength snaps to the
+    # nearest step in an 8-step schedule -- so being able to set them directly
+    # is how the dial's mapping gets characterised rather than guessed.
+    audio_cover_strength: float | None = Field(None, ge=0.0, le=1.0)
+    cover_noise_strength: float | None = Field(None, ge=0.0, le=1.0)
+
+    def engine_params(self) -> dict:
+        """Map one dial onto the model's two.
+
+        Faithful (1.0) means full conditioning strength and high noise
+        retention; improvise (0.0) means light conditioning and start closer to
+        noise. The floor on cover_strength is deliberate: at 0 the source stops
+        influencing the result at all, which is not a variation of anything.
+        """
+        s = float(self.strength)
+        params = {
+            "audio_cover_strength": round(0.2 + 0.8 * s, 3),
+            "cover_noise_strength": round(s, 3),
+        }
+        if self.audio_cover_strength is not None:
+            params["audio_cover_strength"] = round(self.audio_cover_strength, 3)
+        if self.cover_noise_strength is not None:
+            params["cover_noise_strength"] = round(self.cover_noise_strength, 3)
+        return params
+
+
+
 class ExtendRequest(BaseModel):
     bars: int = Field(8, ge=1, le=128)
     prompt: str | None = None

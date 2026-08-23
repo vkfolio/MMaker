@@ -412,8 +412,8 @@ struct Studio {
     //
     // Mouse events arrive in window coordinates, while the view maps frames to
     // canvas-relative pixels. Using the raw event position put every click off
-    // by the width of everything to the left of the timeline -- the sidebar
-    // plus the track headers -- so the playhead landed nowhere near the pointer.
+    // by the width of everything to the left of the timeline -- the track
+    // headers -- so the playhead landed nowhere near the pointer.
     float canvas_x = 0.0f;
     float canvas_y = 0.0f;
 
@@ -453,6 +453,12 @@ struct Studio {
     // The document is local and is the app's own. The pod is a render service
     // configured in settings, not the place work lives.
     std::filesystem::path document_path;
+    /// The home screen owns the window until a project is chosen.
+    ///
+    /// Not a modal over the arrangement: with nothing loaded there is nothing
+    /// behind it worth seeing, and the app used to open onto four synthesised
+    /// demo tones, which reads as a broken project rather than an empty one.
+    bool                  show_home = false;
     bool                  dirty = false;
     bool                  show_settings = false;
     bool                  show_layers = false;
@@ -635,6 +641,7 @@ struct Studio {
     void mark_dirty() { dirty = true; }
 
     void new_document() {
+        show_home = false;
         session = mx::Session{};
         session.rate = g_device.running() ? g_device.rate() : 48000;
         document_path.clear();
@@ -676,6 +683,7 @@ struct Studio {
             return;
         }
         document_path = path;
+        show_home = false;
         dirty = false;
         fitted = false;
         loaded_sources = 0;
@@ -700,14 +708,53 @@ struct Studio {
         publish();
     }
 
-    std::vector<std::filesystem::path> local_documents() const {
-        std::vector<std::filesystem::path> found;
+    /// One row of the home screen's recent list.
+    struct RecentDoc {
+        std::filesystem::path path;
+        std::string           name;
+        std::string           when;      // "today", "3 days ago", "2026-06-01"
+        int64_t               sort_key = 0;   // seconds since epoch, newest first
+    };
+
+    /// Saved documents, newest first.
+    ///
+    /// Sorted by modification time rather than by name: a recents list ordered
+    /// alphabetically is not a recents list, and the thing you were working on
+    /// five minutes ago is the one you almost always want.
+    std::vector<RecentDoc> local_documents() const {
+        std::vector<RecentDoc> found;
         std::error_code ec;
+        const auto now = std::chrono::system_clock::now();
         for (const auto& e : std::filesystem::directory_iterator(
-                 mx::documents_root(), ec))
-            if (e.is_regular_file() && e.path().extension() == ".mmproj")
-                found.push_back(e.path());
-        std::sort(found.begin(), found.end());
+                 mx::documents_root(), ec)) {
+            if (!e.is_regular_file() || e.path().extension() != ".mmproj") continue;
+            RecentDoc doc;
+            doc.path = e.path();
+            doc.name = e.path().stem().string();
+
+            std::error_code time_ec;
+            const auto written = std::filesystem::last_write_time(e.path(), time_ec);
+            if (time_ec) {
+                doc.when = "";
+            } else {
+                const auto when = std::chrono::clock_cast<std::chrono::system_clock>(written);
+                doc.sort_key = std::chrono::duration_cast<std::chrono::seconds>(
+                                   when.time_since_epoch()).count();
+                const auto days = std::chrono::duration_cast<std::chrono::hours>(
+                                      now - when).count() / 24;
+                if (days <= 0)      doc.when = "today";
+                else if (days == 1) doc.when = "yesterday";
+                else if (days < 30) doc.when = std::to_string(days) + " days ago";
+                else                doc.when = std::format("{:%Y-%m-%d}",
+                                                  std::chrono::floor<std::chrono::days>(when));
+            }
+            found.push_back(std::move(doc));
+        }
+        std::sort(found.begin(), found.end(),
+                  [](const RecentDoc& a, const RecentDoc& b) {
+                      if (a.sort_key != b.sort_key) return a.sort_key > b.sort_key;
+                      return a.name < b.name;
+                  });
         return found;
     }
 
@@ -1752,6 +1799,7 @@ struct Studio {
     /// the stack before.
     vik::AnyElement pianoroll_panel(vik::Context<Studio>& cx);
     vik::AnyElement new_clip_menu(vik::Context<Studio>& cx);
+    vik::AnyElement home_screen(vik::Context<Studio>& cx);
     vik::AnyElement quality_chip(vik::Context<Studio>& cx, const char* tier,
                                  bool on);
 };
@@ -2254,6 +2302,179 @@ vik::AnyElement Studio::pianoroll_panel(vik::Context<Studio>& cx) {
 /// track because that is the commonest case would be the same mistake as
 /// auto-splitting a generate: convenient once, wrong every other time, and
 /// invisible until you notice the wrong kind of track appeared.
+
+/// The first screen: what you have made, and how to start something new.
+///
+/// This replaces the left Projects sidebar, which was a column of filenames
+/// competing with the arrangement for width at every moment of use, when the
+/// question it answers -- which project -- is asked once per session. The
+/// reference has no such sidebar either; it has a hamburger that opens a mixer.
+///
+/// It owns the whole window rather than floating over the timeline. With no
+/// document loaded there is nothing behind it worth seeing, and the app used to
+/// open onto four synthesised demo tones, which looks like a project that
+/// failed to load rather than like no project at all.
+vik::AnyElement Studio::home_screen(vik::Context<Studio>& cx) {
+    auto action = [&cx](const std::string& id, const char* icon, const char* title,
+                        const char* blurb, auto fn) {
+        return vik::div().id(id).flex_row().items_center().gap_3()
+            .px_4().py_3().rounded_lg().cursor_pointer()
+            .bg(vik::rgb(0x1f2430))
+            .border_1().border_color(vik::rgb(0x3b4250))
+            .hover([](vik::StyleRefinement& st) {
+                st.bg(vik::rgb(0x272d3b));
+                // A field on StyleRefinement, not a setter -- calling it
+                // compiles as an attempt to invoke an optional<Color>.
+                st.border_color = vik::rgb(0x6b63e8);
+            })
+            .on_click(cx.listener(fn))
+            .child(vik::ui::phosphor(icon, vik::ui::PhWeight::Regular).size(22.0f)
+                       .color(vik::rgb(0x9b93ff)))
+            .child(vik::div().flex_col().gap_1()
+                .child(vik::text(title).text_color(vik::rgb(0xffffff)))
+                .child(vik::text(blurb).text_xs().text_color(vik::rgb(0x6c7383))));
+    };
+
+    auto actions = vik::div().flex_col().gap_2().w_px(320.0f)
+        .child(action("home-new", "file-plus", "New project",
+                      "An empty timeline",
+                      [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                         vik::Context<Studio>& c) {
+                          s.new_document();
+                          c.notify();
+                      }))
+        .child(action("home-import", "waveform", "Start from audio or MIDI",
+                      "Drop a file onto this window",
+                      [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                         vik::Context<Studio>& c) {
+                          // There is no file picker to open -- vikui has no
+                          // native dialog -- so this says where the door is
+                          // rather than pretending to be one.
+                          s.doc_status = "drop a .wav, .mp3, .flac or .mid onto the window";
+                          c.notify();
+                      }));
+
+    // --- recents ----------------------------------------------------------
+    const auto documents = local_documents();
+
+    auto list = vik::div().flex_col().gap_1().flex_1();
+    if (documents.empty()) {
+        list = std::move(list).child(
+            vik::div().flex_col().gap_1().px_4().py_3().rounded_lg()
+                .bg(vik::rgb(0x1a1e27))
+                .child(vik::text("Nothing saved yet")
+                           .text_color(vik::rgb(0x8d94a3)))
+                .child(vik::text("Saved projects land in Documents/MusicMaker")
+                           .text_xs().text_color(vik::rgb(0x565c6b))));
+    }
+
+    int shown = 0;
+    for (const auto& doc : documents) {
+        if (++shown > 12) break;        // a recents list, not a file browser
+        list = std::move(list).child(
+            // Each row needs its own id: element_state keys on the id path, so
+            // one shared id gives the whole list a single hover state and only
+            // the first row responds.
+            vik::div().id(std::format("home-doc-{}", shown))
+                .flex_row().items_center().justify_between()
+                .px_4().py_2().rounded_md().cursor_pointer()
+                .bg(vik::rgb(0x1a1e27))
+                .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x242b39)); })
+                .on_click(cx.listener([path = doc.path](Studio& s,
+                                                        const vik::ClickEvent&,
+                                                        vik::Window&,
+                                                        vik::Context<Studio>& c) {
+                    s.open_document(path, c.app());
+                    c.notify();
+                }))
+                .child(vik::text(doc.name).text_color(vik::rgb(0xe6e8ec)))
+                .child(vik::text(doc.when).text_xs()
+                           .text_color(vik::rgb(0x6c7383))));
+    }
+
+    // --- engine status ----------------------------------------------------
+    // Said here, on the way in, rather than discovered when a tool turns out to
+    // be greyed out three clicks later.
+    std::string engine_line;
+    uint32_t engine_tint = 0x565c6b;
+    if (pod_url.empty()) {
+        engine_line = "No engine configured -- generation is unavailable";
+    } else if (net_error) {
+        engine_line = "Engine unreachable: " + net_status;
+        engine_tint = 0xe05c72;
+    } else if (caps.known) {
+        engine_line = caps.can("lego")
+            ? "Engine ready -- every tool available"
+            : "Engine ready -- turbo checkpoint, so no layering or extend";
+        engine_tint = caps.can("lego") ? 0x56c08a : 0xd9903c;
+    } else {
+        engine_line = net_status.empty() ? "Engine not connected yet" : net_status;
+    }
+
+    auto footer = vik::div().flex_row().items_center().justify_between()
+        .child(vik::div().flex_row().items_center().gap_2()
+            .child(vik::ui::phosphor("circle", vik::ui::PhWeight::Fill).size(8.0f)
+                       .color(vik::rgb(engine_tint)))
+            .child(vik::text(engine_line).text_xs()
+                       .text_color(vik::rgb(0x8d94a3))))
+        .child(vik::div().id("home-settings").px_3().py_1().rounded_md()
+            .cursor_pointer().bg(vik::rgb(0x2c313d))
+            .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x3a4150)); })
+            .on_click(cx.listener([](Studio& s, const vik::ClickEvent&,
+                                     vik::Window&, vik::Context<Studio>& c) {
+                s.show_settings = true;
+                c.notify();
+            }))
+            .child(vik::text("Settings").text_xs()
+                       .text_color(vik::rgb(0xc9cedb))));
+
+    auto body = vik::div().flex_col().gap_4().w_px(760.0f)
+        .child(vik::div().flex_col().gap_1()
+            .child(vik::text("musicX Studio").text_color(vik::rgb(0xffffff)))
+            .child(vik::text("Bring in an idea, then build it up layer by layer")
+                       .text_color(vik::rgb(0x8d94a3))))
+        .child(vik::div().flex_row().gap_4()
+            .child(std::move(actions))
+            .child(vik::div().flex_col().gap_2().flex_1()
+                .child(vik::text("Recent").text_xs()
+                           .text_color(vik::rgb(0x6c7383)))
+                .child(std::move(list))))
+        .child(std::move(footer));
+
+    if (!doc_status.empty())
+        body = std::move(body).child(
+            vik::text(doc_status).text_xs().text_color(vik::rgb(0xffd58a)));
+
+    // A document already open means this is a deliberate visit, so it can be
+    // left again. On a cold start there is nothing behind to go back to.
+    if (!session.tracks.empty() || !document_path.empty())
+        body = std::move(body).child(
+            vik::div().id("home-back").px_3().py_1().rounded_md().cursor_pointer()
+                .bg(vik::rgb(0x2c313d))
+                .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x3a4150)); })
+                .on_click(cx.listener([](Studio& s, const vik::ClickEvent&,
+                                         vik::Window&, vik::Context<Studio>& c) {
+                    s.show_home = false;
+                    c.notify();
+                }))
+                .child(vik::text("Back to the timeline").text_xs()
+                           .text_color(vik::rgb(0xc9cedb))));
+
+    return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
+        .flex_col().items_center().justify_center()
+        .bg(vik::rgb(0x14161d))
+        // Nothing behind this should receive anything: it covers the window,
+        // and a click landing on the timeline underneath would move a playhead
+        // the user cannot see.
+        .occlude()
+        .on_mouse_down(vik::MouseButton::Left,
+            [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
+                w.stop_propagation();
+            })
+        .child(std::move(body))
+        .into_any();
+}
+
 vik::AnyElement Studio::new_clip_menu(vik::Context<Studio>& cx) {
     auto row = [&cx](const std::string& id, const char* icon, const char* label,
                      bool enabled, const char* why, auto fn) {
@@ -2687,12 +2908,38 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
     auto transport =
         vik::div().flex_row().items_center().px_3().py_2()
             .bg(vik::rgb(0x1b1e27)).border_1().border_color(vik::rgb(0x2c313d))
-            .child(vik::div().flex_row().items_center().gap_2().w_px(260.0f)
-                .child(vik::text(session.title.empty() ? "Untitled Project"
-                                                       : session.title)
-                           .text_color(vik::rgb(0xe6e8ec)))
-                .child(vik::text(open_project_id.empty() ? "local" : "pod")
-                           .text_xs().text_color(vik::rgb(0x6c7383))))
+            // Left: the way back to the project list, and the document's own
+            // state. These lived in the sidebar; they belong beside the title
+            // rather than in a column that costs width for the whole session.
+            .child(vik::div().flex_row().items_center().gap_2().w_px(300.0f)
+                .child(icon_button("t-home", "house", false,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) {
+                        s.show_home = true;
+                        c.notify();
+                    }))
+                .child(vik::div().flex_col()
+                    .child(vik::text(session.title.empty() ? "Untitled Project"
+                                                           : session.title)
+                               .text_color(vik::rgb(0xe6e8ec)))
+                    .child(vik::text(document_path.empty()
+                                         ? std::string(dirty ? "unsaved" : "no file")
+                                         : document_path.filename().string()
+                                               + (dirty ? " *" : ""))
+                               .text_xs()
+                               .text_color(vik::rgb(dirty ? 0xd9903c : 0x6c7383))))
+                .child(icon_button("t-save", "floppy-disk", dirty,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) {
+                        s.save_document_now();
+                        c.notify();
+                    }))
+                .child(icon_button("t-settings", "gear", show_settings,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) {
+                        s.show_settings = !s.show_settings;
+                        c.notify();
+                    })))
 
             // centre cluster
             .child(vik::div().flex_1().flex_row().items_center().justify_center().gap_2()
@@ -3146,81 +3393,6 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     c.notify();
                 }));
 
-    // --- sidebar: local projects ------------------------------------------
-    // The list here is the user's own documents, not the pod's. The pod renders
-    // audio; it does not hold work, and putting its project list in the primary
-    // navigation made it look like it did.
-    auto row = [](std::string label, std::string value, uint32_t tint) {
-        return vik::div().flex_col().gap_1().px_3().py_2()
-            .child(vik::text(std::move(label)).text_xs().text_color(vik::rgb(0x6c7383)))
-            .child(vik::text(std::move(value)).text_color(vik::rgb(tint)));
-    };
-
-    auto sidebar = vik::div().flex_col().w_px(220.0f)
-        .bg(vik::rgb(0x1b1e27)).border_1().border_color(vik::rgb(0x2c313d))
-        .child(vik::div().flex_row().items_center().justify_between().px_3().py_2()
-            .child(vik::text("Projects").text_color(vik::rgb(0xe6e8ec)))
-            .child(vik::div().flex_row().gap_1()
-                .child(icon_button("new", "file-plus", false,
-                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                       vik::Context<Studio>& c) { s.new_document(); c.notify(); }))
-                .child(icon_button("save", "floppy-disk", dirty,
-                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                       vik::Context<Studio>& c) { s.save_document_now(); c.notify(); }))))
-        .child(row("document",
-                   document_path.empty()
-                       ? std::string(dirty ? "unsaved" : "no file")
-                       : document_path.filename().string() + (dirty ? " *" : ""),
-                   dirty ? 0xd9903c : 0x8d94a3));
-
-    if (!doc_status.empty())
-        sidebar = std::move(sidebar).child(row("", doc_status, 0x6c7383));
-
-    {
-        auto list = vik::div().flex_col().flex_1().overflow_hidden();
-        const auto documents = local_documents();
-        if (documents.empty()) {
-            list = std::move(list).child(
-                vik::div().px_3().py_2().child(
-                    vik::text("No saved projects yet")
-                        .text_xs().text_color(vik::rgb(0x565c6b))));
-        }
-        for (const auto& doc : documents) {
-            const bool active = doc == document_path;
-            list = std::move(list).child(
-                vik::div().id("doc").px_3().py_1().cursor_pointer()
-                    .bg(vik::rgb(active ? 0x2c3446 : 0x1b1e27))
-                    .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x242936)); })
-                    .on_click(cx.listener([path = doc](Studio& s,
-                                                       const vik::ClickEvent&,
-                                                       vik::Window&,
-                                                       vik::Context<Studio>& c) {
-                        s.open_document(path, c.app());
-                        c.notify();
-                    }))
-                    .child(vik::text(doc.stem().string().substr(0, 24))
-                               .text_color(vik::rgb(active ? 0xffd58a : 0xc9cedb))));
-        }
-        sidebar = std::move(sidebar).child(std::move(list));
-    }
-
-    // The pod lives at the bottom, as a service the app is configured to use.
-    sidebar = std::move(sidebar).child(
-        vik::div().flex_row().items_center().justify_between().px_3().py_2()
-            .border_1().border_color(vik::rgb(0x2c313d))
-            .child(vik::div().flex_row().items_center().gap_2()
-                .child(vik::ui::phosphor("circle", vik::ui::PhWeight::Fill).size(8.0f)
-                           .color(vik::rgb(pod_url.empty() ? 0x565c6b
-                                           : (net_error ? 0xe05c72 : 0x56c08a))))
-                .child(vik::text(pod_url.empty() ? "No pod" : net_status)
-                           .text_xs().text_color(vik::rgb(0x8d94a3))))
-            .child(icon_button("settings", "gear", show_settings,
-                [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                   vik::Context<Studio>& c) {
-                    s.show_settings = !s.show_settings;
-                    c.notify();
-                })));
-
     // The editor is a layer of its own, not an `overlay` case: a modal opened
     // from inside it must appear over it, not replace it.
     vik::AnyElement editor = editing_clip ? pianoroll_panel(cx)
@@ -3323,6 +3495,18 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     return;
                 }
 
+                // The home screen owns the keyboard while it is up. Space
+                // starting playback of a project you have not opened yet is
+                // the same class of bug as a click falling through it.
+                if (s.show_home) {
+                    if (e.key == "escape" &&
+                        (!s.session.tracks.empty() || !s.document_path.empty())) {
+                        s.show_home = false;
+                        c.notify();
+                    }
+                    return;
+                }
+
                 if (e.key == "space") s.toggle_play();
                 else if (e.key == "r") s.regenerate(c.app());
                 else if (e.key == "e") s.export_mix();
@@ -3342,10 +3526,13 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             }))
         .child(std::move(transport))
         .child(vik::div().flex_1().flex_row()
-                   .child(std::move(sidebar))
                    .child(std::move(headers))
                    .child(std::move(timeline_area)))
         .child(std::move(editor))
+        // Home sits above the timeline and the note editor, but below the
+        // modals: Settings is reachable from it, and a dialog rendered behind
+        // the screen that opened it is a dialog nobody can answer.
+        .child(show_home ? home_screen(cx) : vik::div().into_any())
         .child(std::move(overlay))
         .into_any();
 }
@@ -3767,6 +3954,7 @@ int main(int argc, char** argv) {
                     else if (open_panel == "extend") s.tool = Studio::Tool::Extend;
                     else if (open_panel == "voice") s.tool = Studio::Tool::Voice;
                     else if (open_panel == "tool-layer") s.tool = Studio::Tool::Layer;
+                    else if (open_panel == "home") s.show_home = true;
                     s.stress = stress;
                     // Read the theme once at startup. It is what tooltips
                     // dereference, and a missing one used to surface only when
@@ -3776,13 +3964,30 @@ int main(int argc, char** argv) {
                     // because everything decoded is resampled to it once.
                     if (g_device.running()) s.session.rate = g_device.rate();
                     s.session.loop_start = 0;
+                    // A pod URL still connects in the background whichever
+                    // screen is shown -- knowing what the engine can do is
+                    // what the home screen reports.
                     if (!pod_url.empty()) {
                         if (!pod_project.empty()) s.open_project(pod_project, app);
                         else s.connect(app);
-                    } else if (folder.empty()) {
-                        s.build_demo();
-                    } else {
+                    }
+
+                    if (!folder.empty()) {
                         s.load_folder(folder, app);
+                    } else if (pod_project.empty() && !s.selftest && !s.stress &&
+                               s.scripted_prompt.empty() && s.regen_from < 0) {
+                        // Nothing was asked for, so ask. Opening the last
+                        // document automatically would be the wrong guess as
+                        // often as the right one, and build_demo()'s four
+                        // synthesised tones looked like a project that had
+                        // failed to load.
+                        //
+                        // The scripted paths keep the old behaviour: they drive
+                        // the timeline directly and would otherwise be blocked
+                        // by a screen no test can click.
+                        s.show_home = true;
+                    } else if (pod_project.empty()) {
+                        s.build_demo();
                     }
                     s.view.frames_per_pixel = 512.0;
                     s.publish();

@@ -200,7 +200,7 @@ class StableAudioEngine:
         return au.write(dest, data, pipe.vae.sampling_rate)
 
     def generate(self, dest, prompt, grid, seed, lyrics="", vocal_language="en",
-                 src_audio=None):
+                 src_audio=None, cover=None):
         return self.sfx(dest, prompt, grid.duration_s, seed)
 
     def separate(self, *a, **k):

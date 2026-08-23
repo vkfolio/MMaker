@@ -12,10 +12,12 @@ import uuid
 import zipfile
 from pathlib import Path
 
+import math
+
 from . import analysis, audio, engines, presets, storage, voices
 from .base_errors import NotReady, RenderError
-from .schemas import (Grid, Project, Stem, StemVersion, SyncReport, TrackClass,
-                      Variation)
+from .schemas import (CoverRequest, Grid, Project, Stem, StemVersion, SyncReport,
+                      TrackClass, Variation)
 
 # Layers are generated against the mixdown of what already exists, so the model
 # hears the whole arrangement rather than one track.
@@ -521,6 +523,78 @@ def generate_vocals(project: Project, lyrics: str | None = None,
             report(0.85, "applying voice")
         apply_voice(project, stem, voice_id)
     return stem.model_dump()
+
+
+def cover_stem(project: Project, stem: Stem, prompt: str | None = None,
+               strength: float = 0.5, seed: int | None = None,
+               region: tuple[float, float] | None = None,
+               report=None) -> dict:
+    """Reimagine a stem -- or one region of it -- against a prompt.
+
+    The difference between this and vary_stem is which question is being
+    answered. vary_stem asks the model for another performance of the same
+    part, conditioned on the *other* layers, and needs `lego`. This conditions
+    on the part itself and needs only `cover`, which every checkpoint
+    implements -- so it is the one form of "play with my idea" that works on a
+    laptop install.
+
+    It is also the path an imported recording or a hummed melody takes: seed
+    audio in, a prompt, and a dial for how much of the original survives.
+    """
+    _require_confirmed(project)
+    seed = _seed(seed)
+    src = _abs(project, stem.version.audio)
+    dest = _next_path(project, stem, "cover")
+    if report:
+        report(0.15, "reimagining" + (" the selection" if region else ""))
+
+    composed = presets.build_prompt(prompt or stem.prompt or project.prompt,
+                                    project.style, bpm=project.grid.bpm)
+    cover_params = CoverRequest(strength=strength).engine_params()
+    engine = engines.music()
+
+    if region:
+        # Cover the slice alone and splice it back, so the rest of the stem is
+        # the same file it was. Regenerating the whole stem and trusting the
+        # model to leave the other bars alone is what made repaint bleed.
+        piece = storage.project_dir(project.id) / "_cover_region.wav"
+        audio.slice_seconds(src, piece, region[0], region[1])
+
+        # The model is told how long to render, and the grid it inherits
+        # describes the whole project -- so without this a four-bar selection
+        # asks for a four-minute cover. Round the region up to whole bars:
+        # splice truncates a long patch, but zero-pads a short one, and silence
+        # in the middle of a take is worse than a slightly early cut.
+        bar_s = project.grid.beats_per_bar * 60.0 / project.grid.bpm
+        region_bars = max(1, math.ceil((region[1] - region[0]) / bar_s))
+        grid = project.grid.model_copy(update={"bars": region_bars})
+
+        covered = storage.project_dir(project.id) / "_cover_result.wav"
+        engine.generate(covered, composed, grid, seed,
+                        lyrics=project.lyrics if stem.track_class == "vocals" else "",
+                        vocal_language=project.vocal_language,
+                        src_audio=piece, report=report, cover=cover_params,
+                        **_quality(project))
+        audio.splice(src, covered, dest, region[0], region[1])
+    else:
+        engine.generate(dest, composed, project.grid, seed,
+                        lyrics=project.lyrics if stem.track_class == "vocals" else "",
+                        vocal_language=project.vocal_language,
+                        src_audio=src, report=report, cover=cover_params,
+                        **_quality(project))
+
+    version = stem.add(StemVersion(
+        audio=_rel(project, dest), op="cover",
+        params={"seed": seed, "prompt": prompt or stem.prompt,
+                "strength": strength, **cover_params,
+                **({"start_s": region[0], "end_s": region[1]} if region else {})},
+        sync=_verify(dest, project.grid),
+    ))
+    storage.save(project)
+    if report:
+        report(1.0, "ready")
+    return version.model_dump()
+
 
 
 def apply_voice(project: Project, stem: Stem, voice_id: str, report=None,

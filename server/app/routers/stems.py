@@ -5,8 +5,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Header, HTTPException
 
 from .. import jobs, service, storage
-from ..schemas import (ExtendRequest, MixState, Project, RepaintRequest,
-                       VaryRequest, VoiceRequest)
+from ..schemas import (CoverRequest, ExtendRequest, MixState, Project,
+                       RepaintRequest, VaryRequest, VoiceRequest)
 
 router = APIRouter(prefix="/api/projects/{project_id}/stems", tags=["stems"])
 
@@ -71,6 +71,31 @@ def vary(project_id: str, stem_id: str, body: VaryRequest):
                                  body.seed, body.prompt, report)
 
     return {"job": jobs.queue.submit("vary", work, project_id).public()}
+
+
+@router.post("/{stem_id}/cover")
+def cover(project_id: str, stem_id: str, body: CoverRequest,
+          idempotency_key: str | None = Header(None, alias="Idempotency-Key")):
+    """Reimagine a stem, or one region of it, with a strength dial.
+
+    Unlike vary, this conditions on the stem itself rather than on the other
+    layers, so it needs only ACE-Step's `cover` task -- which every checkpoint
+    implements, including the turbo one an ordinary laptop install carries.
+    """
+    _stem(_get(project_id), stem_id)
+    try:
+        region = body.region()
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    def work(report):
+        project = _get(project_id)
+        return service.cover_stem(project, project.stem(stem_id),
+                                  prompt=body.prompt, strength=body.strength,
+                                  seed=body.seed, region=region, report=report)
+
+    return {"job": jobs.queue.submit("cover", work, project_id,
+                                     idempotency_key=idempotency_key).public()}
 
 
 @router.post("/{stem_id}/voice")

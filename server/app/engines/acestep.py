@@ -498,7 +498,14 @@ class AceStepEngine:
     # -- Engine interface --------------------------------------------------
 
     def generate(self, dest, prompt, grid, seed, lyrics="", vocal_language="en",
-                 src_audio=None, report=None, quality=None):
+                 src_audio=None, report=None, quality=None, cover=None):
+        """Generate, or cover `src_audio` when one is given.
+
+        `cover` carries the conditioning strengths for the cover case --
+        audio_cover_strength and cover_noise_strength. Left out, ACE-Step uses
+        its own defaults (1.0 / 0.0), the maximally faithful corner, which is
+        what every cover did before there was a way to ask for anything else.
+        """
         params = {
             **self._grid_params(grid),
             **self._quality_params(quality),
@@ -508,6 +515,8 @@ class AceStepEngine:
             "vocal_language": vocal_language,
             **_seed_params(seed),
         }
+        if src_audio and cover:
+            params.update(cover)
         return self._run(params, dest, src_audio, report)
 
     def layer(self, dest, track_class, src_audio, prompt, grid, seed,
