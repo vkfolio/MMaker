@@ -155,5 +155,46 @@ else
   done
 fi
 
-log "starting musicmaker on :${PORT}"
-exec python -m uvicorn app.main:app --host 0.0.0.0 --port "$PORT"
+# Supervise rather than exec.
+#
+# `exec` made uvicorn the container's own process, so stopping it to pick up
+# new code stopped the pod -- deploying a one-line server change meant a
+# console restart and a cold model load. Under this loop, `pkill -f uvicorn`
+# is the whole deploy: the server comes back on the new code, ACE-Step keeps
+# its weights resident, and the container never notices.
+#
+# MUSICMAKER_NO_SUPERVISE=1 restores the old behaviour for anything that
+# expects the process to be the container.
+if [ "${MUSICMAKER_NO_SUPERVISE:-0}" = "1" ]; then
+  log "starting musicmaker on :${PORT} (unsupervised)"
+  exec python -m uvicorn app.main:app --host 0.0.0.0 --port "$PORT"
+fi
+
+log "starting musicmaker on :${PORT} (supervised; pkill -f uvicorn to redeploy)"
+STOP_FILE="${MUSICMAKER_STOP_FILE:-/workspace/.musicmaker-stop}"
+rm -f "$STOP_FILE"
+fails=0
+while true; do
+  start_ts=$(date +%s)
+  python -m uvicorn app.main:app --host 0.0.0.0 --port "$PORT" || true
+  code=$?
+  [ -f "$STOP_FILE" ] && { log "stop file present -- not restarting"; break; }
+
+  # A run that lasted a while was a deploy or a kill; one that died instantly
+  # is a crash loop, and restarting it as fast as possible helps nobody.
+  if [ $(( $(date +%s) - start_ts )) -lt 10 ]; then
+    fails=$((fails + 1))
+    if [ "$fails" -ge 5 ]; then
+      log "musicmaker exited immediately $fails times (last code $code) -- giving up"
+      break
+    fi
+    log "musicmaker exited after less than 10s (code $code); retry $fails in 5s"
+    sleep 5
+  else
+    fails=0
+    log "musicmaker exited (code $code) -- restarting on current code"
+    # Pick up whatever was pulled while it was down, so a redeploy is just a
+    # git pull followed by a pkill.
+    sleep 1
+  fi
+done
