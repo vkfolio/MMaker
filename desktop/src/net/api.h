@@ -153,7 +153,8 @@ public:
     Generated generate(const std::string& prompt, const std::string& lyrics,
                        int bars, const std::string& quality,
                        bool instrumental, double bpm,
-                       const std::string& idempotency_key = {});
+                       const std::string& idempotency_key = {},
+                       bool thinking = false);
 
     /// Separate a rendered take into stems, so each part is editable.
     ///

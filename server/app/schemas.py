@@ -110,6 +110,11 @@ class Project(BaseModel):
     title: str = "Untitled"
     instrumental: bool = False
     quality: Literal["fast", "high", "ultra"] = "high"
+    # ACE-Step's chain-of-thought caption rewriting. Off by default: it helps a
+    # thin caption and constrains a good one -- their own docs warn the LM
+    # generalises captions less well than the DiT -- so it is a thing to try
+    # rather than a thing to assume.
+    thinking: bool = False
     grid: Grid = Field(default_factory=Grid)
     idea_kind: IdeaKind = "prompt"
     prompt: str = ""
@@ -155,6 +160,11 @@ class CreateProject(BaseModel):
     # ACE-Step sings by default; instrumental is the deliberate choice.
     instrumental: bool = False
     quality: Literal["fast", "high", "ultra"] = "high"
+    # ACE-Step's chain-of-thought caption rewriting. Off by default: it helps a
+    # thin caption and constrains a good one -- their own docs warn the LM
+    # generalises captions less well than the DiT -- so it is a thing to try
+    # rather than a thing to assume.
+    thinking: bool = False
     vocal_language: str = "en"
     bpm: int | None = None
     key_scale: str | None = None

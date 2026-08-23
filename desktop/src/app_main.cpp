@@ -507,6 +507,12 @@ struct Studio {
     std::string           gen_prompt = "warm indie soul, brushed drums, rhodes";
     std::string           gen_lyrics;
     std::string           gen_quality = "ultra";
+    /// ACE-Step's chain-of-thought caption rewriting.
+    ///
+    /// Off by default and deliberately so: it expands a thin caption usefully
+    /// and narrows a good one. Now that Inspire Me writes captions worth
+    /// keeping, forcing it on would undo that work.
+    bool                  gen_thinking = false;
     int                   gen_bars = 16;
     bool                  gen_instrumental = false;
     std::string           doc_status;
@@ -1242,13 +1248,14 @@ struct Studio {
         std::thread([url = pod_url, token = pod_token, prompt,
                      lyrics = gen_lyrics, bars = gen_bars, quality = gen_quality,
                      instrumental = gen_instrumental, bpm = session.bpm,
-                     rate = session.rate, platform] {
+                     rate = session.rate, thinking = gen_thinking, platform] {
             WorkerScope scope;
             mx::net::ApiClient api;
             api.set_base(url);
             api.set_token(token);
 
-            auto made = api.generate(prompt, lyrics, bars, quality, instrumental, bpm);
+            auto made = api.generate(prompt, lyrics, bars, quality, instrumental, bpm,
+                                     {}, thinking);
             if (!made.ok) {
                 g_inbox.push(MsgStatus{"generate refused: " + api.last_error(), true});
                 wake_ui(platform);
@@ -3374,7 +3381,23 @@ vik::AnyElement Studio::generate_modal(vik::Context<Studio>& cx) {
                     .child(vik::text("quality").text_xs().text_color(vik::rgb(0x6c7383)))
                     .child(quality_chip(cx, "fast", gen_quality == "fast"))
                     .child(quality_chip(cx, "high", gen_quality == "high"))
-                    .child(quality_chip(cx, "ultra", gen_quality == "ultra")))
+                    .child(quality_chip(cx, "ultra", gen_quality == "ultra"))
+                    // Chain-of-thought caption rewriting, off by default. It
+                    // expands a thin caption and narrows a good one, so it is
+                    // worth A/B-ing rather than assuming either way.
+                    .child(vik::div().id("g-think").px_3().py_1().rounded_md()
+                        .cursor_pointer()
+                        .bg(vik::rgb(gen_thinking ? 0x3a4a68 : 0x2c313d))
+                        .tooltip(gen_thinking
+                                     ? "The engine will rewrite your caption first"
+                                     : "Let the engine expand a thin caption (CoT)")
+                        .on_click(cx.listener([](Studio& s, const vik::ClickEvent&,
+                                                 vik::Window&, vik::Context<Studio>& c) {
+                            s.gen_thinking = !s.gen_thinking;
+                            c.notify();
+                        }))
+                        .child(vik::text("rewrite").text_color(
+                            vik::rgb(gen_thinking ? 0xffffff : 0x8d94a3)))))
                 .child(vik::div().flex_row().gap_2().items_center()
                     .child(vik::text("length").text_xs().text_color(vik::rgb(0x6c7383)))
                     .child(chip("8 bars", gen_bars == 8,

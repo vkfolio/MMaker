@@ -511,7 +511,8 @@ class AceStepEngine:
     # -- Engine interface --------------------------------------------------
 
     def generate(self, dest, prompt, grid, seed, lyrics="", vocal_language="en",
-                 src_audio=None, report=None, quality=None, cover=None):
+                 src_audio=None, report=None, quality=None, cover=None,
+                 thinking=False):
         """Generate, or cover `src_audio` when one is given.
 
         `cover` carries the conditioning strengths for the cover case --
@@ -530,10 +531,16 @@ class AceStepEngine:
         }
         if src_audio and cover:
             params.update(cover)
+        # Chain-of-thought caption rewriting. Off unless asked for: it expands
+        # a thin caption usefully and narrows a good one, and ACE-Step's own
+        # docs say the LM generalises captions less well than the DiT.
+        if thinking:
+            params["thinking"] = True
         return self._run(params, dest, src_audio, report)
 
     def layer(self, dest, track_class, src_audio, prompt, grid, seed,
-              lyrics="", vocal_language="en", report=None, quality=None):
+              lyrics="", vocal_language="en", report=None, quality=None,
+              thinking=False):
         params = {
             **self._grid_params(grid),
             **self._quality_params(quality),
@@ -544,10 +551,13 @@ class AceStepEngine:
             "vocal_language": vocal_language,
             **_seed_params(seed),
         }
+        if thinking:
+            params["thinking"] = True
         return self._run(params, dest, src_audio, report)
 
     def repaint(self, dest, src_audio, start_s, end_s, prompt, grid, seed,
-                report=None, quality=None, strength=None, mode=None):
+                report=None, quality=None, strength=None, mode=None,
+                thinking=False):
         """Regenerate a range, conditioned on the surrounding audio.
 
         This -- not `cover` -- is what produces a genuine variation on the
@@ -571,7 +581,7 @@ class AceStepEngine:
         return self._run(params, dest, src_audio, report)
 
     def extend(self, dest, src_audio, added_s, prompt, grid, seed, report=None,
-               quality=None):
+               quality=None, thinking=False):
         params = {
             **self._grid_params(grid),
             **self._quality_params(quality),

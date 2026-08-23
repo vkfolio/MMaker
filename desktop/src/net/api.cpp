@@ -121,7 +121,8 @@ ApiClient::Generated ApiClient::generate(const std::string& prompt,
                                          const std::string& lyrics, int bars,
                                          const std::string& quality,
                                          bool instrumental, double bpm,
-                                         const std::string& idempotency_key) {
+                                         const std::string& idempotency_key,
+                                         bool thinking) {
     Generated out;
     json body;
     body["title"] = "scratch";
@@ -130,6 +131,7 @@ ApiClient::Generated ApiClient::generate(const std::string& prompt,
     body["variations"] = 1;          // one take; more is the pod doing work we discard
     body["quality"] = quality;
     body["instrumental"] = instrumental;
+    body["thinking"] = thinking;
     if (bpm > 0) body["bpm"] = static_cast<int>(bpm);
     // An empty lyrics field means instrumental regardless of the flag, so it is
     // only sent when there is something to sing.

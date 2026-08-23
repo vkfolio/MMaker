@@ -101,14 +101,16 @@ class StubEngine:
     name = "stub"
 
     def generate(self, dest, prompt, grid, seed, lyrics="", vocal_language="en",
-                 src_audio=None, report=None, quality=None, cover=None):
+                 src_audio=None, report=None, quality=None, cover=None,
+                 thinking=False):
         # `cover` is the real engine's conditioning strength. There is nothing
         # to condition on here, but the signature has to match or stub mode
         # stops being a drop-in replacement -- which is its whole purpose.
         return audio.write(dest, _render("mix", grid, seed, grid.duration_s), SR)
 
     def layer(self, dest, track_class, src_audio, prompt, grid, seed,
-              lyrics="", vocal_language="en", report=None, quality=None):
+              lyrics="", vocal_language="en", report=None, quality=None,
+              thinking=False):
         # Returns the new part alone -- the behaviour we hope ACE-Step has, and
         # which research/lego_chain.py exists to confirm on a real pod.
         base, sr = audio.load(src_audio)
@@ -116,7 +118,8 @@ class StubEngine:
         return audio.write(dest, _render(track_class, grid, seed, duration), SR)
 
     def repaint(self, dest, src_audio, start_s, end_s, prompt, grid, seed,
-                report=None, quality=None, strength=None, mode=None):
+                report=None, quality=None, strength=None, mode=None,
+                thinking=False):
         data, sr = audio.load(src_audio)
         fresh = _render("mix", grid, seed, max(end_s - start_s, 0.01))
         i0 = int(start_s * sr)
@@ -140,7 +143,7 @@ class StubEngine:
         return audio.write(dest, out, sr)
 
     def extend(self, dest, src_audio, added_s, prompt, grid, seed,
-               report=None, quality=None):
+               report=None, quality=None, thinking=False):
         data, sr = audio.load(src_audio)
         tail = _render("mix", grid, seed, added_s)
         if tail.shape[1] != data.shape[1]:

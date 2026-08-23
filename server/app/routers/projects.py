@@ -57,6 +57,7 @@ def create_project(body: CreateProject,
         lyrics=body.lyrics,
         instrumental=body.instrumental,
         quality=body.quality,
+        thinking=body.thinking,
         vocal_language=body.vocal_language,
         idea_kind="prompt",
     )

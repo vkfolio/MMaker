@@ -38,7 +38,9 @@ def _seed(explicit: int | None = None) -> int:
 
 def _quality(project: Project) -> dict:
     """Only the real engine takes a quality tier; the stub has no such notion."""
-    return {"quality": project.quality} if engines.music().name == "acestep" else {}
+    if engines.music().name != "acestep":
+        return {}
+    return {"quality": project.quality, "thinking": project.thinking}
 
 
 def _engine_meta() -> dict:
