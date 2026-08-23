@@ -26,6 +26,7 @@
 #include <numbers>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "audio/device.h"
@@ -46,6 +47,7 @@
 #include "vikui/elements/canvas.h"
 #include "components/menu.h"
 #include "components/phosphor.h"
+#include "components/dropzone.h"
 #include "components/text_input.h"
 
 #include "ai/sidecar.h"
@@ -268,6 +270,13 @@ struct Studio {
     enum class ClipGrab { Move, TrimStart, TrimEnd };
     ClipGrab   clip_grab    = ClipGrab::Move;
     bool       drag_changed = false;   // has this drag actually moved anything
+    /// Last pointer position, in window coordinates.
+    ///
+    /// A file drop reports its own position to the element, but the handler
+    /// signature does not carry it, and dropping every take at bar 1 makes the
+    /// timeline a list. The pointer has been over the drop point for as long as
+    /// the drag lasted, so this is that position.
+    float      last_pointer_x = 0.0f;
     bool       scrubbing    = false;
 
     double last_paint_ms  = 0.0;
@@ -1027,6 +1036,77 @@ struct Studio {
 
     mx::Clip clipboard{};
     bool     has_clipboard = false;
+
+    /// Where a dropped file should land once it has finished decoding.
+    ///
+    /// Decoding happens on a worker, so the clip cannot be made at drop time --
+    /// its length is the decoded length, which nobody knows yet. Placement is
+    /// remembered here instead of guessed from list positions, which is how the
+    /// original loader paired sources with tracks and is wrong the moment
+    /// anything is imported out of order.
+    struct Placement { mx::TrackId track; int64_t start_frame; };
+    std::unordered_map<mx::SourceId, Placement> pending_import;
+
+    static bool is_audio_file(const std::filesystem::path& p) {
+        std::string ext = p.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        return ext == ".wav" || ext == ".mp3" || ext == ".flac" || ext == ".ogg" ||
+               ext == ".m4a" || ext == ".aiff" || ext == ".aif";
+    }
+
+    static bool is_midi_file(const std::filesystem::path& p) {
+        std::string ext = p.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        return ext == ".mid" || ext == ".midi";
+    }
+
+    /// Import dropped files, each onto its own new track, starting where they
+    /// were dropped.
+    void import_files(const std::vector<std::string>& paths, float window_x,
+                      vik::App& app) {
+        static const uint32_t colors[] = {0xff4f8ef7, 0xffe0813c, 0xff56c08a,
+                                          0xffc169d6, 0xffe05c72, 0xff40b8c4,
+                                          0xffd9b23c, 0xff7f8cf0};
+        // Snap to the bar the pointer is over. A drop is a coarse gesture, and
+        // a take that lands 30 ms before the downbeat is worse than one that
+        // lands on it.
+        const int64_t fpb = std::max<int64_t>(1, session.frames_per_bar());
+        int64_t at = view.frame_at(local_x(window_x));
+        at = std::max<int64_t>(0, (at + fpb / 2) / fpb * fpb);
+
+        int accepted = 0, skipped = 0;
+        std::string why;
+        for (const auto& raw : paths) {
+            const std::filesystem::path path{raw};
+            if (is_midi_file(path)) {
+                ++skipped;
+                why = "MIDI import needs the engine's soundfont, which is not "
+                      "installed here yet";
+                continue;
+            }
+            if (!is_audio_file(path)) {
+                ++skipped;
+                if (why.empty()) why = path.filename().string() + " is not audio";
+                continue;
+            }
+            if (accepted == 0) push_undo("import");
+
+            const std::string name = path.stem().string();
+            auto& track = session.add_track(
+                name, colors[session.tracks.size() % std::size(colors)]);
+            auto& src = session.add_source(path, name);
+            pending_import[src.id] = Placement{track.id, at};
+            spawn_decode(src.id, path, app);
+            ++accepted;
+        }
+
+        if (accepted) {
+            fitted = false;   // a first import should frame itself
+            after_edit(std::format("importing {} file{}…", accepted,
+                                   accepted == 1 ? "" : "s"));
+        }
+        if (skipped) doc_status = why;
+    }
 
     void mark_dirty() { dirty = true; }
 
@@ -1987,12 +2067,23 @@ struct Studio {
                     src->source_rate = m.media.source_rate;
 
                     mx::TrackId track = 0;
-                    for (size_t i = 0; i < session.sources.size(); ++i)
-                        if (session.sources[i].id == m.source_id &&
-                            i < session.tracks.size())
-                            track = session.tracks[i].id;
+                    int64_t start = 0;
+                    // An import said where it belongs. Everything else falls
+                    // back to pairing by list position, which only holds while
+                    // sources and tracks are added together and in order.
+                    if (auto it = pending_import.find(m.source_id);
+                        it != pending_import.end()) {
+                        track = it->second.track;
+                        start = it->second.start_frame;
+                        pending_import.erase(it);
+                    } else {
+                        for (size_t i = 0; i < session.sources.size(); ++i)
+                            if (session.sources[i].id == m.source_id &&
+                                i < session.tracks.size())
+                                track = session.tracks[i].id;
+                    }
                     if (track) {
-                        auto& clip = session.add_clip(track, src->id, 0,
+                        auto& clip = session.add_clip(track, src->id, start,
                                                       src->buffer->frames);
                         clip.name = src->label;
                         clip.fade_in = clip.fade_out = session.rate / 200;
@@ -3950,8 +4041,29 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                         [](Studio&, const vik::ClickEvent&, vik::Window&,
                            vik::Context<Studio>&) {})));
 
+    // Files dropped anywhere on the timeline. An invisible fill target rather
+    // than a visible dropzone: the arrangement is the drop surface, and a
+    // dashed box over it would be chrome that is wrong ninety-nine percent of
+    // the time. It still lights up while a drag hovers.
+    // `this->self`, not `self`: render() shadows the member with a raw Studio*
+    // for the canvas closures, and capturing that into a handler that outlives
+    // the frame is exactly the dangling pointer the handle exists to prevent.
+    auto drop_handle = this->self;
+    auto drop_target = vik::ui::file_drop_target(
+        [drop_handle](const std::vector<std::string>& paths, vik::Window&,
+                      vik::App& app) {
+            app.update_entity(drop_handle, [&paths](Studio& s,
+                                                    vik::Context<Studio>& c) {
+                // Dropped at the pointer: the handler is not told where, and
+                // dropping every take at bar 1 would make the timeline a list.
+                s.import_files(paths, s.last_pointer_x, c.app());
+                c.notify();
+            });
+        });
+
     auto timeline =
         vik::div().flex_1().relative().overflow_hidden()
+            .child(std::move(drop_target))
             .child(std::move(surface))
             .child(std::move(job_strip))
             .child(std::move(dock))
@@ -4040,6 +4152,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             .capture_mouse_move(cx.listener(
                 [](Studio& s, const vik::MouseMoveEvent& e, vik::Window&,
                    vik::Context<Studio>& c) {
+                    s.last_pointer_x = e.position.x;
                     if (s.panning) {
                         // Drag the content with the pointer, so the surface
                         // follows the hand rather than opposing it.
