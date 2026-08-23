@@ -652,7 +652,7 @@ struct Studio {
         if (document_path.empty()) {
             std::string name = session.title.empty() ? "Untitled" : session.title;
             for (char& c : name)
-                if (std::strchr("\/:*?\"<>|", c)) c = '_';
+                if (std::strchr("\\/:*?\"<>|", c)) c = '_';
             document_path = mx::documents_root() / (name + ".mmproj");
         }
         std::string error;
@@ -1486,7 +1486,7 @@ struct Studio {
         std::filesystem::create_directories(dir, ec);
         std::string name = session.title.empty() ? "mix" : session.title;
         for (char& c : name)
-            if (std::strchr("\/:*?\"<>|", c)) c = '_';
+            if (std::strchr("\\/:*?\"<>|", c)) c = '_';
         const auto out = dir / (name + ".wav");
 
         const auto result = mx::bounce(session, out);
@@ -2429,7 +2429,8 @@ vik::ui::MenuBuilder Studio::ai_tools_menu(vik::Context<Studio>&) {
     const bool connected = !open_project_id.empty() && !net_busy;
     const bool ranged = connected && selection.active();
 
-    auto entry = [&menu, handle = self](const char* label, bool enabled, Tool which) {
+    auto entry = [&menu, handle = self](const std::string& label, bool enabled,
+                                       Tool which) {
         if (!enabled) {
             menu.disabled_item(label);
             return;
@@ -2442,15 +2443,35 @@ vik::ui::MenuBuilder Studio::ai_tools_menu(vik::Context<Studio>&) {
         });
     };
 
+    // Whether the connected engine implements the task each tool needs.
+    //
+    // A turbo checkpoint -- the ordinary laptop install -- carries four of
+    // ACE-Step's seven tasks, and `lego` and `complete` are not among them.
+    // Both were previously offered and failed well into the render, which
+    // reads as a broken feature rather than an absent model. Note that Inspire
+    // Me is a lego call too (service.vary_stem generates the stem against a
+    // mixdown of the others), so it is gated with Add a Layer, not with the
+    // region tools.
+    const bool can_lego = caps.can("lego");
+    const bool can_complete = caps.can("complete");
+
+    // The reason travels in the label. MenuBuilder's disabled items carry no
+    // tooltip, and "greyed out with no explanation" is the thing this whole
+    // pass exists to stop.
+    auto needs = [](const char* label, bool ok) {
+        return ok ? std::string(label)
+                  : std::string(label) + "  (needs a full checkpoint)";
+    };
+
     // Ordered as in the reference, and disabled with a reason rather than
     // hidden: a menu that changes shape with state is harder to learn than one
     // where an item explains why it cannot run.
-    entry("Inspire Me", ranged, Tool::Inspire);
-    entry("Add a Layer", connected, Tool::Layer);
+    entry(needs("Inspire Me", can_lego), ranged && can_lego, Tool::Inspire);
+    entry(needs("Add a Layer", can_lego), connected && can_lego, Tool::Layer);
     entry("Music Enhancer", ranged, Tool::Enhance);
     entry("Voice Changer", ranged, Tool::Voice);
     entry("Stem Splitter", connected, Tool::Splitter);
-    entry("Extend", ranged, Tool::Extend);
+    entry(needs("Extend", can_complete), ranged && can_complete, Tool::Extend);
     menu.separator();
     menu.disabled_item("Vocal to MIDI");        // no endpoint for it yet
     return menu;
@@ -2906,8 +2927,11 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             .child(dock_tool("t-layer", "stack-plus",
                         open_project_id.empty()
                             ? "Import a pod project first"
-                            : "Add a layer  (L)",
-                        !open_project_id.empty() && !net_busy,
+                            : !caps.can("lego")
+                                ? "This engine cannot add layers -- a turbo "
+                                  "checkpoint has no 'lego' task"
+                                : "Add a layer  (L)",
+                        !open_project_id.empty() && !net_busy && caps.can("lego"),
                         [](Studio& s, const vik::ClickEvent&, vik::Window&,
                            vik::Context<Studio>& c) {
                             s.show_layers = true;
@@ -3304,7 +3328,8 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 else if (e.key == "e") s.export_mix();
                 else if (e.key == "g" && !s.pod_url.empty())
                     s.show_generate = !s.show_generate;
-                else if (e.key == "l" && !s.open_project_id.empty())
+                else if (e.key == "l" && !s.open_project_id.empty() &&
+                         s.caps.can("lego"))
                     s.show_layers = !s.show_layers;
                 else if (e.key == "escape") s.selection.clear();
                 else if (e.key == "home") s.seek(0);
@@ -3458,6 +3483,23 @@ int connect_probe(const std::string& url, const std::string& token,
     std::printf("status      : %s%s  gpu=%s\n", health.status.c_str(),
                 health.auth_required ? "  (token required)" : "",
                 health.gpu.empty() ? "none" : health.gpu.c_str());
+
+    // What the engine can actually be asked to do. A turbo checkpoint carries
+    // four of ACE-Step's seven tasks, so this is the line that says whether Add
+    // a Layer, Inspire Me and Extend are available at all on this engine.
+    const auto caps = api.capabilities();
+    if (caps.known) {
+        std::string tasks;
+        for (const auto& t : caps.tasks) tasks += (tasks.empty() ? "" : " ") + t;
+        std::printf("tasks       : %s\n",
+                    tasks.empty() ? "(none reported)" : tasks.c_str());
+        std::printf("  layer/inspire (lego) : %s\n", caps.can("lego") ? "yes" : "NO");
+        std::printf("  extend (complete)    : %s\n", caps.can("complete") ? "yes" : "NO");
+        std::printf("  repaint              : %s\n", caps.can("repaint") ? "yes" : "NO");
+        std::printf("  cover (variations)   : %s\n", caps.can("cover") ? "yes" : "NO");
+    } else {
+        std::printf("tasks       : engine does not report them\n");
+    }
 
     const auto list = api.projects();
     std::printf("projects    : %zu\n", list.size());

@@ -74,6 +74,19 @@ MODEL_SETTINGS = {
     "acestep-v15-base":     {"inference_steps": 50, "guidance_scale": 7.0},
 }
 
+# Which task types each kind of checkpoint implements.
+#
+# Mirrors acestep/constants.py TASK_TYPES_TURBO / TASK_TYPES_BASE. A turbo
+# checkpoint is distilled and implements only four of the seven tasks, so
+# `lego` (add a layer), `complete` (extend) and `extract` are unavailable on a
+# pod that carries turbo alone -- which is the ordinary laptop install.
+#
+# Getting this wrong is not a soft failure. Asking turbo for `lego` is accepted
+# by the HTTP API and fails deep in the render, minutes later, which reads as a
+# broken feature rather than an absent one.
+TASKS_TURBO = ("text2music", "repaint", "cover", "cover-nofsq")
+TASKS_BASE = TASKS_TURBO + ("extract", "lego", "complete")
+
 # Best first. A tier whose checkpoint is absent resolves to the best one that
 # is present, and takes that model's settings with it.
 MODEL_PREFERENCE = ("acestep-v15-xl-base", "acestep-v15-xl-turbo", "acestep-v15-turbo")
@@ -358,7 +371,36 @@ class AceStepEngine:
         return wanted
 
     @staticmethod
-    def installed_models() -> list[str]:
+    def checkpoint_root() -> str:
+        root = os.environ.get("ACESTEP_CHECKPOINT_DIR")
+        if not root:
+            base = os.environ.get("ACESTEP_DIR", "/workspace/ACE-Step-1.5")
+            root = os.path.join(base, "checkpoints")
+        return root
+
+    @classmethod
+    def model_tasks(cls, model: str) -> list[str]:
+        """The task types one checkpoint implements.
+
+        Read from the checkpoint's own config.json, the same way ACE-Step
+        decides it (`is_turbo`). Guessing from the model name would be wrong
+        for any checkpoint not in our table, and a wrong guess here is what
+        turns "this pod cannot do that" into a render that fails minutes in.
+
+        An unreadable config is reported as turbo -- the smaller claim. Over-
+        claiming offers a button that fails; under-claiming disables one that
+        might have worked, and says why.
+        """
+        path = os.path.join(cls.checkpoint_root(), model, "config.json")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                is_turbo = bool(json.load(handle).get("is_turbo", False))
+        except (OSError, ValueError):
+            return list(TASKS_TURBO)
+        return list(TASKS_TURBO if is_turbo else TASKS_BASE)
+
+    @classmethod
+    def installed_models(cls) -> list[str]:
         """Checkpoints actually on disk.
 
         ACE-Step runs in this container, so its checkpoint directory is readable
@@ -366,10 +408,7 @@ class AceStepEngine:
         list is only what has been lazily *loaded* and is empty until the first
         render.
         """
-        root = os.environ.get("ACESTEP_CHECKPOINT_DIR")
-        if not root:
-            base = os.environ.get("ACESTEP_DIR", "/workspace/ACE-Step-1.5")
-            root = os.path.join(base, "checkpoints")
+        root = cls.checkpoint_root()
         try:
             # Skip dot-directories: .cache sits alongside the checkpoints and
             # is not one, and listing it invites someone to read it as a model.
@@ -432,8 +471,29 @@ class AceStepEngine:
         return params
 
     def _run(self, params, dest, src_audio=None, report=None):
+        self._require_task(params)
         task_id = self._submit(params, src_audio)
         return self._await(task_id, dest, report)
+
+    def _require_task(self, params) -> None:
+        """Refuse a task this checkpoint does not implement, before submitting.
+
+        ACE-Step's HTTP API accepts any task name and only discovers the model
+        cannot do it well into the render, so the failure arrives minutes late
+        and looks like a broken feature. Checking here turns that into an
+        immediate, readable refusal naming the checkpoint that would be used.
+        """
+        task = params.get("task_type")
+        model = params.get("model")
+        if not task or not model:
+            return
+        supported = self.model_tasks(model)
+        if task in supported:
+            return
+        raise NotSupported(
+            f"{model} does not implement '{task}' -- it is a distilled turbo "
+            f"checkpoint, which implements {', '.join(supported)}. "
+            f"Install acestep-v15-xl-base, or run this on a pod that has it.")
 
     # -- Engine interface --------------------------------------------------
 
@@ -518,14 +578,22 @@ class AceStepEngine:
         suspiciously equal render times.
         """
         installed = self.installed_models()
+        effective = {k: self._resolve_model(v["model"], installed)
+                     for k, v in QUALITY.items()}
+        tasks_by_tier = {k: self.model_tasks(m) for k, m in effective.items()}
+        tasks_union = {t for tasks in tasks_by_tier.values() for t in tasks}
         info: dict = {"requested_tiers": {k: v["model"] for k, v in QUALITY.items()},
                       # What is on disk, which is the answer to "can this pod
                       # render that tier". /v1/models only reports what has been
                       # loaded, and is empty until something renders.
                       "installed": installed,
-                      "effective_tiers": {
-                          k: self._resolve_model(v["model"], installed)
-                          for k, v in QUALITY.items()},
+                      "effective_tiers": effective,
+                      # What this pod can actually be asked to do. The union
+                      # across tiers, because the client picks a tier per
+                      # render: a task is offerable if any installed checkpoint
+                      # implements it.
+                      "tasks": sorted(tasks_union),
+                      "tasks_by_tier": tasks_by_tier,
                       "last_render": dict(self.last_meta)}
         for path in ("/v1/models", "/models"):
             try:

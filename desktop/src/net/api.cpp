@@ -303,6 +303,9 @@ Capabilities ApiClient::capabilities() {
         for (auto item = it->begin(); item != it->end(); ++item)
             if (item.value().is_string())
                 caps.effective.emplace_back(item.key(), item.value().get<std::string>());
+    if (auto it = body->find("tasks"); it != body->end() && it->is_array())
+        for (const auto& name : *it)
+            if (name.is_string()) caps.tasks.push_back(name.get<std::string>());
     if (auto it = body->find("tiers_that_would_fall_back");
         it != body->end() && it->is_object())
         for (auto item = it->begin(); item != it->end(); ++item)

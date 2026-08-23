@@ -35,11 +35,28 @@ struct Capabilities {
     std::vector<std::pair<std::string, std::string>> effective;
     /// Tiers that would quietly render as something else.
     std::vector<std::string> falls_back;
+    /// ACE-Step task types any installed checkpoint implements -- "cover",
+    /// "repaint", "lego", "complete", "extract". A turbo checkpoint carries
+    /// only the first three of the seven, so on an ordinary laptop install
+    /// Add a Layer and Extend are genuinely unavailable rather than slow.
+    std::vector<std::string> tasks;
 
     bool tier_is_real(const std::string& tier) const {
         for (const auto& name : falls_back)
             if (name == tier) return false;
         return true;
+    }
+
+    /// Whether the engine can be asked to do this at all.
+    ///
+    /// Unknown capabilities answer yes: before the first probe the app must not
+    /// grey out everything, and an older engine that does not report tasks was
+    /// working before this field existed.
+    bool can(const std::string& task) const {
+        if (!known || tasks.empty()) return true;
+        for (const auto& name : tasks)
+            if (name == task) return true;
+        return false;
     }
 };
 
