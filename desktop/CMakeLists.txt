@@ -50,6 +50,7 @@ add_executable(musicx
     src/media/peaks.cpp
     src/ui/arrangement.cpp
     src/ui/pianoroll.cpp
+    src/audio/midi_in.cpp
     src/audio/recorder.cpp
     src/ai/sidecar.cpp
     src/miniaudio_impl.c

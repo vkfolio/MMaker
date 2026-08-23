@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "audio/device.h"
+#include "audio/midi_in.h"
 #include "audio/recorder.h"
 #include "audio/mixer.h"
 #include "media/bounce.h"
@@ -351,6 +352,11 @@ struct Studio {
     float piano_local_y(float wy) const { return wy - piano_y; }
 
     void open_editor(mx::ClipId clip_id) {
+        // The keyboard is opened here rather than at startup: it is only
+        // meaningful with a score on screen, and holding an input device open
+        // for a session that never edits notes takes it from whatever else
+        // wanted it.
+        ensure_midi();
         editing_clip = clip_id;
         piano_selected = -1;
         lyric_editing = -1;
@@ -1211,6 +1217,73 @@ struct Studio {
             : std::format("take recorded ({:.1f}s)",
                           static_cast<double>(frames) / session.rate);
         after_edit(doc_status);
+    }
+
+    // --- MIDI input ---------------------------------------------------------
+    //
+    // Played notes land in the open score. Only there: with no note editor open
+    // there is nothing a pitch could mean, and inventing a target -- a new
+    // track, the selected clip -- would be a guess made silently on every
+    // keypress.
+
+    mx::MidiIn  midi;
+    bool        midi_tried = false;      // opened once; absence is not an error
+    /// Pitches currently held, and the frame each was struck at. A note is only
+    /// written when it is released, because its length is not known until then.
+    std::unordered_map<uint8_t, int64_t> midi_held;
+
+    void ensure_midi() {
+        if (midi_tried) return;
+        midi_tried = true;
+        if (!midi.open()) return;        // no keyboard is the normal case
+        doc_status = "MIDI: " + midi.name();
+    }
+
+    /// Drain the keyboard into the open score. Called from the UI tick.
+    bool pump_midi() {
+        if (!midi.listening()) return false;
+        mx::Score* score = editing_score();
+        const mx::Clip* clip = session.find_clip(editing_clip);
+        auto events = midi.drain();
+        if (events.empty()) return false;
+        if (!score || !clip) {
+            // Keys pressed with no editor open are dropped, but the held set
+            // must not keep stale pitches or the next opened score inherits
+            // notes that started before it existed.
+            midi_held.clear();
+            return false;
+        }
+
+        const int64_t sixteenth = std::max<int64_t>(1, session.frames_per_bar() / 16);
+        bool changed = false;
+        for (const auto& e : events) {
+            // Clip-relative, because a Note's start is relative to its clip.
+            const int64_t now = std::max<int64_t>(0, playhead() - clip->start_frame);
+            if (e.on) {
+                midi_held[e.pitch] = snap_frames(now);
+                continue;
+            }
+            auto held = midi_held.find(e.pitch);
+            if (held == midi_held.end()) continue;   // released without a press
+            const int64_t start = held->second;
+            midi_held.erase(held);
+
+            if (!changed) push_undo("play");
+            mx::Note n;
+            n.pitch = e.pitch;
+            n.start = start;
+            // A note held for less than a sixteenth is still a note; rounding
+            // it to nothing would make fast playing vanish.
+            n.length = std::max(sixteenth, snap_frames(now) - start);
+            score->notes.push_back(n);
+            piano_selected = static_cast<int>(score->notes.size()) - 1;
+            changed = true;
+        }
+        if (changed) {
+            dirty = true;
+            doc_status = std::format("{} notes", score->notes.size());
+        }
+        return changed;
     }
 
     void mark_dirty() { dirty = true; }
@@ -5040,7 +5113,7 @@ int main(int argc, char** argv) {
                 // sleep rather than spinning at 60 Hz forever.
                 app.set_interval(std::chrono::milliseconds(16), [handle](vik::App& a) {
                     a.update_entity(handle, [](Studio& s, vik::Context<Studio>& c) {
-                        const bool landed = s.pump() | s.pump_ai(c.app());
+                        const bool landed = s.pump() | s.pump_ai(c.app()) | s.pump_midi();
 
                         if (!s.scripted_prompt.empty() && !s.regen_fired &&
                             !s.net_busy) {
