@@ -17,6 +17,18 @@
 set -euo pipefail
 
 TIER="${1:-high}"
+# Prefer a directory that actually holds checkpoints over one that merely
+# exists -- a pod can carry an empty /opt/ACE-Step-1.5 beside a populated
+# /workspace one, and 20 GB fetched into the empty one is invisible to the
+# engine while looking, from the outside, exactly like a successful download.
+if [ -z "${ACESTEP_DIR:-}" ]; then
+    for candidate in /opt/ACE-Step-1.5 /workspace/ACE-Step-1.5 /data/ACE-Step-1.5 "$HOME/ACE-Step-1.5"; do
+        if [ -n "$(ls -A "$candidate/checkpoints" 2>/dev/null)" ]; then
+            ACESTEP_DIR="$candidate"
+            break
+        fi
+    done
+fi
 ACESTEP_DIR="${ACESTEP_DIR:-/opt/ACE-Step-1.5}"
 # ACE-Step loads from its own checkpoints/ directory, and start.sh reads the
 # same place when deciding which model slots to register. A checkpoint

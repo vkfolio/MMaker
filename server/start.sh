@@ -11,12 +11,25 @@ set -euo pipefail
 # in /opt, install.sh puts it on the volume, and a crane-appended image keeps
 # whatever path it was tarred from. Look rather than assume.
 if [ -z "${ACESTEP_DIR:-}" ]; then
-  for candidate in /opt/ACE-Step-1.5 /workspace/ACE-Step-1.5                    "${MUSICMAKER_ROOT:-/workspace}/ACE-Step-1.5"                    /data/ACE-Step-1.5 "$HOME/ACE-Step-1.5"; do
-    if [ -d "$candidate" ]; then
+  CANDIDATES="/opt/ACE-Step-1.5 /workspace/ACE-Step-1.5 ${MUSICMAKER_ROOT:-/workspace}/ACE-Step-1.5 /data/ACE-Step-1.5 $HOME/ACE-Step-1.5"
+  # Two passes: a directory that actually holds checkpoints wins over one that
+  # merely exists. This pod has an empty /opt/ACE-Step-1.5 beside a populated
+  # /workspace one, and taking the first that existed pointed everything --
+  # start.sh and the weight fetcher alike -- at the empty one.
+  for candidate in $CANDIDATES; do
+    if [ -n "$(ls -A "$candidate/checkpoints" 2>/dev/null)" ]; then
       ACESTEP_DIR="$candidate"
       break
     fi
   done
+  if [ -z "${ACESTEP_DIR:-}" ]; then
+    for candidate in $CANDIDATES; do
+      if [ -d "$candidate" ]; then
+        ACESTEP_DIR="$candidate"
+        break
+      fi
+    done
+  fi
 fi
 ACESTEP_DIR="${ACESTEP_DIR:-/opt/ACE-Step-1.5}"
 ACESTEP_PORT="${ACESTEP_PORT:-8001}"
