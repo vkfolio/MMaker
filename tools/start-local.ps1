@@ -100,6 +100,17 @@ if (Running "acestep-api") {
           Where-Object { Test-Path (Join-Path $ckpt $_) } | Select-Object -First 1
     if ($lm) { $env:ACESTEP_LM_MODEL_PATH = $lm }
 
+    # Do not load the language model. It is loaded to CUDA at startup and then
+    # skipped for every task we submit -- the engine log says so itself:
+    # "Skipping LM for task_type='lego' - using DiT directly". It is only used
+    # for chain-of-thought, which needs thinking=true, which we never send.
+    #
+    # On an 8 GB card that dead weight is the difference between a layer render
+    # and no layer render: with it loaded, lego peaked at 9.41 GB, spilled into
+    # Windows shared memory, fell back to a CPU tiled VAE decode and hit the
+    # 30-minute timeout without producing anything.
+    $env:ACESTEP_INIT_LLM = "false"
+
     $exe = Join-Path $c.acestep_dir ".venv\Scripts\acestep-api.exe"
     if (-not (Test-Path $exe)) { throw "acestep-api not found -- rerun install-local.ps1" }
     Start-Process -FilePath $exe `
