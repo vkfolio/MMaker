@@ -1209,25 +1209,22 @@ struct Studio {
 
     bool show_record = false;
 
-    /// The record button opens the panel; it does not start a take.
+    /// Send a take to the engine and bring back what it makes of it.
     ///
-    /// Choosing an input, seeing it move, and only then committing is the
-    /// difference between a take and a blank file discovered later. Once
-    /// rolling, the same button stops -- a modal in the way of stopping would
-    /// be worse than useless.
-    /// Send a local clip's audio to the engine so the AI tools can reach it.
+    /// Upload, confirm the grid, render one variation, place it on a new
+    /// track. The upload on its own was the wrong shape: it left a project on
+    /// the pod, said so, and produced nothing you could hear -- "sent to the
+    /// engine" reads as a request for a result, not for a filing cabinet.
     ///
-    /// The tools act on stems the engine holds; a recorded take or a dropped
-    /// file is something it has never seen. Uploading makes the take the
-    /// project's source audio, which is what ACE-Step's `cover` conditions on
-    /// -- so "hum something and have it played back as a band" is this, then
-    /// variations.
+    /// This is ACE-Step's `cover`: the take becomes the source audio the model
+    /// conditions on, so what comes back is your own performance played as
+    /// whatever the prompt asks for. Measured on this pod, silence in gives
+    /// music out, so it genuinely generates rather than handing the file back.
     ///
-    /// The grid is confirmed from what the engine detected rather than left
-    /// unconfirmed: the server refuses to layer against an unconfirmed grid,
-    /// and a hum has no key the user has told us about anyway. Detection is
-    /// reported in the status line so a wrong guess is visible rather than
-    /// silently baked into everything generated afterwards.
+    /// The grid is confirmed from what the engine detected. A hum has no key
+    /// anyone has declared, and the server refuses to work against an
+    /// unconfirmed one -- but the detection is reported, because a wrong guess
+    /// would otherwise be baked silently into everything built on it.
     void send_take_to_engine(mx::ClipId clip_id, vik::App& app) {
         const mx::Clip* clip = session.find_clip(clip_id);
         if (!clip) { doc_status = "select a clip first"; return; }
@@ -1249,12 +1246,13 @@ struct Studio {
                      path = src->local_path.string(),
                      title = src->label,
                      prompt = gen_prompt,
-                     bars = gen_bars] {
+                     bars = gen_bars,
+                     rate = session.rate] {
             WorkerScope scope;
             mx::net::ApiClient api;
             api.set_base(url);
             api.set_token(token);
-            api.http().set_timeout(600);   // a take is tens of megabytes
+            api.http().set_timeout(900);   // a take is tens of megabytes
 
             const auto up = api.upload_audio(path, title.empty() ? "take" : title,
                                              prompt);
@@ -1264,14 +1262,64 @@ struct Studio {
                 return;
             }
             api.confirm_grid(up.project_id, up.bpm, up.key_scale, bars);
-            g_inbox.push(MsgProjectOpened{up.project_id, title, 
-                                          up.bpm > 0 ? double(up.bpm) : 120.0, bars, 0});
             g_inbox.push(MsgStatus{
                 up.bpm > 0
-                    ? std::format("take uploaded -- detected {} BPM, {}", up.bpm,
+                    ? std::format("uploaded -- {} BPM, {}; rendering…", up.bpm,
                                   up.key_scale.empty() ? "unknown key" : up.key_scale)
-                    : std::string("take uploaded"),
+                    : std::string("uploaded; rendering…"),
                 false});
+            wake_ui(platform);
+
+            auto job = api.variations(up.project_id, 1);
+            if (!job) {
+                g_inbox.push(MsgStatus{"the engine refused: " + api.last_error(), true});
+                wake_ui(platform);
+                return;
+            }
+            g_inbox.push(MsgJob{job->id, "cover", job->status, job->message,
+                                job->queue_position, false});
+            wake_ui(platform);
+
+            auto finished = api.follow(job->id, [&](const mx::net::JobRef& j) {
+                g_inbox.push(MsgJob{j.id, "cover", j.status, j.message,
+                                    j.queue_position, false});
+                wake_ui(platform);
+                return true;
+            });
+            g_inbox.push(MsgJob{finished.id, "cover", finished.status,
+                                finished.message, 0, true});
+            wake_ui(platform);
+            if (finished.status != "done") {
+                g_inbox.push(MsgStatus{"cover " + finished.status +
+                    (finished.error.empty() ? "" : ": " + finished.error),
+                    finished.status != "cancelled"});
+                wake_ui(platform);
+                return;
+            }
+
+            auto detail = api.project(up.project_id);
+            if (!detail || detail->variations.empty()) {
+                g_inbox.push(MsgStatus{"rendered, but no take came back", true});
+                wake_ui(platform);
+                return;
+            }
+            // Adopt the project so the region tools can act on what comes next.
+            g_inbox.push(MsgProjectOpened{up.project_id, title,
+                                          detail->summary.bpm, detail->summary.bars,
+                                          static_cast<int>(detail->stems.size())});
+            wake_ui(platform);
+
+            const auto& take = detail->variations.back();
+            const uint64_t key = mx::net::cache_key(up.project_id, take.id, take.audio);
+            const auto cached = mx::net::cache_path(key);
+            if (std::filesystem::exists(cached) ||
+                api.fetch_audio(up.project_id, take.audio, cached.string())) {
+                mx::Media media = mx::decode_file(cached, rate);
+                if (media.ok())
+                    g_inbox.push(MsgStemArrived{"cover", "", take.id, 0,
+                                                std::move(media), 0.0, false});
+            }
+            g_inbox.push(MsgStatus{"", false});
             wake_ui(platform);
         }).detach();
     }
@@ -4147,7 +4195,7 @@ vik::ui::MenuBuilder Studio::ai_tools_menu(vik::Context<Studio>&) {
         const bool local_audio = src && !src->local_path.empty() && src->stem_id.empty();
         if (local_audio && !pod_url.empty() && !net_busy) {
             auto handle = self;
-            menu.item("Send this take to the engine",
+            menu.item("Reimagine this take with the engine",
                       [handle](vik::Window&, vik::App& app) {
                           app.update_entity(handle, [](Studio& s,
                                                        vik::Context<Studio>& c2) {
@@ -4156,7 +4204,7 @@ vik::ui::MenuBuilder Studio::ai_tools_menu(vik::Context<Studio>&) {
                           });
                       });
         } else if (local_audio) {
-            menu.disabled_item("Send this take to the engine  (not connected)");
+            menu.disabled_item("Reimagine this take  (not connected)");
         }
     }
 
