@@ -169,7 +169,10 @@ class CreateProject(BaseModel):
     bpm: int | None = None
     key_scale: str | None = None
     bars: int = 32
-    variations: int = Field(4, ge=1, le=8)
+    # Zero is allowed and means "just make the project". Rendering a take
+    # nobody asked for, purely so a project can exist to hang a score on, is
+    # a minute of GPU spent on something that gets thrown away.
+    variations: int = Field(4, ge=0, le=8)
 
 
 class ScoreNote(BaseModel):

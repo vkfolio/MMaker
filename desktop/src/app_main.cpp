@@ -2291,28 +2291,154 @@ struct Studio {
         }).detach();
     }
 
-    /// Render the open score to audio.
+    /// General MIDI program for a score, from the instrument it was created as.
     ///
-    /// Not wired to a backend yet: ACE-Step has no score conditioning at all,
-    /// so this needs the separate singing engine rather than another call to
-    /// the one already running. Says so, rather than failing quietly, because
-    /// a button that appears to work and does nothing is worse than one that
-    /// explains itself.
+    /// A small table rather than a picker, for now: the point of S1 is that a
+    /// piano roll makes sound, and choosing between 128 General MIDI patches is
+    /// a panel that can come later without changing anything here.
+    static int gm_program_for(const std::string& voice_id) {
+        if (voice_id == "violin") return 40;
+        if (voice_id == "cello") return 42;
+        if (voice_id == "flute") return 73;
+        if (voice_id == "sax") return 65;
+        if (voice_id == "trumpet") return 56;
+        if (voice_id == "guitar") return 24;
+        if (voice_id == "bass") return 33;
+        if (voice_id == "strings") return 48;
+        return 0;                       // acoustic grand
+    }
+
+    /// Play the open score.
+    ///
+    /// The sampler renders it; with a prompt in the Generate panel the render
+    /// is then reimagined through the engine, which is how a General MIDI patch
+    /// becomes something that sounds played. The result comes back as an
+    /// ordinary stem and lands on the timeline through the same path every
+    /// other rendered audio takes.
     void run_sing(vik::App& app) {
-        (void)app;
         mx::Score* score = editing_score();
-        if (!score || score->notes.empty()) {
+        const mx::Clip* clip = session.find_clip(editing_clip);
+        if (!score || score->notes.empty() || !clip) {
             net_status = "draw some notes first";
             net_error = true;
             return;
         }
-        int with_lyrics = 0;
-        for (const auto& n : score->notes)
-            if (!n.lyric.empty()) ++with_lyrics;
-        net_status = std::format(
-            "singing engine not installed yet -- {} notes, {} with lyrics",
-            score->notes.size(), with_lyrics);
-        net_error = true;
+        if (pod_url.empty()) {
+            net_status = "no engine configured -- set one in Settings";
+            net_error = true;
+            return;
+        }
+        if (net_busy) { net_status = "the engine is busy"; return; }
+
+        // Frames to seconds happens here, at the edge, because a sample rate
+        // belongs to this machine's audio device and not to the music.
+        const double rate = static_cast<double>(session.rate ? session.rate : 48000);
+        std::vector<mx::net::ApiClient::ScoreNote> wire;
+        wire.reserve(score->notes.size());
+        for (const auto& n : score->notes) {
+            mx::net::ApiClient::ScoreNote w;
+            w.start = static_cast<double>(n.start) / rate;
+            w.length = static_cast<double>(n.length) / rate;
+            w.pitch = n.pitch;
+            w.lyric = n.lyric;
+            wire.push_back(std::move(w));
+        }
+
+        net_busy = true;
+        net_error = false;
+        net_status = "playing the score…";
+
+        auto* platform = &app.platform();
+        std::thread([url = pod_url, token = pod_token, platform,
+                     project = open_project_id,
+                     notes = std::move(wire),
+                     bpm = session.bpm,
+                     program = gm_program_for(score->voice_id),
+                     label = score->voice_label.empty() ? std::string("Score")
+                                                        : score->voice_label,
+                     prompt = gen_prompt,
+                     session_rate = session.rate] {
+            WorkerScope scope;
+            mx::net::ApiClient api;
+            api.set_base(url);
+            api.set_token(token);
+
+            // A score needs somewhere to live on the engine. Creating an empty
+            // project rather than generating one costs no GPU.
+            std::string project_id = project;
+            if (project_id.empty()) {
+                project_id = api.create_empty_project("scores");
+                if (project_id.empty()) {
+                    g_inbox.push(MsgStatus{"could not reach the engine: " +
+                                           api.last_error(), true});
+                    wake_ui(platform);
+                    return;
+                }
+            }
+
+            auto job = api.render_score(project_id, notes, bpm, program, label, prompt);
+            if (!job) {
+                g_inbox.push(MsgStatus{"the engine refused the score: " +
+                                       api.last_error(), true});
+                wake_ui(platform);
+                return;
+            }
+            g_inbox.push(MsgJob{job->id, "score", job->status, job->message,
+                                job->queue_position, false});
+            wake_ui(platform);
+
+            auto finished = api.follow(job->id, [&](const mx::net::JobRef& j) {
+                g_inbox.push(MsgJob{j.id, "score", j.status, j.message,
+                                    j.queue_position, false});
+                wake_ui(platform);
+                return true;
+            });
+            g_inbox.push(MsgJob{finished.id, "score", finished.status,
+                                finished.message, 0, true});
+            wake_ui(platform);
+            if (finished.status != "done") {
+                g_inbox.push(MsgStatus{"the score did not render" +
+                    (finished.error.empty() ? "" : ": " + finished.error),
+                    finished.status != "cancelled"});
+                wake_ui(platform);
+                return;
+            }
+
+            auto detail = api.project(project_id);
+            if (!detail || detail->stems.empty()) {
+                g_inbox.push(MsgStatus{"rendered, but nothing came back", true});
+                wake_ui(platform);
+                return;
+            }
+            g_inbox.push(MsgProjectOpened{project_id, label,
+                                          detail->summary.bpm, detail->summary.bars,
+                                          static_cast<int>(detail->stems.size())});
+            wake_ui(platform);
+
+            const auto& stem = detail->stems.back();     // the one just made
+            const auto* version = stem.version();
+            if (!version || version->audio.empty()) {
+                g_inbox.push(MsgStatus{"rendered, but the stem has no audio", true});
+                wake_ui(platform);
+                return;
+            }
+            const uint64_t key = mx::net::cache_key(project_id, version->id,
+                                                    version->audio);
+            const auto cached = mx::net::cache_path(key);
+            if (std::filesystem::exists(cached) ||
+                api.fetch_audio(project_id, version->audio, cached.string())) {
+                mx::Media media = mx::decode_file(cached, session_rate);
+                if (media.ok())
+                    // Lands as a normal stem, on its own track at zero. Placing
+                    // it under the score clip it came from needs a field this
+                    // message does not have; moving it is one drag, and
+                    // inventing a meaning for fetch_ms would be worse.
+                    g_inbox.push(MsgStemArrived{label, stem.id, version->id, 0,
+                                                std::move(media), 0.0, false});
+            }
+            g_inbox.push(MsgStatus{"", false});
+            wake_ui(platform);
+        }).detach();
     }
 
     void run_split(vik::App& app) {

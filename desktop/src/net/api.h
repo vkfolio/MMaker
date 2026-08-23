@@ -184,6 +184,32 @@ public:
     /// audio this is ACE-Step's `cover`: variations of your own material.
     std::optional<JobRef> variations(const std::string& project_id, int count = 1);
 
+    /// One note on the wire, in seconds relative to its clip.
+    ///
+    /// Seconds rather than frames: a sample rate is a property of the audio
+    /// device, not of the music, and every other time this client sends is
+    /// converted at this edge for the same reason.
+    struct ScoreNote {
+        double  start = 0.0;
+        double  length = 0.0;
+        int     pitch = 60;
+        int     velocity = 96;
+        std::string lyric;
+    };
+
+    /// Play a score. With a prompt, the sampler render is then reimagined
+    /// through the engine; without one you get the sampler alone, which is
+    /// offline, immediate and predictable.
+    std::optional<JobRef> render_score(const std::string& project_id,
+                                       const std::vector<ScoreNote>& notes,
+                                       double bpm, int program,
+                                       const std::string& label,
+                                       const std::string& prompt = {},
+                                       const std::string& idempotency_key = {});
+
+    /// A project to work in, with nothing rendered into it.
+    std::string create_empty_project(const std::string& title);
+
     std::optional<JobRef> split(const std::string& project_id,
                                 const std::string& variation_id,
                                 const std::string& tier = "basic",

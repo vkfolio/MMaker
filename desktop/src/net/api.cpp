@@ -201,6 +201,54 @@ std::optional<JobRef> ApiClient::variations(const std::string& project_id,
     return std::nullopt;
 }
 
+std::optional<JobRef> ApiClient::render_score(
+    const std::string& project_id, const std::vector<ScoreNote>& notes,
+    double bpm, int program, const std::string& label,
+    const std::string& prompt, const std::string& idempotency_key) {
+    json body;
+    json array = json::array();
+    for (const auto& n : notes) {
+        json note;
+        note["start"] = n.start;
+        // The server refuses a note of no length, and rightly: it is silence
+        // that looks like a note. A millisecond floor is inaudible and keeps a
+        // fast passage from being rejected wholesale.
+        note["length"] = n.length > 0.001 ? n.length : 0.001;
+        note["pitch"] = n.pitch;
+        note["velocity"] = n.velocity;
+        if (!n.lyric.empty()) note["lyric"] = n.lyric;
+        array.push_back(std::move(note));
+    }
+    body["notes"] = std::move(array);
+    if (bpm > 0) body["bpm"] = static_cast<int>(bpm);
+    body["program"] = program;
+    body["label"] = label;
+    if (!prompt.empty()) body["prompt"] = prompt;
+
+    const Response r = http_.post(
+        url("/api/projects/" + url_escape(project_id) + "/score"), body.dump(),
+        idempotency_key);
+    auto parsed = parse(r, last_error_);
+    if (!parsed) return std::nullopt;
+    if (auto j = parsed->find("job"); j != parsed->end() && j->is_object())
+        return read_job(*j);
+    return std::nullopt;
+}
+
+std::string ApiClient::create_empty_project(const std::string& title) {
+    json body;
+    body["title"] = title;
+    body["prompt"] = "";
+    body["bars"] = 32;
+    body["variations"] = 0;      // somewhere to work, not a take
+    const Response r = http_.post(url("/api/projects"), body.dump());
+    auto parsed = parse(r, last_error_);
+    if (!parsed) return {};
+    if (auto p = parsed->find("project"); p != parsed->end() && p->is_object())
+        return field<std::string>(*p, "id", "");
+    return {};
+}
+
 std::optional<JobRef> ApiClient::split(const std::string& project_id,
                                        const std::string& variation_id,
                                        const std::string& tier,

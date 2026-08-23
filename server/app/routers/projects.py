@@ -72,6 +72,11 @@ def create_project(body: CreateProject,
     )
     storage.save(project)
 
+    # variations=0 means the caller wants somewhere to work, not a take. A
+    # score render or an upload needs a project to exist and nothing else.
+    if body.variations == 0:
+        return {"project": project.model_dump(), "job": None}
+
     job = jobs.queue.submit(
         "variations",
         lambda report: service.generate_variations(_get(project.id), body.variations, report),
