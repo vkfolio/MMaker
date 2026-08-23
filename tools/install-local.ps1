@@ -83,7 +83,9 @@ if ($vram -eq 0) {
 }
 
 $free = [math]::Round((Get-PSDrive -Name $Root.Substring(0,1)).Free / 1GB)
-$needed = if ($Tier -eq "all") { 54 } else { 14 }
+# +5 GB on the small tier for acestep-v15-base, which is what makes every
+# task type available without a pod.
+$needed = if ($Tier -eq "all") { 59 } else { 19 }
 Note "$free GB free on $($Root.Substring(0,1)):  (about $needed GB is needed for -Tier $Tier)"
 if ($free -lt $needed) { Write-Host "`nNot enough disk space." -ForegroundColor Red; exit 1 }
 
@@ -168,6 +170,19 @@ p = snapshot_download(repo_id="ACE-Step/Ace-Step1.5", local_dir=str(dest),
 size = sum(f.stat().st_size for f in pathlib.Path(p).rglob("*") if f.is_file())
 print(f"  core models: {size/1e9:.2f} GB")
 
+# acestep-v15-base: the same 4.7 GB as turbo, but not distilled, so it is the
+# only checkpoint that fits an 8 GB card and still implements lego (Add a
+# Layer, Inspire Me), complete (Extend) and extract. Turbo carries four of the
+# seven task types; this carries all seven. It is part of the small tier
+# because it costs steps, not memory.
+base = dest / "acestep-v15-base"
+if not base.exists():
+    b = snapshot_download(repo_id="ACE-Step/acestep-v15-base", local_dir=str(base))
+    size = sum(f.stat().st_size for f in pathlib.Path(b).rglob("*") if f.is_file())
+    print(f"  v15-base:    {size/1e9:.2f} GB")
+else:
+    print("  v15-base:    already present")
+
 lm = dest / "acestep-5Hz-lm-0.6B"
 if not lm.exists():
     q = snapshot_download(repo_id="ACE-Step/acestep-5Hz-lm-0.6B", local_dir=str(lm),
@@ -185,7 +200,8 @@ else:
     Good "small tier in place"
 
     if ($Tier -eq "all") {
-        Note "fetching the XL checkpoints (~40 GB) -- these give local mode the"
+        Note "fetching the XL checkpoints (~40 GB) -- these are the 4B models;"
+        Note "every task type is already available from the small tier's v15-base"
         Note "same tiers as a pod, at the cost of CPU offload on every render"
         $xl = @'
 import os, sys, pathlib

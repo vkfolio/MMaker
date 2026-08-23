@@ -51,8 +51,19 @@ QUALITY = {
     "fast":  {"model": "acestep-v15-turbo",    "lm": "acestep-5Hz-lm-1.7B",
               "inference_steps": 8,  "guidance_scale": None, "vram_gb": 6,
               "installed": True},
-    "high":  {"model": "acestep-v15-xl-turbo", "lm": "acestep-5Hz-lm-1.7B",
-              "inference_steps": 8,  "guidance_scale": None, "vram_gb": 14,
+    # Not xl-turbo. acestep-v15-base is the same 4.7 GB footprint as turbo --
+    # it fits an 8 GB laptop -- but it is not distilled, so it implements all
+    # seven task types instead of four. That is what makes Add a Layer, Inspire
+    # Me and Extend possible without a pod. The cost is steps, not memory: 50
+    # with CFG rather than 8, so roughly an order of magnitude slower per
+    # render. Hence it sits on `high` and `fast` stays turbo.
+    # 0.6B, not 1.7B. The LM shares VRAM with the DiT, and ACE-Step's own tier
+    # table allows only the 0.6B below 12 GB. Asking for 1.7B on an 8 GB card
+    # does not fail -- it pushes the DiT to CPU, where a 50-step CFG render
+    # takes over twelve minutes at 0% GPU utilisation while looking, from the
+    # outside, exactly like a slow GPU render.
+    "high":  {"model": "acestep-v15-base",     "lm": "acestep-5Hz-lm-0.6B",
+              "inference_steps": 50, "guidance_scale": 7.0,  "vram_gb": 8,
               "installed": False},
     "ultra": {"model": "acestep-v15-xl-base",  "lm": "acestep-5Hz-lm-4B",
               "inference_steps": 50, "guidance_scale": 7.0,  "vram_gb": 30,
@@ -89,11 +100,13 @@ TASKS_BASE = TASKS_TURBO + ("extract", "lego", "complete")
 
 # Best first. A tier whose checkpoint is absent resolves to the best one that
 # is present, and takes that model's settings with it.
-MODEL_PREFERENCE = ("acestep-v15-xl-base", "acestep-v15-xl-turbo", "acestep-v15-turbo")
+MODEL_PREFERENCE = ("acestep-v15-xl-base", "acestep-v15-xl-turbo",
+                   "acestep-v15-base", "acestep-v15-turbo")
 
 # Extra checkpoints a pod can opt into, with their download sizes, so the
 # operator can decide rather than discover.
 OPTIONAL_WEIGHTS = {
+    "acestep-v15-base":      4.8,
     "acestep-v15-xl-turbo": 19.9,
     "acestep-v15-xl-base":  19.9,
     "acestep-5Hz-lm-4B":     8.4,

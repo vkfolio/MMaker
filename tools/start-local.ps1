@@ -72,8 +72,13 @@ if (Running "acestep-api") {
     # weights unregistered was the wrong call.
     $ckpt = Join-Path $c.acestep_dir "checkpoints"
     $slot = 1
+    # Best first, and acestep-v15-base earns its place ahead of turbo: same
+    # 4.7 GB footprint, but not distilled, so it is the only checkpoint an
+    # 8 GB laptop can hold that implements lego, complete and extract. Every
+    # request names its model explicitly, so a checkpoint left unregistered
+    # here is one the engine silently substitutes for.
     foreach ($model in @("acestep-v15-xl-base", "acestep-v15-xl-turbo",
-                         "acestep-v15-turbo")) {
+                         "acestep-v15-base", "acestep-v15-turbo")) {
         if (-not (Test-Path (Join-Path $ckpt $model))) { continue }
         if ($slot -gt 3) { continue }
         $name = if ($slot -eq 1) { "ACESTEP_CONFIG_PATH" }
