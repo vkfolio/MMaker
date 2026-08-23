@@ -31,7 +31,13 @@ SFX_PRESETS = [
 _BY_ID = {s["id"]: s for s in STYLES}
 
 # Tags beyond this many dilute the prompt rather than sharpen it.
-MAX_TAGS = 7
+# ACE-Step's own guidance is to combine dimensions -- it lists nine (genre,
+# emotion, instruments, timbre, era, production, vocals, tempo, structure) and
+# says a caption naming several anchors the result where one naming a single
+# dimension does not. Seven cut the best captions short: a well-written one runs
+# ten to twelve tags, so the tail -- usually the reference and the structure
+# hint, the two doing the most work -- was being thrown away silently.
+MAX_TAGS = 16
 
 
 def build_prompt(user_text: str, style_id: str = "", *, instrumental: bool = False,
@@ -53,6 +59,13 @@ def build_prompt(user_text: str, style_id: str = "", *, instrumental: bool = Fal
         if part and part.lower() not in (t.lower() for t in tags):
             tags.append(part)
 
+    # Truncate the description, never the controls. These three say what the
+    # render must do rather than what it should sound like, and appending them
+    # before the cap meant a long caption could silently drop its own tempo --
+    # or its "instrumental" tag, which is how an instrumental acquires mumbled
+    # vocals.
+    tags = tags[:MAX_TAGS]
+
     # Vocal intent belongs in the tags; the lyrics field carries the words.
     if instrumental:
         if not any("instrumental" in t.lower() for t in tags):
@@ -64,7 +77,7 @@ def build_prompt(user_text: str, style_id: str = "", *, instrumental: bool = Fal
     if bpm and not any("bpm" in t.lower() for t in tags):
         tags.append(f"{bpm} BPM")
 
-    return ", ".join(tags[:MAX_TAGS])
+    return ", ".join(tags)
 
 
 def lyric_budget(duration_s: float) -> int:
