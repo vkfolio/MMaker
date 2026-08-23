@@ -89,10 +89,54 @@ struct Source {
     }
 };
 
+using ScoreId = uint32_t;
+
+/// One sung or played note.
+///
+/// Times are in frames, like everything else in the session, not in ticks. One
+/// time unit in the document and conversions only at the edges is what keeps a
+/// note, a clip and the playhead from disagreeing after a tempo change.
+struct Note {
+    int64_t     start  = 0;      // relative to the clip, not the timeline
+    int64_t     length = 0;
+    uint8_t     pitch  = 60;     // MIDI note number, 60 = C4
+    std::string lyric;           // one syllable; empty for an instrument
+};
+
+/// The notes behind a clip, plus who should perform them.
+///
+/// This is the second input representation in the app: ACE-Step renders audio
+/// from prompts, and has no notion of a note. A score is what the singing and
+/// instrument engines take instead, so it lives beside `Source` rather than
+/// inside it.
+struct Score {
+    ScoreId           id = 0;
+    std::vector<Note> notes;
+    std::string       voice_id;             // which voice or instrument
+    std::string       voice_label;          // for the clip title
+    std::string       language = "en";
+    std::string       key = "C Major";
+
+    /// Frames from the clip start to the end of the last note.
+    int64_t length_frames() const {
+        int64_t end = 0;
+        for (const auto& n : notes) end = std::max(end, n.start + n.length);
+        return end;
+    }
+};
+
 struct Clip {
     ClipId      id = 0;
     TrackId     track_id = 0;
     SourceId    source_id = 0;
+    /// A clip is backed by audio *or* by notes, never both.
+    ///
+    /// A score clip carries no source until it has been rendered, and
+    /// `build_graph` already skips clips whose source is not loaded -- so it is
+    /// silent with no change to the mixer at all. When the render arrives it
+    /// lands as an ordinary `Source` on this same clip, which is what lets
+    /// playback, offline bounce and the version badge keep working untouched.
+    ScoreId     score_id = 0;
 
     int64_t start_frame   = 0;
     int64_t length        = 0;
@@ -122,6 +166,7 @@ struct Session {
     std::vector<Track>  tracks;
     std::vector<Clip>   clips;
     std::vector<Source> sources;
+    std::vector<Score>  scores;
 
     int64_t loop_start = 0;
     int64_t loop_end   = 0;
@@ -131,6 +176,7 @@ struct Session {
     TrackId  next_track  = 1;
     ClipId   next_clip   = 1;
     SourceId next_source = 1;
+    ScoreId  next_score  = 1;
 
     Track& add_track(std::string name, uint32_t color) {
         tracks.push_back(Track{next_track++, std::move(name), 1.0f, 0.0f, false, false, color});
@@ -157,6 +203,32 @@ struct Session {
         return clips.back();
     }
 
+    /// Creates an empty score and the clip that shows it.
+    Clip& add_score_clip(TrackId track, std::string voice_id, std::string label,
+                         int64_t start, int64_t length) {
+        Score sc;
+        sc.id = next_score++;
+        sc.voice_id = std::move(voice_id);
+        sc.voice_label = std::move(label);
+        scores.push_back(std::move(sc));
+
+        Clip c;
+        c.id = next_clip++;
+        c.track_id = track;
+        c.score_id = scores.back().id;
+        c.start_frame = start;
+        c.length = length;
+        c.name = scores.back().voice_label + "_Clip_1";
+        clips.push_back(c);
+        return clips.back();
+    }
+
+    Score* find_score(ScoreId id) {
+        if (id == 0) return nullptr;
+        for (auto& s : scores)
+            if (s.id == id) return &s;
+        return nullptr;
+    }
     Source* find_source(SourceId id) {
         for (auto& s : sources)
             if (s.id == id) return &s;

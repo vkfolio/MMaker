@@ -9,3 +9,7 @@ server/out/
 *.mp3
 *.zip
 .env
+
+# Local engine install: a cloned ACE-Step checkout plus ~10 GB of checkpoints
+# and rendered projects. Machine-specific, and far too large for a repo.
+local/

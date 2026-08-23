@@ -84,15 +84,82 @@ int main() {
     }
 
     {
-        // Lane hit-testing is the inverse of lane drawing.
+        // Lane hit-testing is the inverse of lane drawing -- at every scroll
+        // offset and every lane height, not just the default pair. This is the
+        // property that keeps a click on track 3 from editing track 5.
         int bad = 0;
-        for (int i = 0; i < 6; ++i) {
-            const float top = mx::track_top(i);
-            if (mx::track_at(top + 1.0f, 6) != i) ++bad;
-            if (mx::track_at(top + mx::kTrackHeight - 1.0f, 6) != i) ++bad;
+        for (float scroll : {0.0f, 37.0f, 260.0f}) {
+            for (float h : {mx::kTrackHeightMin, 84.0f, mx::kTrackHeightMax}) {
+                mx::View v;
+                v.scroll_y_px = scroll;
+                v.track_h = h;
+                for (int i = 0; i < 6; ++i) {
+                    const float top = v.track_top(i);
+                    if (top < mx::kRulerHeight) continue;   // scrolled above
+                    if (v.track_at(top + 1.0f, 6) != i) ++bad;
+                    if (v.track_at(top + v.track_h - 1.0f, 6) != i) ++bad;
+                }
+            }
         }
-        check(bad == 0, "lane hit-test inverts lane layout");
-        check(mx::track_at(4.0f, 6) == -1, "the ruler is not a lane");
+        check(bad == 0, "lane hit-test inverts lane layout at any scroll/height");
+
+        mx::View v;
+        check(v.track_at(4.0f, 6) == -1, "the ruler is not a lane");
+        v.scroll_y_px = 500.0f;
+        check(v.track_at(4.0f, 6) == -1, "the ruler is not a lane when scrolled");
+    }
+
+    {
+        // The header column is drawn as elements offset by -scroll_y_px while
+        // the lanes are drawn on a canvas at track_top(). Those are two
+        // different code paths that must produce the same number, and a
+        // disagreement is invisible until you scroll.
+        mx::View v;
+        v.scroll_y_px = 137.0f;
+        v.track_h = 64.0f;
+        int bad = 0;
+        for (int i = 0; i < 8; ++i) {
+            const float header_top = mx::kRulerHeight +
+                                     static_cast<float>(i) * (v.track_h + mx::kTrackGap) -
+                                     v.scroll_y_px;
+            if (std::fabs(header_top - v.track_top(i)) > 0.001f) ++bad;
+        }
+        check(bad == 0, "track headers and lanes agree on every top edge");
+    }
+
+    {
+        // Zooming track height keeps what is under the cursor under it, the
+        // same contract horizontal zoom already has.
+        mx::View v;
+        v.track_h = 84.0f;
+        v.scroll_y_px = 200.0f;
+        const float cursor = 300.0f;
+        const int before = v.track_at(cursor, 40);
+        v.zoom_tracks_about(cursor, 1.5f);
+        const int after = v.track_at(cursor, 40);
+        check(before == after, "track-height zoom keeps the lane under the cursor");
+    }
+
+    {
+        // Scrolling stops at the last track rather than into empty space.
+        mx::View v;
+        v.track_h = 84.0f;
+        // A viewport shorter than the content, or there is nothing to clamp:
+        // 4 lanes of 84 px come to 372 px, so 600 px of window shows them all.
+        v.scroll_y_px = 100000.0f;
+        v.clamp_y(4, 200.0f);
+        const float content = v.content_height(4);
+        check(std::fabs(v.scroll_y_px - (content - 200.0f)) < 0.001f,
+              "vertical scroll clamps to the content");
+
+        v.scroll_y_px = -50.0f;
+        v.clamp_y(4, 200.0f);
+        check(v.scroll_y_px == 0.0f, "vertical scroll cannot go above the top");
+
+        // A session shorter than the window does not scroll at all.
+        v.scroll_y_px = 400.0f;
+        v.clamp_y(1, 900.0f);
+        check(v.scroll_y_px == 0.0f, "a short session does not scroll");
     }
 
     std::printf("%s\n", std::string(66, '=').c_str());

@@ -33,18 +33,65 @@ constexpr float kRulerHeight = 28.0f;
 constexpr float kTrackHeight = 84.0f;
 constexpr float kTrackGap    = 2.0f;
 
-/// The one place the timeline<->pixel mapping is defined. Everything else --
-/// drawing, hit-testing, scroll clamping -- goes through these two functions,
-/// so they cannot drift apart.
+/// Where the version badge sits inside a clip's title strip, so the hit-test
+/// and the drawing agree on one rectangle rather than two guesses.
+constexpr float kTitleStrip = 15.0f;
+
+constexpr float kTrackHeightMin = 40.0f;
+constexpr float kTrackHeightMax = 200.0f;
+
+/// The one place the timeline<->pixel mapping is defined -- **both axes**.
+/// Everything else (drawing, hit-testing, scroll clamping, the track-header
+/// column) goes through these functions, so they cannot drift apart.
+///
+/// Vertical used to live outside this struct, as free `track_top`/`track_at`
+/// functions over a compile-time constant height. That was fine only while
+/// there was no vertical scrolling: the moment there is, a caller that forgets
+/// the offset computes a lane that is off by however far you have scrolled, and
+/// the bug shows up as clicking one track and editing another. Making them
+/// members means no caller *can* forget.
 struct View {
     double  frames_per_pixel = 512.0;
     int64_t scroll_frames    = 0;
+    float   scroll_y_px      = 0.0f;
+    float   track_h          = kTrackHeight;
 
     float x_of(int64_t frame) const {
         return static_cast<float>((frame - scroll_frames) / frames_per_pixel);
     }
     int64_t frame_at(float x) const {
         return scroll_frames + static_cast<int64_t>(std::llround(x * frames_per_pixel));
+    }
+
+    float lane_pitch() const { return track_h + kTrackGap; }
+
+    /// Top edge of lane `index`, in surface coordinates. Below the ruler and
+    /// shifted by the vertical scroll.
+    float track_top(int index) const {
+        return kRulerHeight + static_cast<float>(index) * lane_pitch() - scroll_y_px;
+    }
+
+    /// Which lane a y coordinate falls in, or -1. The inverse of `track_top`,
+    /// which is the only reason the two can be trusted to agree.
+    int track_at(float y, int track_count) const {
+        if (y < kRulerHeight) return -1;               // the ruler is not a lane
+        const float local = y - kRulerHeight + scroll_y_px;
+        if (local < 0.0f) return -1;
+        const int i = static_cast<int>(local / lane_pitch());
+        return (i >= 0 && i < track_count) ? i : -1;
+    }
+
+    /// Total height of `track_count` lanes plus the ruler.
+    float content_height(int track_count) const {
+        return kRulerHeight + static_cast<float>(track_count) * lane_pitch();
+    }
+
+    /// Keep the scroll inside the content. Scrolling past the last track shows
+    /// a void the user then has to scroll back out of, which reads as a bug.
+    void clamp_y(int track_count, float viewport_h) {
+        const float max_scroll =
+            std::max(0.0f, content_height(track_count) - viewport_h);
+        scroll_y_px = std::clamp(scroll_y_px, 0.0f, max_scroll);
     }
 
     /// Frames per pixel that fits `frames` into `width_px`, with a little air.
@@ -61,22 +108,19 @@ struct View {
         scroll_frames = anchor - static_cast<int64_t>(std::llround(x * frames_per_pixel));
         if (scroll_frames < 0) scroll_frames = 0;
     }
+
+    /// The vertical counterpart: change the lane height while keeping whatever
+    /// is under `y` under `y`. Without the anchor, zooming track height throws
+    /// away your place in a tall session.
+    void zoom_tracks_about(float y, float factor) {
+        const float above = std::max(0.0f, y - kRulerHeight) + scroll_y_px;
+        const double lanes = above / lane_pitch();     // fractional lane index
+        track_h = std::clamp(track_h * factor, kTrackHeightMin, kTrackHeightMax);
+        scroll_y_px = static_cast<float>(lanes * lane_pitch()) -
+                      std::max(0.0f, y - kRulerHeight);
+        if (scroll_y_px < 0.0f) scroll_y_px = 0.0f;
+    }
 };
-
-inline float track_top(int index) {
-    return kRulerHeight + static_cast<float>(index) * (kTrackHeight + kTrackGap);
-}
-
-/// Where the version badge sits inside a clip's title strip, so the hit-test
-/// and the drawing agree on one rectangle rather than two guesses.
-constexpr float kTitleStrip = 15.0f;
-
-/// Which track lane a y coordinate falls in, or -1. The inverse function again.
-inline int track_at(float y, int track_count) {
-    if (y < kRulerHeight) return -1;
-    const int i = static_cast<int>((y - kRulerHeight) / (kTrackHeight + kTrackGap));
-    return (i >= 0 && i < track_count) ? i : -1;
-}
 
 /// A time range on one track. This is what every AI tool acts on -- the plan
 /// calls it "the defining interaction" -- so it is a first-class thing the

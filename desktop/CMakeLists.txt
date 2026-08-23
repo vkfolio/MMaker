@@ -49,6 +49,7 @@ add_executable(musicx
     src/media/decode.cpp
     src/media/peaks.cpp
     src/ui/arrangement.cpp
+    src/ui/pianoroll.cpp
     src/miniaudio_impl.c
 )
 target_include_directories(musicx PRIVATE src third_party)
@@ -81,6 +82,11 @@ add_executable(zoom_check tests/zoom_check.cpp src/ui/arrangement.cpp
 target_include_directories(zoom_check PRIVATE src third_party)
 target_link_libraries(zoom_check PRIVATE vik_components)
 add_test(NAME zoom_anchor COMMAND zoom_check)
+
+add_executable(pianoroll_check tests/pianoroll_check.cpp src/ui/pianoroll.cpp)
+target_include_directories(pianoroll_check PRIVATE src third_party)
+target_link_libraries(pianoroll_check PRIVATE vik_components)
+add_test(NAME pianoroll_coords COMMAND pianoroll_check)
 
 add_executable(mixer_test tests/mixer_test.cpp)
 target_link_libraries(mixer_test PRIVATE mx_audio)

@@ -105,11 +105,12 @@ DrawStats draw_arrangement(SkCanvas* c, const SkRect& bounds, Session& session,
 
     // --- lanes ---------------------------------------------------------------
     for (int i = 0; i < track_count; ++i) {
-        const float top = bounds.top() + track_top(i);
+        const float top = bounds.top() + view.track_top(i);
         if (top > bounds.bottom()) break;
+        if (top + view.track_h < bounds.top() + kRulerHeight) continue;
         fill.setColor(i % 2 ? pal.lane_alt : pal.lane);
         c->drawRect(SkRect::MakeLTRB(bounds.left(), top, bounds.right(),
-                                     top + kTrackHeight), fill);
+                                     top + view.track_h), fill);
     }
 
     // --- bar grid ------------------------------------------------------------
@@ -138,7 +139,7 @@ DrawStats draw_arrangement(SkCanvas* c, const SkRect& bounds, Session& session,
 
     const int64_t first_bar = view.scroll_frames / fpb;
     const float lanes_bottom =
-        bounds.top() + track_top(std::max(0, track_count)) - kTrackGap;
+        bounds.top() + view.track_top(std::max(0, track_count)) - kTrackGap;
 
     for (int64_t bar = first_bar - (first_bar % bar_step);; bar += bar_step) {
         const float x = bounds.left() + view.x_of(bar * fpb);
@@ -201,10 +202,10 @@ DrawStats draw_arrangement(SkCanvas* c, const SkRect& bounds, Session& session,
         const float x1 = bounds.left() + view.x_of(clip.start_frame + clip.length);
         if (x1 < bounds.left() || x0 > bounds.right()) continue;
 
-        const float top = bounds.top() + track_top(index);
+        const float top = bounds.top() + view.track_top(index);
         const SkRect lane = SkRect::MakeLTRB(std::max(bounds.left(), x0), top + 2.0f,
                                              std::min(bounds.right(), x1),
-                                             top + kTrackHeight - 2.0f);
+                                             top + view.track_h - 2.0f);
         if (lane.width() <= 0.0f) continue;
 
         visible.push_back(Visible{&clip, session.find_source(clip.source_id), lane,
@@ -330,10 +331,10 @@ DrawStats draw_arrangement(SkCanvas* c, const SkRect& bounds, Session& session,
         if (index >= 0) {
             const float x0 = bounds.left() + view.x_of(range.begin());
             const float x1 = bounds.left() + view.x_of(range.end());
-            const float top = bounds.top() + track_top(index);
+            const float top = bounds.top() + view.track_top(index);
             const SkRect box = SkRect::MakeLTRB(
                 std::max(bounds.left(), x0), top,
-                std::min(bounds.right(), x1), top + kTrackHeight);
+                std::min(bounds.right(), x1), top + view.track_h);
             if (box.width() > 0.0f) {
                 fill.setColor(pal.selection);
                 fill.setAntiAlias(false);
@@ -345,10 +346,10 @@ DrawStats draw_arrangement(SkCanvas* c, const SkRect& bounds, Session& session,
                 line.setStrokeWidth(1.0f);
                 if (x0 >= bounds.left())
                     c->drawLine(std::floor(x0) + 0.5f, top,
-                                std::floor(x0) + 0.5f, top + kTrackHeight, line);
+                                std::floor(x0) + 0.5f, top + view.track_h, line);
                 if (x1 <= bounds.right())
                     c->drawLine(std::floor(x1) + 0.5f, top,
-                                std::floor(x1) + 0.5f, top + kTrackHeight, line);
+                                std::floor(x1) + 0.5f, top + view.track_h, line);
             }
         }
     }

@@ -51,10 +51,25 @@ bool save_document(const Session& session, const std::filesystem::path& path,
                                   {"local_path", s.local_path.string()},
                                   {"source_rate", s.source_rate}});
     }
+    for (const auto& sc : session.scores) {
+        json notes = json::array();
+        for (const auto& n : sc.notes)
+            notes.push_back({{"start", n.start},
+                             {"length", n.length},
+                             {"pitch", n.pitch},
+                             {"lyric", n.lyric}});
+        doc["scores"].push_back({{"id", sc.id},
+                                 {"voice_id", sc.voice_id},
+                                 {"voice_label", sc.voice_label},
+                                 {"language", sc.language},
+                                 {"key", sc.key},
+                                 {"notes", std::move(notes)}});
+    }
     for (const auto& c : session.clips) {
         doc["clips"].push_back({{"id", c.id},
                                 {"track_id", c.track_id},
                                 {"source_id", c.source_id},
+                                {"score_id", c.score_id},
                                 {"start_frame", c.start_frame},
                                 {"length", c.length},
                                 {"source_offset", c.source_offset},
@@ -67,7 +82,8 @@ bool save_document(const Session& session, const std::filesystem::path& path,
     // already in use and two objects would share an identity.
     doc["next"] = {{"track", session.next_track},
                    {"clip", session.next_clip},
-                   {"source", session.next_source}};
+                   {"source", session.next_source},
+                   {"score", session.next_score}};
 
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
@@ -151,11 +167,29 @@ LoadResult load_document(Session& session, const std::filesystem::path& path) {
             ++out.missing_audio;
         session.sources.push_back(std::move(source));
     }
+    for (const auto& sc : doc.value("scores", json::array())) {
+        Score score;
+        score.id = sc.value("id", 0u);
+        score.voice_id = sc.value("voice_id", "");
+        score.voice_label = sc.value("voice_label", "");
+        score.language = sc.value("language", "en");
+        score.key = sc.value("key", "C Major");
+        for (const auto& n : sc.value("notes", json::array())) {
+            Note note;
+            note.start = n.value("start", 0LL);
+            note.length = n.value("length", 0LL);
+            note.pitch = static_cast<uint8_t>(n.value("pitch", 60));
+            note.lyric = n.value("lyric", "");
+            score.notes.push_back(std::move(note));
+        }
+        session.scores.push_back(std::move(score));
+    }
     for (const auto& c : doc.value("clips", json::array())) {
         Clip clip;
         clip.id = c.value("id", 0u);
         clip.track_id = c.value("track_id", 0u);
         clip.source_id = c.value("source_id", 0u);
+        clip.score_id = c.value("score_id", 0u);
         clip.start_frame = c.value("start_frame", 0LL);
         clip.length = c.value("length", 0LL);
         clip.source_offset = c.value("source_offset", 0LL);
@@ -170,6 +204,7 @@ LoadResult load_document(Session& session, const std::filesystem::path& path) {
         session.next_track = it->value("track", 1u);
         session.next_clip = it->value("clip", 1u);
         session.next_source = it->value("source", 1u);
+        session.next_score = it->value("score", 1u);
     }
     // Whatever the file said, never hand out an id that is already taken.
     for (const auto& t : session.tracks)
@@ -178,6 +213,8 @@ LoadResult load_document(Session& session, const std::filesystem::path& path) {
         session.next_clip = std::max(session.next_clip, c.id + 1);
     for (const auto& s : session.sources)
         session.next_source = std::max(session.next_source, s.id + 1);
+    for (const auto& sc : session.scores)
+        session.next_score = std::max(session.next_score, sc.id + 1);
 
     out.ok = true;
     return out;

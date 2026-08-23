@@ -39,6 +39,7 @@
 #include "media/decode.h"
 #include "session.h"
 #include "ui/arrangement.h"
+#include "ui/pianoroll.h"
 
 #include "vikui/vikui.h"
 #include "vikui/theme.h"
@@ -252,6 +253,161 @@ struct Studio {
     bool             keys_focused = false;
     bool  fitted      = false;
     float timeline_px = 1100.0f;   // last measured canvas width
+    float timeline_h  = 700.0f;    // last measured canvas height, for clamping
+
+    // Middle-drag pan.
+    bool       panning = false;
+    vik::Point pan_from{};
+
+    // --- the note editor ----------------------------------------------------
+    // Open on a clip rather than on a score: the editor needs the clip to know
+    // where the notes sit on the timeline, and a score with no clip is not
+    // something the user can point at.
+    // Double-click on empty canvas: the reference offers three ways to make
+    // something there rather than silently creating one kind.
+    bool           show_new_clip_menu = false;
+    int64_t        new_clip_at = 0;
+    int            new_clip_lane = -1;
+    vik::Point     new_clip_pos{};
+
+    mx::ClipId     editing_clip = 0;
+    mx::PianoView  piano;
+    int            piano_selected = -1;   // index into the score's notes
+    int            piano_drag = -1;
+    mx::NoteGrab   piano_grab = mx::NoteGrab::Move;
+    int64_t        piano_grab_offset = 0;
+    bool           piano_framed = false;
+    float          piano_x = 0.0f;        // canvas origin, as for the timeline
+    float          piano_y = 0.0f;
+    float          piano_w = 900.0f;
+    float          piano_h = 320.0f;
+    // Which note is taking typed characters, or -1. Editing a lyric has to
+    // swallow the transport keys, or typing a word plays and stops the song.
+    int            lyric_editing = -1;
+
+    /// The score behind the open clip, or null.
+    mx::Score* editing_score() {
+        if (auto* c = session.find_clip(editing_clip))
+            return session.find_score(c->score_id);
+        return nullptr;
+    }
+
+    float piano_local_x(float wx) const { return wx - piano_x - mx::kKeyboardWidth; }
+    float piano_local_y(float wy) const { return wy - piano_y; }
+
+    void open_editor(mx::ClipId clip_id) {
+        editing_clip = clip_id;
+        piano_selected = -1;
+        lyric_editing = -1;
+        piano_framed = false;
+        // Match the timeline's zoom, so the notes line up with the clip you
+        // just double-clicked rather than opening at some unrelated scale.
+        piano.frames_per_pixel = view.frames_per_pixel;
+        piano.scroll_frames = 0;
+    }
+
+    void close_editor() {
+        editing_clip = 0;
+        piano_selected = -1;
+        lyric_editing = -1;
+    }
+
+    /// Makes a track and an empty score clip where the user double-clicked,
+    /// then opens the editor on it. One gesture to a place you can type notes.
+    void create_score_clip(bool vocal) {
+        show_new_clip_menu = false;
+        static const uint32_t colors[] = {0xff7f8cf0, 0xffc169d6, 0xff56c08a,
+                                          0xffe0813c, 0xff40b8c4};
+        const size_t n = session.tracks.size();
+
+        // Reuse the lane that was double-clicked if it is empty, rather than
+        // always appending: double-clicking row 5 and getting row 12 is the
+        // kind of small wrongness that makes a canvas feel unresponsive.
+        mx::TrackId track = 0;
+        if (new_clip_lane >= 0 && new_clip_lane < static_cast<int>(n)) {
+            const mx::TrackId candidate = session.tracks[new_clip_lane].id;
+            bool occupied = false;
+            for (const auto& c : session.clips)
+                if (c.track_id == candidate) occupied = true;
+            if (!occupied) track = candidate;
+        }
+        if (!track)
+            track = session.add_track(vocal ? "Voice" : "Instrument",
+                                      colors[n % std::size(colors)]).id;
+
+        const int64_t start = std::max<int64_t>(0, snap_frames(new_clip_at));
+        auto& clip = session.add_score_clip(
+            track, vocal ? "default" : "violin", vocal ? "Voice" : "Violin",
+            start, session.frames_per_bar() * 4);
+        selected = clip.id;
+        dirty = true;
+        open_editor(clip.id);
+        publish();
+    }
+
+    /// Notes land on the sixteenth-note grid.
+    ///
+    /// Free-placed notes are almost never what anyone wants from a piano roll,
+    /// and a singer rendering a note that starts 3 ms before the beat sounds
+    /// like a mistake rather than a choice.
+    int64_t snap_frames(int64_t frame) const {
+        const int64_t step = std::max<int64_t>(1, session.frames_per_bar() / 16);
+        return ((frame + step / 2) / step) * step;
+    }
+
+    void piano_scroll_time(double px) {
+        piano.scroll_frames = std::max<int64_t>(
+            0, piano.scroll_frames +
+                   static_cast<int64_t>(px * piano.frames_per_pixel));
+    }
+
+    mx::Note* selected_note() {
+        mx::Score* score = editing_score();
+        if (!score || piano_selected < 0 ||
+            piano_selected >= static_cast<int>(score->notes.size()))
+            return nullptr;
+        return &score->notes[static_cast<size_t>(piano_selected)];
+    }
+
+    void scale_note(double factor) {
+        if (mx::Note* n = selected_note()) {
+            const int64_t floor_len = std::max<int64_t>(
+                1, session.frames_per_bar() / 32);
+            n->length = std::max(floor_len,
+                                 static_cast<int64_t>(n->length * factor));
+            dirty = true;
+        }
+    }
+
+    void delete_note() {
+        mx::Score* score = editing_score();
+        if (!score || piano_selected < 0 ||
+            piano_selected >= static_cast<int>(score->notes.size()))
+            return;
+        score->notes.erase(score->notes.begin() + piano_selected);
+        piano_selected = -1;
+        lyric_editing = -1;
+        dirty = true;
+    }
+
+    /// A character typed while a note is taking its lyric.
+    void type_lyric(const std::string& key) {
+        mx::Score* score = editing_score();
+        if (!score || lyric_editing < 0 ||
+            lyric_editing >= static_cast<int>(score->notes.size()))
+            return;
+        std::string& text = score->notes[static_cast<size_t>(lyric_editing)].lyric;
+        if (key == "backspace") {
+            if (!text.empty()) text.pop_back();
+        } else if (key == "enter" || key == "escape") {
+            lyric_editing = -1;
+        } else if (key.size() == 1 && key[0] > 32 && key[0] < 127) {
+            text += key;
+        } else {
+            return;
+        }
+        dirty = true;
+    }
     // Where the canvas sits in the window, captured at paint.
     //
     // Mouse events arrive in window coordinates, while the view maps frames to
@@ -265,6 +421,33 @@ struct Studio {
     /// these, so the mapping cannot drift between them again.
     float local_x(float window_x) const { return window_x - canvas_x; }
     float local_y(float window_y) const { return window_y - canvas_y; }
+
+    /// Scroll the timeline by `px` pixels of time. One function so the wheel,
+    /// the trackpad and the pan drag cannot disagree about direction.
+    void scroll_time(double px) {
+        view.scroll_frames = std::max<int64_t>(
+            0, view.scroll_frames +
+                   static_cast<int64_t>(px * view.frames_per_pixel));
+    }
+
+    /// Keep both axes inside the content. Called after every navigation gesture
+    /// rather than inside each one, so a new gesture cannot forget it.
+    void clamp_view() {
+        view.clamp_y(static_cast<int>(session.tracks.size()), timeline_h);
+    }
+
+    /// Fit the whole project into the window, both axes. What `F` does.
+    void fit_view() {
+        view.frames_per_pixel = mx::View::fit(session.length_frames(), timeline_px);
+        view.scroll_frames = 0;
+        view.scroll_y_px = 0.0f;
+        const int n = static_cast<int>(session.tracks.size());
+        if (n > 0) {
+            const float room = std::max(1.0f, timeline_h - mx::kRulerHeight);
+            view.track_h = std::clamp(room / static_cast<float>(n) - mx::kTrackGap,
+                                      mx::kTrackHeightMin, mx::kTrackHeightMax);
+        }
+    }
 
     // --- network ------------------------------------------------------------
     // The document is local and is the app's own. The pod is a render service
@@ -1141,6 +1324,30 @@ struct Studio {
         }).detach();
     }
 
+    /// Render the open score to audio.
+    ///
+    /// Not wired to a backend yet: ACE-Step has no score conditioning at all,
+    /// so this needs the separate singing engine rather than another call to
+    /// the one already running. Says so, rather than failing quietly, because
+    /// a button that appears to work and does nothing is worse than one that
+    /// explains itself.
+    void run_sing(vik::App& app) {
+        (void)app;
+        mx::Score* score = editing_score();
+        if (!score || score->notes.empty()) {
+            net_status = "draw some notes first";
+            net_error = true;
+            return;
+        }
+        int with_lyrics = 0;
+        for (const auto& n : score->notes)
+            if (!n.lyric.empty()) ++with_lyrics;
+        net_status = std::format(
+            "singing engine not installed yet -- {} notes, {} with lyrics",
+            score->notes.size(), with_lyrics);
+        net_error = true;
+    }
+
     void run_split(vik::App& app) {
         if (net_busy || open_project_id.empty()) return;
         // Split acts on the take, not on a stem, so it needs a variation id --
@@ -1490,7 +1697,7 @@ struct Studio {
 
     /// The inverse of the draw mapping, not a test against retained shapes.
     mx::ClipId clip_at(float x, float y) const {
-        const int index = mx::track_at(y, static_cast<int>(session.tracks.size()));
+        const int index = view.track_at(y, static_cast<int>(session.tracks.size()));
         if (index < 0) return 0;
         const mx::TrackId track = session.tracks[index].id;
         const int64_t frame = view.frame_at(x);
@@ -1539,6 +1746,12 @@ struct Studio {
                                const char* action, bool ready,
                                std::function<void(Studio&, vik::App&)> run);
     vik::AnyElement current_tool_modal(vik::Context<Studio>& cx);
+    /// The note editor. Its own function for the same reason every other panel
+    /// is: MSVC reserves frame space for every branch of a function whether it
+    /// runs or not, and render() plus one more inline panel is what overflowed
+    /// the stack before.
+    vik::AnyElement pianoroll_panel(vik::Context<Studio>& cx);
+    vik::AnyElement new_clip_menu(vik::Context<Studio>& cx);
     vik::AnyElement quality_chip(vik::Context<Studio>& cx, const char* tier,
                                  bool on);
 };
@@ -1577,7 +1790,7 @@ vik::AnyElement Studio::settings_modal(vik::Context<Studio>& cx) {
 
     auto mode_chip = [&cx](const char* label, const char* detail, bool on,
                            mx::Mode which) {
-        return vik::div().id("mode").flex_1().flex_col().gap_1().px_3().py_2()
+        return vik::div().id(std::string("mode-") + label).flex_1().flex_col().gap_1().px_3().py_2()
             .rounded_md().cursor_pointer()
             .bg(vik::rgb(on ? 0x3a4a68 : 0x2c313d))
             .border_1().border_color(vik::rgb(on ? 0x5b5bd6 : 0x3b4250))
@@ -1669,7 +1882,7 @@ vik::AnyElement Studio::layer_modal(vik::Context<Studio>& cx) {
         auto chips = vik::div().flex_row().wrap().gap_2();
         for (const char* name : kTrackClasses) {
             chips = std::move(chips).child(
-                vik::div().id("chip").px_3().py_2().rounded_md().cursor_pointer()
+                vik::div().id(std::string("cls-") + name).px_3().py_2().rounded_md().cursor_pointer()
                     .bg(vik::rgb(0x2c313d))
                     .border_1().border_color(vik::rgb(0x3b4250))
                     .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x3a4a68)); })
@@ -1805,9 +2018,307 @@ vik::AnyElement Studio::tool_modal(vik::Context<Studio>& cx, const char* title,
 }
 
 /// Whichever tool is open, or an empty element.
+/// The note editor: a second canvas surface over the lower half of the window.
+///
+/// Same contract as the arrangement -- one canvas for content, real elements
+/// for chrome, hit-testing by inverse function. `pianoroll_check` keeps the
+/// coordinate half of that honest; this function is the input half.
+vik::AnyElement Studio::pianoroll_panel(vik::Context<Studio>& cx) {
+    mx::Score* score = editing_score();
+    if (!score) return vik::div().into_any();
+
+    // Same trick the arrangement canvas uses: the closure runs on the UI
+    // thread during this entity's own update, so a raw pointer is exactly as
+    // valid as `this` and does not touch the refcount.
+    auto* self_ptr = this;
+    auto surface = vik::canvas([self_ptr](vik::Bounds b, vik::Window& w,
+                                          vik::App&) {
+        Studio* s = self_ptr;
+        s->piano_x = b.origin.x;
+        s->piano_y = b.origin.y;
+        s->piano_w = b.size.width;
+        s->piano_h = b.size.height;
+
+        mx::Score* sc = s->editing_score();
+        if (!sc) return;
+        if (!s->piano_framed) {
+            s->piano.frame_notes(*sc, b.size.height);
+            s->piano_framed = true;
+        }
+
+        // The playhead in clip-relative frames, which is what the roll draws
+        // in. Outside the clip it is not shown at all, rather than clamped to
+        // an edge where it would lie about where playback is.
+        int64_t local_head = -1;
+        if (const mx::Clip* c = s->session.find_clip(s->editing_clip)) {
+            const int64_t head = s->playhead();
+            if (head >= c->start_frame && head <= c->start_frame + c->length)
+                local_head = head - c->start_frame;
+        }
+
+        const SkRect rect = SkRect::MakeXYWH(b.origin.x, b.origin.y,
+                                             b.size.width, b.size.height);
+        w.paint_skia([sc, view = s->piano, sel = s->piano_selected,
+                            local_head, rect,
+                            fpb = s->session.frames_per_bar()](SkCanvas* c) {
+            mx::draw_pianoroll(c, rect, *sc, view, sel, local_head, fpb);
+        });
+    }).size_full();
+    // .size_full(), or the canvas is zero-height and draws nothing at all.
+    // Canvas::request_layout builds its style from its own refinement and has
+    // no children, so nothing else can give it a size -- and a zero-height
+    // element paints an empty clip rect rather than failing, which looks
+    // exactly like a panel that opened but did not load.
+
+    const std::string title =
+        score->voice_label.empty() ? std::string("Score") : score->voice_label;
+
+    // Local, like every other panel's: `icon_button` in settings_modal is a
+    // lambda in that function, not a shared helper.
+    auto plain_button = [&cx](const char* id, const char* icon, auto fn) {
+        return vik::div().id(id).px_2().py_1().rounded_md().cursor_pointer()
+            .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x333a4a)); })
+            .on_click(cx.listener(fn))
+            .child(vik::ui::phosphor(icon, vik::ui::PhWeight::Regular)
+                       .size(16.0f).color(vik::rgb(0xe6e8ec)));
+    };
+
+    auto tool_chip = [&cx](const std::string& id, const char* icon,
+                           const char* tip, auto fn) {
+        return vik::div().id(id).px_2().py_1().rounded_md().cursor_pointer()
+            .bg(vik::rgb(0x2c313d))
+            .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x3a4150)); })
+            .tooltip(tip)
+            .on_click(cx.listener(fn))
+            .child(vik::ui::phosphor(icon, vik::ui::PhWeight::Regular)
+                       .size(15.0f).color(vik::rgb(0xe6e8ec)));
+    };
+
+    auto header =
+        vik::div().flex_row().items_center().gap_2().px_3().py_2()
+            .bg(vik::rgb(0x232834))
+            .child(vik::text(title).text_color(vik::rgb(0xffffff)))
+            .child(vik::text(score->key).text_xs().text_color(vik::rgb(0x8d94a3)))
+            .child(vik::text(score->language).text_xs()
+                       .text_color(vik::rgb(0x8d94a3)))
+            .child(vik::div().w_px(12.0f))
+            .child(tool_chip("pr-half", "arrow-line-left", "Halve the note",
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) { s.scale_note(0.5); c.notify(); }))
+            .child(tool_chip("pr-double", "arrow-line-right", "Double the note",
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) { s.scale_note(2.0); c.notify(); }))
+            .child(tool_chip("pr-del", "trash", "Delete the note",
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) { s.delete_note(); c.notify(); }))
+            .child(vik::div().flex_1())
+            .child(vik::text(lyric_editing >= 0
+                                 ? std::string("typing a lyric -- Enter to finish")
+                                 : std::to_string(score->notes.size()) + " notes")
+                       .text_xs()
+                       .text_color(vik::rgb(lyric_editing >= 0 ? 0xffd58a
+                                                              : 0x6c7383)))
+            .child(plain_button("pr-sing", "microphone-stage",
+                [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                   vik::Context<Studio>& c) { s.run_sing(c.app()); c.notify(); }))
+            .child(plain_button("pr-close", "x",
+                [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                   vik::Context<Studio>& c) { s.close_editor(); c.notify(); }));
+
+    return vik::div().absolute().left(0.0f).right(0.0f).bottom(0.0f)
+        .h_px(360.0f)
+        .flex_col()
+        .bg(vik::rgb(0x181b23))
+        // The editor floats over the timeline, so without this its clicks
+        // bubble through and move the playhead behind it -- the same bug the
+        // dock and the modals each had, and it is never visible in a
+        // screenshot.
+        .occlude()
+        .on_mouse_down(vik::MouseButton::Left, cx.listener(
+            [](Studio& s, const vik::MouseDownEvent& e, vik::Window& w,
+               vik::Context<Studio>& c) {
+                w.stop_propagation();
+                mx::Score* score = s.editing_score();
+                if (!score) return;
+                const float x = s.piano_local_x(e.position.x);
+                const float y = s.piano_local_y(e.position.y);
+                if (y < mx::kPianoRulerHeight || x < 0.0f) return;
+
+                const int hit = mx::note_at(*score, s.piano, x, y);
+                if (hit >= 0) {
+                    s.piano_selected = hit;
+                    s.lyric_editing = (e.click_count >= 2) ? hit : -1;
+                    s.piano_drag = hit;
+                    s.piano_grab = mx::grab_kind(*score, s.piano, hit, x);
+                    s.piano_grab_offset =
+                        s.piano.frame_at(x) - score->notes[hit].start;
+                    c.notify();
+                    return;
+                }
+
+                // Empty grid: a click places a note, and immediately takes the
+                // lyric. Placing a note and then hunting for where to type the
+                // word is the step that makes note editors feel like forms.
+                mx::Note n;
+                n.pitch = s.piano.pitch_at(y);
+                n.start = std::max<int64_t>(0, s.snap_frames(s.piano.frame_at(x)));
+                n.length = std::max<int64_t>(1, s.session.frames_per_bar() / 4);
+                score->notes.push_back(n);
+                s.piano_selected = static_cast<int>(score->notes.size()) - 1;
+                s.piano_drag = s.piano_selected;
+                s.piano_grab = mx::NoteGrab::ResizeEnd;
+                s.lyric_editing = s.piano_selected;
+                s.dirty = true;
+                c.notify();
+            }))
+        .on_mouse_up(vik::MouseButton::Left, cx.listener(
+            [](Studio& s, const vik::MouseUpEvent&, vik::Window&,
+               vik::Context<Studio>& c) {
+                if (s.piano_drag < 0) return;
+                s.piano_drag = -1;
+                c.notify();
+            }))
+        .capture_mouse_move(cx.listener(
+            [](Studio& s, const vik::MouseMoveEvent& e, vik::Window&,
+               vik::Context<Studio>& c) {
+                if (s.piano_drag < 0) return;
+                mx::Score* score = s.editing_score();
+                if (!score ||
+                    s.piano_drag >= static_cast<int>(score->notes.size()))
+                    return;
+                mx::Note& n = score->notes[static_cast<size_t>(s.piano_drag)];
+                const float x = s.piano_local_x(e.position.x);
+                const float y = s.piano_local_y(e.position.y);
+
+                if (s.piano_grab == mx::NoteGrab::ResizeEnd) {
+                    const int64_t end = s.snap_frames(s.piano.frame_at(x));
+                    // Never allowed to reach zero: the note would vanish
+                    // mid-drag with nothing left to hold on to.
+                    n.length = std::max<int64_t>(s.session.frames_per_bar() / 16,
+                                                 end - n.start);
+                } else {
+                    n.start = std::max<int64_t>(
+                        0, s.snap_frames(s.piano.frame_at(x) - s.piano_grab_offset));
+                    n.pitch = s.piano.pitch_at(y);
+                }
+                s.dirty = true;
+                c.notify();
+            }))
+        .on_scroll_wheel(cx.listener(
+            [](Studio& s, const vik::ScrollWheelEvent& e, vik::Window&,
+               vik::Context<Studio>& c) {
+                // The same map as the timeline. Two surfaces that navigate
+                // differently is what makes an app feel assembled rather than
+                // designed.
+                const float x = s.piano_local_x(e.position.x);
+                const float y = s.piano_local_y(e.position.y);
+                const double vert = e.delta.y;
+                const double horz = e.delta.x;
+                if (vert == 0.0 && horz == 0.0) return;
+
+                if (vert != 0.0 && e.modifiers.control && e.modifiers.shift) {
+                    const uint8_t under = s.piano.pitch_at(y);
+                    s.piano.row_h = std::clamp(
+                        s.piano.row_h * (vert > 0.0 ? 1.0f / 1.15f : 1.15f),
+                        mx::kRowHeightMin, mx::kRowHeightMax);
+                    // Keep the pitch under the cursor under the cursor.
+                    s.piano.scroll_y_px += s.piano.y_of(under) - y;
+                } else if (vert != 0.0 &&
+                           (e.modifiers.control || e.modifiers.alt)) {
+                    const int64_t anchor = s.piano.frame_at(x);
+                    s.piano.frames_per_pixel = std::clamp(
+                        s.piano.frames_per_pixel * (vert > 0.0 ? 1.0 / 1.2 : 1.2),
+                        4.0, 262144.0);
+                    s.piano.scroll_frames =
+                        anchor - static_cast<int64_t>(
+                                     std::llround(x * s.piano.frames_per_pixel));
+                    if (s.piano.scroll_frames < 0) s.piano.scroll_frames = 0;
+                } else if (vert != 0.0 && !e.modifiers.shift) {
+                    s.piano.scroll_y_px -= static_cast<float>(vert * 40.0);
+                } else if (vert != 0.0) {
+                    s.piano_scroll_time(-vert * 3.0);
+                }
+                if (horz != 0.0) s.piano_scroll_time(-horz * 3.0);
+                s.piano.clamp_y(s.piano_h);
+                c.notify();
+            }))
+        .child(std::move(header))
+        .child(vik::div().flex_1().relative().overflow_hidden()
+                   .child(std::move(surface)))
+        .into_any();
+}
+
+/// What double-clicking empty canvas offers, as in the reference.
+///
+/// Three explicit choices rather than one silent default. Creating a vocal
+/// track because that is the commonest case would be the same mistake as
+/// auto-splitting a generate: convenient once, wrong every other time, and
+/// invisible until you notice the wrong kind of track appeared.
+vik::AnyElement Studio::new_clip_menu(vik::Context<Studio>& cx) {
+    auto row = [&cx](const std::string& id, const char* icon, const char* label,
+                     bool enabled, const char* why, auto fn) {
+        auto item = vik::div().id(id).flex_row().items_center().gap_3()
+            .px_3().py_2().rounded_md()
+            .child(vik::div().px_2().py_1().rounded_sm()
+                       .bg(vik::rgb(enabled ? 0x2c313d : 0x22262f))
+                       .child(vik::ui::phosphor(icon, vik::ui::PhWeight::Regular)
+                                  .size(16.0f)
+                                  .color(vik::rgb(enabled ? 0xe6e8ec : 0x565c6b))))
+            .child(vik::text(label)
+                       .text_color(vik::rgb(enabled ? 0xe6e8ec : 0x565c6b)));
+        if (enabled) {
+            item = std::move(item).cursor_pointer()
+                .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x333a4a)); })
+                .on_click(cx.listener(fn));
+        } else {
+            item = std::move(item).tooltip(why);
+        }
+        return item;
+    };
+
+    return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
+        .occlude()
+        .on_mouse_down(vik::MouseButton::Left, cx.listener(
+            [](Studio& s, const vik::MouseDownEvent&, vik::Window&,
+               vik::Context<Studio>& c) {
+                s.show_new_clip_menu = false;
+                c.notify();
+            }))
+        .child(vik::div().absolute()
+            .left(std::max(8.0f, new_clip_pos.x - 20.0f))
+            .top(std::max(8.0f, new_clip_pos.y - 10.0f))
+            .w_px(300.0f).flex_col().gap_1().p_2()
+            .rounded_lg().bg(vik::rgb(0x1b1e27))
+            .border_1().border_color(vik::rgb(0x3b4250))
+            .occlude()
+            .on_mouse_down(vik::MouseButton::Left,
+                [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
+                    w.stop_propagation();
+                })
+            .child(row("nc-vocal", "microphone-stage", "Generate vocal from MIDI",
+                       true, "",
+                       [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                          vik::Context<Studio>& c) {
+                           s.create_score_clip(/*vocal=*/true);
+                           c.notify();
+                       }))
+            .child(row("nc-inst", "guitar", "Generate instrument from MIDI",
+                       false,
+                       "Needs the instrument engine, which is not installed yet",
+                       [](Studio&, const vik::ClickEvent&, vik::Window&,
+                          vik::Context<Studio>&) {}))
+            .child(vik::div().h_px(1.0f).mx(4.0f).my(2.0f)
+                       .bg(vik::rgb(0x2c313d)))
+            .child(row("nc-import", "download-simple", "Import Audio or MIDI",
+                       false, "Not built yet",
+                       [](Studio&, const vik::ClickEvent&, vik::Window&,
+                          vik::Context<Studio>&) {})))
+        .into_any();
+}
+
 vik::AnyElement Studio::current_tool_modal(vik::Context<Studio>& cx) {
     auto chip = [&cx](const std::string& label, bool on, auto fn) {
-        return vik::div().id("tc").px_3().py_2().rounded_md().cursor_pointer()
+        return vik::div().id("tc-" + label).px_3().py_2().rounded_md().cursor_pointer()
             .bg(vik::rgb(on ? 0x3a4a68 : 0x2c313d))
             .border_1().border_color(vik::rgb(on ? 0x5b5bd6 : 0x3b4250))
             .on_click(cx.listener(fn))
@@ -1849,7 +2360,7 @@ vik::AnyElement Studio::current_tool_modal(vik::Context<Studio>& cx) {
         auto chips = vik::div().flex_row().wrap().gap_2();
         for (const char* name : kTrackClasses) {
             chips = std::move(chips).child(
-                vik::div().id("lc").px_3().py_2().rounded_md().cursor_pointer()
+                vik::div().id(std::string("lc-") + name).px_3().py_2().rounded_md().cursor_pointer()
                     .bg(vik::rgb(0x2c313d))
                     .border_1().border_color(vik::rgb(0x3b4250))
                     .hover([](vik::StyleRefinement& st) { st.bg(vik::rgb(0x3a4a68)); })
@@ -1963,7 +2474,7 @@ vik::AnyElement Studio::quality_chip(vik::Context<Studio>& cx, const char* tier,
         }
     }
 
-    auto chip = vik::div().id("qc").px_3().py_1().rounded_md()
+    auto chip = vik::div().id(std::string("qc-") + tier).px_3().py_1().rounded_md()
         .bg(vik::rgb(on ? 0x3a4a68 : 0x2c313d))
         .child(vik::text(label).text_color(
             vik::rgb(!real ? 0x565c6b : (on ? 0xffffff : 0x8d94a3))));
@@ -2204,21 +2715,23 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                        vik::Context<Studio>& c) { s.export_mix(); c.notify(); })));
 
     // --- track headers: real elements, because they are chrome --------------
-    auto headers = vik::div().flex_col().w_px(160.0f)
-                       .bg(vik::rgb(0x1b1e27))
-                       .border_1().border_color(vik::rgb(0x2c313d))
-                       .child(vik::div().h_px(mx::kRulerHeight));
+    // These are elements while the lanes beside them are one canvas, so the
+    // vertical scroll has to be applied twice, from the same number. A shifted
+    // canvas next to an unshifted header column is the single most likely bug
+    // in vertical scrolling, so `zoom_check` asserts the two agree.
+    auto lanes_col = vik::div().flex_col().mt(-view.scroll_y_px);
 
     for (size_t i = 0; i < session.tracks.size(); ++i) {
         const auto& t = session.tracks[i];
         const auto tid = t.id;
-        headers = std::move(headers).child(
-            vik::div().h_px(mx::kTrackHeight).mb(mx::kTrackGap)
+        lanes_col = std::move(lanes_col).child(
+            vik::div().h_px(view.track_h).mb(mx::kTrackGap)
                 .flex_col().justify_center().gap_1().px_3()
                 .bg(vik::rgb(0x1e222c))
                 .child(vik::text(t.name).text_color(vik::rgb(0xe6e8ec)))
                 .child(vik::div().flex_row().gap_2()
-                    .child(vik::div().id("m").px_2().rounded_sm().cursor_pointer()
+                    .child(vik::div().id(std::format("mute{}", tid))
+                        .px_2().rounded_sm().cursor_pointer()
                         .bg(t.muted ? vik::rgb(0xc0503c) : vik::rgb(0x2c313d))
                         .on_click(cx.listener([tid](Studio& s, const vik::ClickEvent&,
                                                     vik::Window&,
@@ -2231,7 +2744,8 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                                    .size(13.0f)
                                    .color(t.muted ? vik::rgb(0xffffff)
                                                   : vik::rgb(0x8d94a3))))
-                    .child(vik::div().id("s").px_2().rounded_sm().cursor_pointer()
+                    .child(vik::div().id(std::format("solo{}", tid))
+                        .px_2().rounded_sm().cursor_pointer()
                         .bg(t.soloed ? vik::rgb(0xc7a13c) : vik::rgb(0x2c313d))
                         .on_click(cx.listener([tid](Studio& s, const vik::ClickEvent&,
                                                     vik::Window&,
@@ -2245,6 +2759,13 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                                    .color(t.soloed ? vik::rgb(0xffffff)
                                                    : vik::rgb(0x8d94a3))))));
     }
+
+    auto headers = vik::div().flex_col().w_px(160.0f)
+                       .bg(vik::rgb(0x1b1e27))
+                       .border_1().border_color(vik::rgb(0x2c313d))
+                       .child(vik::div().h_px(mx::kRulerHeight))
+                       .child(vik::div().flex_1().flex_col().overflow_hidden()
+                                  .child(std::move(lanes_col)));
 
     // --- the arrangement: one canvas ---------------------------------------
     auto surface = vik::canvas([self](vik::Bounds b, vik::Window& w, vik::App&) {
@@ -2264,6 +2785,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             const auto t1 = std::chrono::steady_clock::now();
             self->columns = stats.columns_drawn;
             self->timeline_px = b.size.width;
+            self->timeline_h  = b.size.height;
             self->canvas_x = b.origin.x;
             self->canvas_y = b.origin.y;
             self->build_ms = stats.build_ms;
@@ -2425,6 +2947,36 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     // surface origin; event positions are already local.
                     const float x = s.local_x(e.position.x);
                     const float y = s.local_y(e.position.y);
+
+                    // Double-click opens things, as in the reference: a score
+                    // clip opens its notes, and empty canvas offers to make
+                    // one. Handled before anything else, because the same
+                    // press would otherwise also seek or start a drag.
+                    if (e.click_count >= 2 && y >= mx::kRulerHeight) {
+                        if (const mx::ClipId id = s.clip_at(x, y)) {
+                            if (const auto* clip = s.session.find_clip(id)) {
+                                if (clip->score_id) {
+                                    s.selected = id;
+                                    s.open_editor(id);
+                                    s.dragging = 0;
+                                    s.scrubbing = false;
+                                    c.notify();
+                                    return;
+                                }
+                            }
+                        } else {
+                            s.show_new_clip_menu = true;
+                            s.new_clip_at = s.view.frame_at(x);
+                            s.new_clip_lane = s.view.track_at(
+                                y, static_cast<int>(s.session.tracks.size()));
+                            s.new_clip_pos = e.position;
+                            s.dragging = 0;
+                            s.scrubbing = false;
+                            c.notify();
+                            return;
+                        }
+                    }
+
                     // Click anywhere that is not a clip to move the playhead,
                     // the way every editor does it. Restricting that to a 28px
                     // ruler strip made the playhead feel stuck, because almost
@@ -2436,7 +2988,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                         // Shift-drag selects a time range on the track under
                         // the cursor. Plain drag still moves the clip, so the
                         // two never fight over the same gesture.
-                        const int lane = mx::track_at(
+                        const int lane = s.view.track_at(
                             y, static_cast<int>(s.session.tracks.size()));
                         if (lane >= 0) {
                             s.selecting = true;
@@ -2461,6 +3013,16 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             .capture_mouse_move(cx.listener(
                 [](Studio& s, const vik::MouseMoveEvent& e, vik::Window&,
                    vik::Context<Studio>& c) {
+                    if (s.panning) {
+                        // Drag the content with the pointer, so the surface
+                        // follows the hand rather than opposing it.
+                        s.scroll_time(-(e.position.x - s.pan_from.x));
+                        s.view.scroll_y_px -= e.position.y - s.pan_from.y;
+                        s.pan_from = e.position;
+                        s.clamp_view();
+                        c.notify();
+                        return;
+                    }
                     if (s.scrubbing) {
                         s.seek(s.view.frame_at(s.local_x(e.position.x)));
                         c.notify();
@@ -2507,27 +3069,56 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
             .on_scroll_wheel(cx.listener(
                 [](Studio& s, const vik::ScrollWheelEvent& e, vik::Window&,
                    vik::Context<Studio>& c) {
-                    // A plain wheel only reports delta.y. Scrolling the timeline
-                    // off delta.x meant an ordinary mouse did nothing at all,
-                    // which is most of why navigation felt broken.
-                    const double step = e.delta.y != 0.0f ? e.delta.y : e.delta.x;
-                    if (step == 0.0) return;
+                    // The map every desktop DAW shares -- Reaper, Studio One,
+                    // Cubase, Resolve. It was worth changing away from "wheel
+                    // scrolls time" precisely because it is not ours to invent:
+                    // a wheel that does the wrong thing is wrong on first
+                    // contact, before anyone reads a shortcut list.
+                    //
+                    //   wheel              scroll tracks
+                    //   shift + wheel      scroll time
+                    //   ctrl  + wheel      zoom time about the cursor
+                    //   ctrl+shift+wheel   track height about the cursor
+                    //
+                    // delta.x is a trackpad's horizontal swipe, which always
+                    // means time whatever the modifiers say.
+                    const float x = s.local_x(e.position.x);
+                    const float y = s.local_y(e.position.y);
+                    const double vert = e.delta.y;
+                    const double horz = e.delta.x;
+                    if (vert == 0.0 && horz == 0.0) return;
 
-                    if (e.modifiers.control || e.modifiers.alt) {
-                        // Ctrl+wheel zooms about the cursor: wheel up zooms in,
-                        // and the frame under the pointer stays under it. That
-                        // is the behaviour every editor shares, and getting the
-                        // direction backwards is instantly wrong to anyone.
-                        const double factor = step > 0.0 ? 1.0 / 1.2 : 1.2;
-                        s.view.zoom_about(s.local_x(e.position.x), factor, 4.0, 262144.0);
-                    } else {
-                        // Otherwise scroll the timeline horizontally, since that
-                        // is the axis a timeline has.
-                        s.view.scroll_frames = std::max<int64_t>(
-                            0, s.view.scroll_frames -
-                                   static_cast<int64_t>(step * 3.0 *
-                                                        s.view.frames_per_pixel));
+                    if (vert != 0.0 && e.modifiers.control && e.modifiers.shift) {
+                        s.view.zoom_tracks_about(y, vert > 0.0 ? 1.0f / 1.15f : 1.15f);
+                    } else if (vert != 0.0 && (e.modifiers.control || e.modifiers.alt)) {
+                        // Wheel up zooms in, and the frame under the pointer
+                        // stays under it.
+                        const double factor = vert > 0.0 ? 1.0 / 1.2 : 1.2;
+                        s.view.zoom_about(x, factor, 4.0, 262144.0);
+                    } else if (vert != 0.0 && !e.modifiers.shift) {
+                        s.view.scroll_y_px -= static_cast<float>(vert * 40.0);
+                    } else if (vert != 0.0) {
+                        s.scroll_time(-vert * 3.0);
                     }
+                    if (horz != 0.0) s.scroll_time(-horz * 3.0);
+
+                    s.clamp_view();
+                    c.notify();
+                }))
+            // Middle-drag pans both axes, the one gesture that needs no
+            // modifier and no mode. Not space+drag: Space is the transport, and
+            // a key that sometimes means play is worse than a missing gesture.
+            .on_mouse_down(vik::MouseButton::Middle, cx.listener(
+                [](Studio& s, const vik::MouseDownEvent& e, vik::Window&,
+                   vik::Context<Studio>& c) {
+                    s.panning = true;
+                    s.pan_from = e.position;
+                    c.notify();
+                }))
+            .on_mouse_up(vik::MouseButton::Middle, cx.listener(
+                [](Studio& s, const vik::MouseUpEvent&, vik::Window&,
+                   vik::Context<Studio>& c) {
+                    s.panning = false;
                     c.notify();
                 }));
 
@@ -2606,11 +3197,18 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     c.notify();
                 })));
 
+    // The editor is a layer of its own, not an `overlay` case: a modal opened
+    // from inside it must appear over it, not replace it.
+    vik::AnyElement editor = editing_clip ? pianoroll_panel(cx)
+                                          : vik::div().into_any();
+
     vik::AnyElement overlay = vik::div().into_any();
 
     if (show_generate) overlay = generate_modal(cx);
 
     if (show_layers) overlay = layer_modal(cx);
+
+    if (show_new_clip_menu) overlay = new_clip_menu(cx);
 
     if (tool != Tool::None)
         overlay = current_tool_modal(cx);
@@ -2621,9 +3219,14 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
     // reference reaches every one of them. vikui's context_menu_area already
     // does open-at-cursor, submenu flyouts and dismiss-on-escape, so none of
     // that is ours to write.
+    // .fill(), or the wrapper hugs its content and the timeline -- canvas,
+    // ruler and dock alike -- collapses to nothing. Adding the right-click menu
+    // silently emptied the whole pane, because a zero-height element draws
+    // nothing at all rather than drawing badly.
     auto timeline_area =
         vik::ui::context_menu_area("timeline-tools", ai_tools_menu(cx),
-                                   std::move(timeline).into_any());
+                                   std::move(timeline).into_any())
+            .fill();
 
     return vik::div().size_full().flex_col().relative().bg(vik::rgb(0x14161d))
         .track_focus(keys)
@@ -2657,6 +3260,35 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 // A modal owns the keyboard while it is open. Firing
                 // timeline shortcuts underneath one is the keyboard version of
                 // the click falling through.
+                // Typing a lyric owns the keyboard completely. Without
+                // this, writing "space" plays and stops the song, and every
+                // letter that happens to be a shortcut fires it -- which is
+                // most of them.
+                if (s.lyric_editing >= 0) {
+                    s.type_lyric(e.key);
+                    c.notify();
+                    return;
+                }
+
+                if (s.editing_clip && e.key == "escape") {
+                    s.close_editor();
+                    c.notify();
+                    return;
+                }
+                if (s.editing_clip && (e.key == "delete" || e.key == "backspace")) {
+                    s.delete_note();
+                    c.notify();
+                    return;
+                }
+
+                if (s.show_new_clip_menu) {
+                    if (e.key == "escape") {
+                        s.show_new_clip_menu = false;
+                        c.notify();
+                    }
+                    return;
+                }
+
                 if (s.tool != Tool::None || s.show_generate ||
                     s.show_layers || s.show_settings) {
                     if (e.key == "escape") {
@@ -2676,6 +3308,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     s.show_layers = !s.show_layers;
                 else if (e.key == "escape") s.selection.clear();
                 else if (e.key == "home") s.seek(0);
+                else if (e.key == "f") s.fit_view();
                 else if (e.key == "l") {
                     auto& t = g_mixer.transport;
                     t.looping.store(!t.looping.load());
@@ -2687,6 +3320,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                    .child(std::move(sidebar))
                    .child(std::move(headers))
                    .child(std::move(timeline_area)))
+        .child(std::move(editor))
         .child(std::move(overlay))
         .into_any();
 }
@@ -2898,6 +3532,22 @@ int document_roundtrip(const fs::path& folder) {
     if (!load_synchronously(studio, folder)) return 1;
     studio.session.title = "roundtrip";
 
+    // A score clip too. Notes that do not survive a save are worse than no
+    // notes at all: the loss is silent, and the work is gone before anyone
+    // notices the file is smaller.
+    {
+        auto& track = studio.session.add_track("Elirah", 0xff7f8cf0);
+        auto& clip = studio.session.add_score_clip(track.id, "elirah", "Elirah",
+                                                   0, 48000 * 4);
+        if (auto* score = studio.session.find_score(clip.score_id)) {
+            const char* words[] = {"twin", "kle", "twin", "kle"};
+            const uint8_t pitches[] = {60, 60, 67, 67};
+            for (int i = 0; i < 4; ++i)
+                score->notes.push_back(
+                    mx::Note{i * 24000, 22000, pitches[i], words[i]});
+        }
+    }
+
     const auto path = fs::temp_directory_path() / "roundtrip.mmproj";
     std::string error;
     if (!mx::save_document(studio.session, path, &error)) {
@@ -2906,9 +3556,9 @@ int document_roundtrip(const fs::path& folder) {
     }
     std::printf("saved   %s (%ju bytes)\n", path.string().c_str(),
                 static_cast<uintmax_t>(fs::file_size(path)));
-    std::printf("  before: %zu tracks, %zu clips, %zu sources, %.2fs\n",
+    std::printf("  before: %zu tracks, %zu clips, %zu sources, %zu scores, %.2fs\n",
                 studio.session.tracks.size(), studio.session.clips.size(),
-                studio.session.sources.size(),
+                studio.session.sources.size(), studio.session.scores.size(),
                 studio.session.length_frames() / 48000.0);
 
     mx::Session reloaded;
@@ -2917,15 +3567,43 @@ int document_roundtrip(const fs::path& folder) {
         std::printf("load failed: %s\n", result.error.c_str());
         return 1;
     }
-    std::printf("  after : %zu tracks, %zu clips, %zu sources, %.2fs\n",
+    std::printf("  after : %zu tracks, %zu clips, %zu sources, %zu scores, %.2fs\n",
                 reloaded.tracks.size(), reloaded.clips.size(),
-                reloaded.sources.size(), reloaded.length_frames() / 48000.0);
+                reloaded.sources.size(), reloaded.scores.size(), reloaded.length_frames() / 48000.0);
+
+    // Compare the notes themselves, not just how many there are: a serialiser
+    // that drops the lyric or the pitch would pass a count check while losing
+    // the only two fields that matter.
+    bool notes_match = reloaded.scores.size() == studio.session.scores.size();
+    for (size_t i = 0; notes_match && i < reloaded.scores.size(); ++i) {
+        const auto& a = studio.session.scores[i];
+        const auto& b = reloaded.scores[i];
+        notes_match = a.notes.size() == b.notes.size() &&
+                      a.voice_id == b.voice_id && a.language == b.language;
+        for (size_t n = 0; notes_match && n < a.notes.size(); ++n)
+            notes_match = a.notes[n].start == b.notes[n].start &&
+                          a.notes[n].length == b.notes[n].length &&
+                          a.notes[n].pitch == b.notes[n].pitch &&
+                          a.notes[n].lyric == b.notes[n].lyric;
+    }
+    // And that each clip still points at its own score.
+    bool links_match = reloaded.clips.size() == studio.session.clips.size();
+    for (size_t i = 0; links_match && i < reloaded.clips.size(); ++i)
+        links_match =
+            reloaded.clips[i].score_id == studio.session.clips[i].score_id &&
+            reloaded.clips[i].source_id == studio.session.clips[i].source_id;
+
+    std::printf("  notes : %s   links: %s\n",
+                notes_match ? "identical" : "CHANGED",
+                links_match ? "intact" : "BROKEN");
 
     const bool same = reloaded.tracks.size() == studio.session.tracks.size() &&
                       reloaded.clips.size() == studio.session.clips.size() &&
                       reloaded.sources.size() == studio.session.sources.size() &&
                       reloaded.title == studio.session.title &&
-                      reloaded.next_clip == studio.session.next_clip;
+                      reloaded.next_clip == studio.session.next_clip &&
+                      reloaded.next_score == studio.session.next_score &&
+                      notes_match && links_match;
     std::printf("  ids   : next_clip %u -> %u\n",
                 studio.session.next_clip, reloaded.next_clip);
     std::printf("%s\n", same ? "PASS  document round-trips"
