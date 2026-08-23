@@ -46,6 +46,7 @@
 #include "vikui/elements/canvas.h"
 #include "components/menu.h"
 #include "components/phosphor.h"
+#include "components/text_input.h"
 
 #include <include/core/SkStream.h>
 #include <include/core/SkSurface.h>
@@ -54,6 +55,24 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+/// Strip surrounding whitespace. Pasted URLs and tokens routinely carry a
+/// trailing newline, and a token with one on the end fails to authenticate
+/// while looking, character for character, exactly right.
+std::string trimmed(const std::string& text) {
+    const auto first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const auto last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+/// Trimmed, and without the trailing slash that would double up in every
+/// path we build by concatenation.
+std::string clean_url(const std::string& text) {
+    std::string url = trimmed(text);
+    while (!url.empty() && url.back() == '/') url.pop_back();
+    return url;
+}
 
 // ---------------------------------------------------------------------------
 // Worker -> UI
@@ -481,6 +500,15 @@ struct Studio {
     std::string pod_url;
     std::string pod_token;
     std::string net_status = "not connected";
+    /// Editable address and token fields in Settings.
+    ///
+    /// Created on first open rather than at construction: text_input_state
+    /// needs an App and Studio is built before there is one. Until now the URL
+    /// was display-only and the modal told you to relaunch with --connect,
+    /// which is an instruction rather than a setting.
+    vik::Handle<vik::ui::TextInputState> url_input;
+    vik::Handle<vik::ui::TextInputState> token_input;
+    bool inputs_ready = false;
 
     /// What the pod is doing for us right now.
     ///
@@ -627,11 +655,41 @@ struct Studio {
 
     /// Switch where renders happen. Nothing else changes: the client speaks to
     /// a URL, so a mode is which URL, not a second implementation.
+    /// Persist what the settings fields changed, then try it.
+    ///
+    /// Editing writes into `settings` as you type so the panel reflects it,
+    /// but saving on every keystroke would litter the disk and store every
+    /// half-typed address. This is the commit point.
+    void save_connection(vik::App& app) {
+        settings.save();
+        pod_url = settings.active_url();
+        pod_token = settings.active_token();
+        caps = mx::net::Capabilities{};   // re-ask; a new engine is a new answer
+        net_error = false;
+        if (pod_url.empty()) {
+            net_status = "no address set";
+            return;
+        }
+        connect(app);
+    }
+
     void set_mode(mx::Mode mode, vik::App& app) {
         settings.mode = mode;
         settings.save();
         pod_url = settings.active_url();
         pod_token = settings.active_token();
+        // The field shows whichever address the new mode points at. Without
+        // this it keeps displaying the old one, and the next keystroke saves
+        // the local address over the pod's.
+        if (inputs_ready) {
+            const std::string current = pod_url;
+            app.update_entity(url_input,
+                [&current](vik::ui::TextInputState& t,
+                           vik::Context<vik::ui::TextInputState>&) {
+                    t.content = current;
+                    t.move_end(false);
+                });
+        }
         projects.clear();
         net_error = false;
         net_status = pod_url.empty() ? "no address set" : "not connected";
@@ -1688,7 +1746,12 @@ struct Studio {
                     // Never leave the picker on a tier this engine will not
                     // honour -- offering it is the whole failure being avoided.
                     if (caps.known && !caps.tier_is_real(gen_quality)) {
-                        for (const char* fallback : {"fast", "high", "ultra"})
+                        // Best first, not fastest first. Dropping to `fast`
+                        // silently picks the turbo checkpoint, which carries
+                        // four of the seven task types -- so asking for a tier
+                        // this engine cannot honour would quietly cost you Add
+                        // a Layer and Extend as well as the quality.
+                        for (const char* fallback : {"ultra", "high", "fast"})
                             if (caps.tier_is_real(fallback)) {
                                 gen_quality = fallback;
                                 break;
@@ -1819,6 +1882,22 @@ struct Studio {
 /// The instrument picker, in its own frame. See generate_modal for why.
 /// Connection settings, in its own frame. See generate_modal for why.
 vik::AnyElement Studio::settings_modal(vik::Context<Studio>& cx) {
+    // The fields are entities, and entities need an App, which Studio does not
+    // have when it is constructed. First open is the earliest point one exists.
+    // Seeded from settings here and never again, so typing is not fought by a
+    // re-seed on every repaint.
+    if (!inputs_ready) {
+        url_input = vik::ui::text_input_state(cx.app());
+        token_input = vik::ui::text_input_state(cx.app());
+        const std::string current = settings.active_url();
+        cx.app().update_entity(url_input,
+            [&current](vik::ui::TextInputState& t, vik::Context<vik::ui::TextInputState>&) {
+                t.content = current;
+                t.move_end(false);
+            });
+        inputs_ready = true;
+    }
+
     auto icon_button = [&cx](const char* id, const char* icon, bool active, auto fn) {
         return vik::div().id(id).px_3().py_2().rounded_md()
             .flex_row().items_center().justify_center()
@@ -1889,16 +1968,76 @@ vik::AnyElement Studio::settings_modal(vik::Context<Studio>& cx) {
                 .child(mode_chip("Cloud", "a RunPod pod", cloud,
                                  mx::Mode::Cloud)))
 
-            .child(vik::text(pod_url.empty() ? "no address set" : pod_url)
-                       .text_color(vik::rgb(0xc9cedb)))
+            // The address, editable at last. Which URL this edits follows the
+            // mode switch above, so Local and Cloud keep their own addresses
+            // and switching back never means retyping the pod.
+            .child(vik::text(cloud ? "Pod address" : "Local address")
+                       .text_xs().text_color(vik::rgb(0x8d94a3)))
+            .child(vik::ui::text_input("s-url", url_input)
+                       .placeholder(cloud ? "https://<pod>-8000.proxy.runpod.net"
+                                          : "http://127.0.0.1:8000")
+                       .w_full()
+                       .on_change(cx.listener(
+                           [](Studio& s, const std::string& value, vik::Window&,
+                              vik::Context<Studio>& c) {
+                               const std::string url = clean_url(value);
+                               if (s.settings.mode == mx::Mode::Cloud)
+                                   s.settings.pod_url = url;
+                               else
+                                   s.settings.local_url = url;
+                               s.pod_url = url;
+                               c.notify();
+                           }))
+                       .on_submit(cx.listener(
+                           [](Studio& s, const std::string&, vik::Window&,
+                              vik::Context<Studio>& c) {
+                               s.save_connection(c.app());
+                               c.notify();
+                           })))
+
+            // The token, cloud only. Never seeded from what is stored: the
+            // field starts empty and blank means "keep it". Echoing a saved
+            // credential into a visible field puts it on screen every time
+            // this panel is opened for some unrelated reason.
+            .child(vik::text(!cloud ? "Access token (cloud only)"
+                                    : pod_token.empty()
+                                          ? "Access token"
+                                          : "Access token (one is stored)")
+                       .text_xs().text_color(vik::rgb(0x8d94a3)))
+            .child(vik::ui::text_input("s-token", token_input)
+                       .placeholder(pod_token.empty()
+                                        ? "paste the pod token"
+                                        : "leave blank to keep the stored one")
+                       .w_full()
+                       .disabled(!cloud)
+                       .on_change(cx.listener(
+                           [](Studio& s, const std::string& value, vik::Window&,
+                              vik::Context<Studio>& c) {
+                               const std::string token = trimmed(value);
+                               if (!token.empty()) {
+                                   s.settings.pod_token = token;
+                                   s.pod_token = token;
+                               }
+                               c.notify();
+                           }))
+                       .on_submit(cx.listener(
+                           [](Studio& s, const std::string&, vik::Window&,
+                              vik::Context<Studio>& c) {
+                               s.save_connection(c.app());
+                               c.notify();
+                           })))
+
             .child(vik::text(net_status).text_xs()
                        .text_color(vik::rgb(net_error ? 0xe05c72 : 0x8d94a3)))
 
             .child(vik::div().flex_row().items_center().gap_2()
                 .child(icon_button("s-conn", "plugs-connected", false,
                     [](Studio& s, const vik::ClickEvent&, vik::Window&,
-                       vik::Context<Studio>& c) { s.connect(c.app()); c.notify(); }))
-                .child(vik::text("Test the connection")
+                       vik::Context<Studio>& c) {
+                        s.save_connection(c.app());
+                        c.notify();
+                    }))
+                .child(vik::text("Save and connect  (or press Enter in a field)")
                            .text_xs().text_color(vik::rgb(0x8d94a3))))
 
             // Say what each mode needs, rather than leaving a failed connection
@@ -3967,7 +4106,12 @@ int main(int argc, char** argv) {
                     // A pod URL still connects in the background whichever
                     // screen is shown -- knowing what the engine can do is
                     // what the home screen reports.
-                    if (!pod_url.empty()) {
+                    // s.pod_url, not the --connect argument. The configured
+                    // engine is the one to ask; without this the app only ever
+                    // connected when a URL was passed on the command line, so
+                    // local mode sat at "not connected" forever and the home
+                    // screen's engine line said nothing useful.
+                    if (!s.pod_url.empty()) {
                         if (!pod_project.empty()) s.open_project(pod_project, app);
                         else s.connect(app);
                     }

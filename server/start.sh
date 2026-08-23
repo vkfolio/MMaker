@@ -76,7 +76,7 @@ else
   # that actually happened here was silent degradation to the weakest model.
   # There are only three slots, which is exactly the number of tiers.
   CKPT_DIR="${ACESTEP_CHECKPOINT_DIR:-$ACESTEP_DIR/checkpoints}"
-  PREFERENCE="${ACESTEP_MODEL_PREFERENCE:-acestep-v15-xl-base acestep-v15-xl-turbo acestep-v15-turbo}"
+  PREFERENCE="${ACESTEP_MODEL_PREFERENCE:-acestep-v15-xl-base acestep-v15-xl-turbo acestep-v15-base acestep-v15-turbo}"
 
   slot=1
   registered=""
@@ -96,7 +96,12 @@ else
   case "$registered" in
     *xl-base*)  : ;;
     *xl-turbo*) log "no acestep-v15-xl-base -- 'ultra' will render as 'high'" ;;
-    *)          log "only acestep-v15-turbo present -- every tier renders as 'fast'"
+    # acestep-v15-base is not a downgrade in capability, only in size: it is
+    # the smallest checkpoint that implements every task type, so lego,
+    # complete and extract work here where turbo alone would refuse them.
+    *v15-base*) log "no XL weights -- 'ultra' renders as acestep-v15-base" ;;
+    *)          log "only acestep-v15-turbo present -- every tier renders as 'fast',"
+                log "  and Add a Layer, Extend and Extract are unavailable"
                 log "  fetch better weights: bash tools/fetch-quality-weights.sh all" ;;
   esac
 
