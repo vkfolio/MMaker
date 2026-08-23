@@ -14,7 +14,9 @@ from pathlib import Path
 
 import math
 
-from . import analysis, audio, engines, presets, storage, voices
+import time
+
+from . import analysis, audio, engines, midi, presets, storage, voices
 from .base_errors import NotReady, RenderError
 from .schemas import (CoverRequest, Grid, Project, Stem, StemVersion, SyncReport,
                       TrackClass, Variation)
@@ -526,6 +528,78 @@ def generate_vocals(project: Project, lyrics: str | None = None,
         if report:
             report(0.85, "applying voice")
         apply_voice(project, stem, voice_id)
+    return stem.model_dump()
+
+
+def render_score(project: Project, notes, bpm: int | None = None,
+                 program: int = 0, label: str = "Score",
+                 track_class: TrackClass = "keyboard",
+                 prompt: str | None = None, seed: int | None = None,
+                 report=None) -> dict:
+    """Render notes to audio, and optionally reimagine that render.
+
+    Two stages, both optional to the caller. The sampler alone is offline,
+    deterministic and immediate -- it is what makes a piano roll audible at all,
+    and it is the honest floor of quality. Given a prompt, the General MIDI
+    render then becomes `src_audio` for a cover, which is how a triggered patch
+    turns into something that sounds played. That second stage is the same path
+    a hummed take takes, and it needs no note conditioning from the model --
+    which is fortunate, because ACE-Step has none.
+
+    The stem is a normal stem afterwards. Repaint, cover, voice and the version
+    history all work on it, because the audio is what they act on and the score
+    is the desktop's business.
+    """
+    if not notes:
+        raise NotReady("there are no notes to render")
+
+    grid_bpm = bpm or project.grid.bpm
+    out_dir = storage.project_dir(project.id) / "scores"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = int(time.time() * 1000)
+
+    if report:
+        report(0.1, "writing the score")
+    smf_path = out_dir / f"score_{stamp}.mid"
+    midi.write_smf(notes, smf_path, bpm=grid_bpm, program=program)
+
+    if report:
+        report(0.3, "playing it")
+    rendered = out_dir / f"score_{stamp}.wav"
+    try:
+        midi.render(smf_path, rendered)
+    except RenderError as exc:
+        # Say which of the two things is missing rather than "render failed".
+        raise NotReady(f"cannot play the score: {exc}") from exc
+
+    final = rendered
+    op = "score"
+    params: dict = {"bpm": grid_bpm, "program": program, "notes": len(notes)}
+
+    if prompt:
+        if report:
+            report(0.5, "reimagining it")
+        seed = _seed(seed)
+        composed = presets.build_prompt(prompt, project.style, bpm=grid_bpm)
+        covered = out_dir / f"score_{stamp}_cover.wav"
+        engines.music().generate(
+            covered, prompt=composed, grid=project.grid, seed=seed,
+            lyrics="", vocal_language=project.vocal_language,
+            src_audio=rendered, report=report, **_quality(project))
+        final = covered
+        op = "score-cover"
+        params.update({"prompt": composed, "seed": seed})
+
+    stem = Stem(split_id=project.active_split or "",
+                track_class=track_class,
+                label=label or "Score",
+                prompt=prompt or "")
+    stem.add(StemVersion(audio=_rel(project, final), op=op, params=params,
+                         sync=_verify(final, project.grid)))
+    project.stems.append(stem)
+    storage.save(project)
+    if report:
+        report(1.0, "score rendered")
     return stem.model_dump()
 
 

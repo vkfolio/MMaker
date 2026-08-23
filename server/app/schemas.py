@@ -172,6 +172,39 @@ class CreateProject(BaseModel):
     variations: int = Field(4, ge=1, le=8)
 
 
+class ScoreNote(BaseModel):
+    """One note, in seconds relative to the clip.
+
+    Seconds rather than frames: a sample rate belongs to an audio device, not to
+    music, and the desktop already converts at its edge for every other time it
+    sends. Lyric is one syllable, carried now so the singing engine has it later
+    even though the sampler ignores it.
+    """
+    start: float = Field(..., ge=0)
+    length: float = Field(..., gt=0)
+    pitch: int = Field(..., ge=0, le=127)
+    velocity: int = Field(96, ge=1, le=127)
+    lyric: str = ""
+
+
+class ScoreRequest(BaseModel):
+    """Render a score to audio.
+
+    `program` is a General MIDI program number -- the sampler's instrument. A
+    `prompt` additionally runs the render through ACE-Step's cover, which turns
+    a General MIDI patch into something that sounds played rather than
+    triggered; without one you get the sampler alone, which is fast, offline and
+    entirely predictable.
+    """
+    notes: list[ScoreNote]
+    bpm: int | None = Field(None, ge=30, le=300)
+    program: int = Field(0, ge=0, le=127)
+    label: str = "Score"
+    track_class: TrackClass = "keyboard"
+    prompt: str | None = None
+    seed: int | None = None
+
+
 class ConfirmGrid(BaseModel):
     bpm: int = Field(..., ge=30, le=300)
     key_scale: str

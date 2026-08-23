@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 
 from .. import analysis, jobs, midi, presets, service, storage
 from ..base_errors import MusicmakerError
-from ..schemas import (AddLayerRequest, ConfirmGrid, CreateProject, Grid,
+from ..schemas import (AddLayerRequest, ConfirmGrid, ScoreRequest, CreateProject, Grid,
                        Project, SfxRequest, SplitRequest, VocalRequest)
 
 router = APIRouter(prefix="/api", tags=["projects"])
@@ -184,6 +184,29 @@ def split(project_id: str, body: SplitRequest,
         idempotency_key=idempotency_key,
     )
     return {"job": job.public()}
+
+
+@router.post("/projects/{project_id}/score")
+def render_score(project_id: str, body: ScoreRequest,
+                 idempotency_key: str | None = Header(None, alias="Idempotency-Key")):
+    """Play a score, and optionally reimagine the result.
+
+    The one route that takes notes rather than audio. Everything else in this
+    API acts on waveforms; this is where a piano roll becomes something you can
+    hear.
+    """
+    _get(project_id)
+
+    def work(report):
+        project = _get(project_id)
+        return service.render_score(project, body.notes, bpm=body.bpm,
+                                    program=body.program, label=body.label,
+                                    track_class=body.track_class,
+                                    prompt=body.prompt, seed=body.seed,
+                                    report=report)
+
+    return {"job": jobs.queue.submit("score", work, project_id,
+                                     idempotency_key=idempotency_key).public()}
 
 
 @router.post("/projects/{project_id}/layers")
