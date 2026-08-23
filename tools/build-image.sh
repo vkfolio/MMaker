@@ -97,12 +97,27 @@ rm -f "$LAYER"
 # Exclude caches and the things that must stay per-pod: model weights (huge and
 # faster from HF), project data, logs, pid files, and the token files -- baking
 # a token into an image would ship a credential to anyone who can pull it.
+# LEAN=1 leaves the model weights out.
+#
+# Not merely a size preference: the tar is written to the same disk it reads,
+# so a self-contained image needs free space equal to the checkpoints plus the
+# venv. On a pod carrying turbo, base and xl-base that is 49 GB against 29 GB
+# free -- the build fills the disk and dies partway. Lean is about 10 GB, fits,
+# pushes in minutes, and costs a checkpoint fetch on the next pod, which
+# fetch-quality-weights.sh does in minutes anyway.
+LEAN_EXCLUDE=()
+if [ "${LEAN:-0}" = "1" ]; then
+  LEAN_EXCLUDE=(--exclude="$ROOT/ACE-Step-1.5/checkpoints")
+  info "lean: model weights excluded"
+fi
+
 tar --create --file "$LAYER" \
     --exclude='*.pyc' --exclude='__pycache__' \
     --exclude="$ROOT/models" --exclude="$ROOT/data" \
     --exclude="$ROOT/.env" --exclude="$ROOT/.hf_token" \
     --exclude="$ROOT/.musicmaker_token" \
     --exclude="$ROOT/*.log" --exclude="$ROOT/*.pid" \
+    "${LEAN_EXCLUDE[@]}" \
     "$ROOT/ACE-Step-1.5" \
     "$ROOT/MMaker" \
     "$SITE" 2>/dev/null || true
