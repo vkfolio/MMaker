@@ -14,6 +14,8 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <utility>
+#include <vector>
 #include <vector>
 
 namespace mx::net {
@@ -48,6 +50,16 @@ public:
     Response get(const std::string& url);
     Response post(const std::string& url, const std::string& json_body,
                   const std::string& idempotency_key = {});
+
+    /// Multipart POST: one file plus form fields.
+    ///
+    /// The upload endpoint takes a file, and the JSON post above cannot carry
+    /// one. Streamed from disk by curl rather than read into memory first --
+    /// a take is tens of megabytes and there is no reason for it to exist
+    /// twice.
+    Response post_file(const std::string& url, const std::string& file_path,
+                       const std::vector<std::pair<std::string, std::string>>& fields,
+                       const std::string& idempotency_key = {});
 
     /// Streams a URL to a file. The partial file is removed on failure, so a
     /// truncated download is never mistaken for a cached one.

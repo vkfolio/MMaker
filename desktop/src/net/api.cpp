@@ -150,6 +150,57 @@ ApiClient::Generated ApiClient::generate(const std::string& prompt,
     return out;
 }
 
+ApiClient::Uploaded ApiClient::upload_audio(const std::string& file_path,
+                                            const std::string& title,
+                                            const std::string& prompt,
+                                            const std::string& idempotency_key) {
+    Uploaded out;
+    const Response r = http_.post_file(
+        url("/api/projects/upload"), file_path,
+        {{"title", title}, {"prompt", prompt}, {"style", ""}, {"lyrics", ""},
+         {"bars", "32"}, {"variations", "1"}},
+        idempotency_key);
+    auto parsed = parse(r, last_error_);
+    if (!parsed) return out;
+
+    if (auto p = parsed->find("project"); p != parsed->end() && p->is_object())
+        out.project_id = field<std::string>(*p, "id", "");
+    // The engine reports what it detected but does not act on it; the grid
+    // stays unconfirmed until someone says so.
+    if (auto d = parsed->find("detected"); d != parsed->end() && d->is_object()) {
+        out.bpm = field<int>(*d, "bpm", 0);
+        out.key_scale = field<std::string>(*d, "key_scale", "");
+    }
+    out.ok = !out.project_id.empty();
+    if (!out.ok) last_error_ = "the engine accepted the file but named no project";
+    return out;
+}
+
+bool ApiClient::confirm_grid(const std::string& project_id, int bpm,
+                             const std::string& key_scale, int bars) {
+    json body;
+    body["bpm"] = bpm > 0 ? bpm : 120;
+    body["key_scale"] = key_scale.empty() ? "A Minor" : key_scale;
+    body["bars"] = bars > 0 ? bars : 32;
+    body["time_sig"] = "4/4";
+    const Response r = http_.post(
+        url("/api/projects/" + url_escape(project_id) + "/grid"), body.dump());
+    return parse(r, last_error_).has_value();
+}
+
+std::optional<JobRef> ApiClient::variations(const std::string& project_id,
+                                            int count) {
+    const Response r = http_.post(
+        url("/api/projects/" + url_escape(project_id) + "/variations?count=" +
+            std::to_string(count < 1 ? 1 : count)),
+        "{}");
+    auto parsed = parse(r, last_error_);
+    if (!parsed) return std::nullopt;
+    if (auto j = parsed->find("job"); j != parsed->end() && j->is_object())
+        return read_job(*j);
+    return std::nullopt;
+}
+
 std::optional<JobRef> ApiClient::split(const std::string& project_id,
                                        const std::string& variation_id,
                                        const std::string& tier,

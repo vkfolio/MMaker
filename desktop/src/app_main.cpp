@@ -1215,6 +1215,67 @@ struct Studio {
     /// difference between a take and a blank file discovered later. Once
     /// rolling, the same button stops -- a modal in the way of stopping would
     /// be worse than useless.
+    /// Send a local clip's audio to the engine so the AI tools can reach it.
+    ///
+    /// The tools act on stems the engine holds; a recorded take or a dropped
+    /// file is something it has never seen. Uploading makes the take the
+    /// project's source audio, which is what ACE-Step's `cover` conditions on
+    /// -- so "hum something and have it played back as a band" is this, then
+    /// variations.
+    ///
+    /// The grid is confirmed from what the engine detected rather than left
+    /// unconfirmed: the server refuses to layer against an unconfirmed grid,
+    /// and a hum has no key the user has told us about anyway. Detection is
+    /// reported in the status line so a wrong guess is visible rather than
+    /// silently baked into everything generated afterwards.
+    void send_take_to_engine(mx::ClipId clip_id, vik::App& app) {
+        const mx::Clip* clip = session.find_clip(clip_id);
+        if (!clip) { doc_status = "select a clip first"; return; }
+        const mx::Source* src = session.find_source(clip->source_id);
+        if (!src || src->local_path.empty() ||
+            !std::filesystem::exists(src->local_path)) {
+            doc_status = "that clip has no audio file to send";
+            return;
+        }
+        if (pod_url.empty()) { doc_status = "no engine configured"; return; }
+        if (net_busy) { doc_status = "the engine is busy"; return; }
+
+        net_busy = true;
+        net_error = false;
+        net_status = "uploading the take…";
+
+        auto* platform = &app.platform();
+        std::thread([url = pod_url, token = pod_token, platform,
+                     path = src->local_path.string(),
+                     title = src->label,
+                     prompt = gen_prompt,
+                     bars = gen_bars] {
+            WorkerScope scope;
+            mx::net::ApiClient api;
+            api.set_base(url);
+            api.set_token(token);
+            api.http().set_timeout(600);   // a take is tens of megabytes
+
+            const auto up = api.upload_audio(path, title.empty() ? "take" : title,
+                                             prompt);
+            if (!up.ok) {
+                g_inbox.push(MsgStatus{"upload failed: " + api.last_error(), true});
+                wake_ui(platform);
+                return;
+            }
+            api.confirm_grid(up.project_id, up.bpm, up.key_scale, bars);
+            g_inbox.push(MsgProjectOpened{up.project_id, title, 
+                                          up.bpm > 0 ? double(up.bpm) : 120.0, bars, 0});
+            g_inbox.push(MsgStatus{
+                up.bpm > 0
+                    ? std::format("take uploaded -- detected {} BPM, {}", up.bpm,
+                                  up.key_scale.empty() ? "unknown key" : up.key_scale)
+                    : std::string("take uploaded"),
+                false});
+            wake_ui(platform);
+        }).detach();
+    }
+
     void toggle_record(vik::App& app) {
         if (recording) { stop_record(app); return; }
         show_record = true;
@@ -4017,6 +4078,28 @@ vik::ui::MenuBuilder Studio::ai_tools_menu(vik::Context<Studio>&) {
     // The editing half. These need no engine and no selection range -- they
     // are the operations that make this a timeline rather than a list of
     // results -- so they sit below the AI tools and are always reachable.
+    // The bridge between a take and the AI tools. Everything above acts on
+    // stems the engine holds; a recorded or imported clip is a file it has
+    // never seen, and this is what makes it one.
+    {
+        const mx::Clip* c = session.find_clip(selected);
+        const mx::Source* src = c ? session.find_source(c->source_id) : nullptr;
+        const bool local_audio = src && !src->local_path.empty() && src->stem_id.empty();
+        if (local_audio && !pod_url.empty() && !net_busy) {
+            auto handle = self;
+            menu.item("Send this take to the engine",
+                      [handle](vik::Window&, vik::App& app) {
+                          app.update_entity(handle, [](Studio& s,
+                                                       vik::Context<Studio>& c2) {
+                              s.send_take_to_engine(s.selected, c2.app());
+                              c2.notify();
+                          });
+                      });
+        } else if (local_audio) {
+            menu.disabled_item("Send this take to the engine  (not connected)");
+        }
+    }
+
     menu.separator();
     const bool has_clip = session.find_clip(selected) != nullptr;
     auto edit = [&menu, handle = self](const char* label, const char* keys,

@@ -160,6 +160,30 @@ public:
     ///
     /// Tiers match the reference dialog: basic (vocal + instrumental),
     /// professional (6 stems), advanced (everything detected).
+    /// Upload local audio as a new scratch project on the engine.
+    ///
+    /// This is how a recorded take reaches the AI tools at all: they act on
+    /// stems the engine holds, and a take recorded here is a file the engine
+    /// has never seen. Returns the new project id, empty on failure.
+    struct Uploaded {
+        std::string project_id;
+        int         bpm = 0;          // what the engine detected, 0 if it did not
+        std::string key_scale;
+        bool        ok = false;
+    };
+    Uploaded upload_audio(const std::string& file_path, const std::string& title,
+                          const std::string& prompt,
+                          const std::string& idempotency_key = {});
+
+    /// Confirm the grid, which the upload deliberately leaves unconfirmed --
+    /// a wrong key silently corrupts every stem generated against it.
+    bool confirm_grid(const std::string& project_id, int bpm,
+                      const std::string& key_scale, int bars);
+
+    /// Generate takes against whatever the project holds. With uploaded source
+    /// audio this is ACE-Step's `cover`: variations of your own material.
+    std::optional<JobRef> variations(const std::string& project_id, int count = 1);
+
     std::optional<JobRef> split(const std::string& project_id,
                                 const std::string& variation_id,
                                 const std::string& tier = "basic",

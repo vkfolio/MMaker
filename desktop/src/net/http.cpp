@@ -191,6 +191,46 @@ Response Http::post(const std::string& url, const std::string& json_body,
     return out;
 }
 
+Response Http::post_file(
+    const std::string& url, const std::string& file_path,
+    const std::vector<std::pair<std::string, std::string>>& fields,
+    const std::string& idempotency_key) {
+    Response out;
+    if (!impl_->curl) { out.error = "curl unavailable"; return out; }
+    const auto started = std::chrono::steady_clock::now();
+
+    curl_easy_reset(impl_->curl);
+    apply_common(impl_->curl, url, timeout_s_);
+    // json=false: curl_mime sets its own multipart Content-Type with the
+    // boundary, and a Content-Type we add by hand overrides it with one that
+    // names no boundary -- which the server rejects as a malformed body.
+    curl_slist* headers = build_headers(token_, false, idempotency_key);
+    curl_easy_setopt(impl_->curl, CURLOPT_HTTPHEADER, headers);
+
+    curl_mime* mime = curl_mime_init(impl_->curl);
+    curl_mimepart* part = curl_mime_addpart(mime);
+    curl_mime_name(part, "file");
+    curl_mime_filedata(part, file_path.c_str());   // streamed, not buffered
+    for (const auto& [name, value] : fields) {
+        curl_mimepart* f = curl_mime_addpart(mime);
+        curl_mime_name(f, name.c_str());
+        curl_mime_data(f, value.c_str(), CURL_ZERO_TERMINATED);
+    }
+    curl_easy_setopt(impl_->curl, CURLOPT_MIMEPOST, mime);
+    curl_easy_setopt(impl_->curl, CURLOPT_WRITEFUNCTION, to_string);
+    curl_easy_setopt(impl_->curl, CURLOPT_WRITEDATA, &out.body);
+
+    const CURLcode code = curl_easy_perform(impl_->curl);
+    if (code != CURLE_OK) out.error = curl_easy_strerror(code);
+    curl_easy_getinfo(impl_->curl, CURLINFO_RESPONSE_CODE, &out.status);
+    curl_mime_free(mime);
+    curl_slist_free_all(headers);
+
+    out.seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    return out;
+}
+
 Response Http::download(const std::string& url, const std::string& dest_path,
                         ProgressFn progress) {
     Response out;
