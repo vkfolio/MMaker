@@ -111,6 +111,19 @@ if (Running "acestep-api") {
     # 30-minute timeout without producing anything.
     $env:ACESTEP_INIT_LLM = "false"
 
+    # Offload the DiT after diffusion, so the VAE has room to decode on the GPU.
+    #
+    # ACE-Step's own tier table sets offload_dit_to_cpu_default = true below
+    # 12 GB, but the API server never reads it: model_init_service takes this
+    # purely from the environment with a default of false, so the tier default
+    # applies to the Gradio path and nothing else. Left off, the DiT stays
+    # resident through the decode, 0.07 GB of VRAM remains, and ACE-Step falls
+    # back to a tiled VAE decode on the CPU -- which is where a lego render
+    # spent 26 of its 30 minutes before timing out. The diffusion itself had
+    # finished on the GPU in about four.
+    $env:ACESTEP_OFFLOAD_DIT_TO_CPU = "true"
+    $env:ACESTEP_OFFLOAD_TO_CPU = "true"
+
     $exe = Join-Path $c.acestep_dir ".venv\Scripts\acestep-api.exe"
     if (-not (Test-Path $exe)) { throw "acestep-api not found -- rerun install-local.ps1" }
     Start-Process -FilePath $exe `
