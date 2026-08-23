@@ -29,6 +29,24 @@ struct MidiNote {
     uint32_t ms = 0;           // driver timestamp, milliseconds since open
 };
 
+/// Where a played note belongs on the timeline.
+///
+/// The driver stamps each event as it arrives; the UI drains them up to a
+/// frame later, so a whole block would otherwise land on one instant. Anchor
+/// the newest event to the current position and offset the rest by their own
+/// stamps, and a chord stays a chord while an arpeggio stays an arpeggio -- at
+/// 60 Hz that is the difference between sixteen milliseconds of slop and none.
+///
+/// Never before zero: a stamp older than the anchor means the transport was
+/// started mid-block, and a negative start is not a place.
+inline int64_t midi_frame_of(uint32_t event_ms, uint32_t newest_ms,
+                             int64_t anchor_frame, uint32_t rate) {
+    const int64_t behind =
+        static_cast<int64_t>(newest_ms - event_ms) * static_cast<int64_t>(rate) / 1000;
+    const int64_t at = anchor_frame - behind;
+    return at > 0 ? at : 0;
+}
+
 class MidiIn {
 public:
     ~MidiIn();

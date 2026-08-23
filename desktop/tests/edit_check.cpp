@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <string>
 
+#include "audio/midi_in.h"
 #include "session.h"
 
 namespace {
@@ -191,6 +192,30 @@ int main() {
         check(s.clip_at_frame(t, 500) != nullptr, "the first frame is inside");
         check(s.clip_at_frame(t, 1499) != nullptr, "the last frame is inside");
         check(s.clip_at_frame(t, 1500) == nullptr, "one past the end is outside");
+    }
+
+    {
+        // MIDI placement. The driver stamps events as they arrive and the UI
+        // drains a whole block at once, so this arithmetic is what decides
+        // whether a chord stays a chord.
+        const uint32_t rate = 48000;
+        const int64_t anchor = 100000;
+
+        check(mx::midi_frame_of(500, 500, anchor, rate) == anchor,
+              "the newest note lands on the anchor");
+        // 100 ms earlier is 4800 frames earlier at 48 kHz.
+        check(mx::midi_frame_of(400, 500, anchor, rate) == anchor - 4800,
+              "an earlier note lands earlier, by its own timestamp");
+        check(mx::midi_frame_of(450, 500, anchor, rate) == anchor - 2400,
+              "half the delay is half the distance");
+        check(mx::midi_frame_of(400, 500, anchor, rate) <
+                  mx::midi_frame_of(450, 500, anchor, rate),
+              "an arpeggio keeps its order");
+        check(mx::midi_frame_of(500, 500, anchor, rate) ==
+                  mx::midi_frame_of(500, 500, anchor, rate),
+              "notes struck together land together");
+        check(mx::midi_frame_of(0, 5000, 100, rate) == 0,
+              "a note cannot be placed before the start");
     }
 
     std::printf("%s\n", std::string(72, '=').c_str());

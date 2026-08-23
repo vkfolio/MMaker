@@ -1400,6 +1400,14 @@ struct Studio {
     }
 
     /// Drain the keyboard into the open score. Called from the UI tick.
+    /// Quantise recorded notes to the sixteenth grid.
+    ///
+    /// On while stepping notes in with the transport stopped, where the grid is
+    /// the only timing there is. A performance played against a rolling
+    /// transport has its own timing, and rounding that to sixteenths is how a
+    /// groove becomes a drum machine -- so this is a toggle, not a rule.
+    bool midi_quantise = true;
+
     bool pump_midi() {
         if (!midi.listening()) return false;
         mx::Score* score = editing_score();
@@ -1408,19 +1416,40 @@ struct Studio {
         if (events.empty()) return false;
         if (!score || !clip) {
             // Keys pressed with no editor open are dropped, but the held set
-            // must not keep stale pitches or the next opened score inherits
-            // notes that started before it existed.
+            // must not keep stale pitches, or the next score opened inherits
+            // notes that began before it existed.
             midi_held.clear();
             return false;
         }
 
+        const bool rolling = g_mixer.transport.playing.load();
         const int64_t sixteenth = std::max<int64_t>(1, session.frames_per_bar() / 16);
+        const int64_t here = std::max<int64_t>(0, playhead() - clip->start_frame);
+
+        // Place events by their own timestamps, measured back from the newest.
+        //
+        // The driver stamps each event when it arrives; this loop runs on the
+        // UI tick, up to a frame later, and a whole block of events would
+        // otherwise land on one instant. Anchoring the newest event to the
+        // current playhead and offsetting the rest by their stamps keeps a
+        // chord a chord and an arpeggio an arpeggio -- at 60 Hz that is the
+        // difference between 16 ms of slop and none.
+        const uint32_t newest_ms = events.back().ms;
+        auto frame_of = [&](const mx::MidiNote& e) {
+            if (!rolling) return here;   // stopped: step entry at the playhead
+            return mx::midi_frame_of(e.ms, newest_ms, here, session.rate);
+        };
+        auto place = [&](int64_t f) {
+            // Quantising while stopped is what makes step entry usable; doing
+            // it to a performance is what flattens one.
+            return (midi_quantise || !rolling) ? snap_frames(f) : f;
+        };
+
         bool changed = false;
         for (const auto& e : events) {
-            // Clip-relative, because a Note's start is relative to its clip.
-            const int64_t now = std::max<int64_t>(0, playhead() - clip->start_frame);
+            const int64_t at = place(frame_of(e));
             if (e.on) {
-                midi_held[e.pitch] = snap_frames(now);
+                midi_held[e.pitch] = at;
                 continue;
             }
             auto held = midi_held.find(e.pitch);
@@ -1433,15 +1462,22 @@ struct Studio {
             n.pitch = e.pitch;
             n.start = start;
             // A note held for less than a sixteenth is still a note; rounding
-            // it to nothing would make fast playing vanish.
-            n.length = std::max(sixteenth, snap_frames(now) - start);
+            // its length to nothing would make fast playing vanish.
+            n.length = std::max(sixteenth, at - start);
             score->notes.push_back(n);
             piano_selected = static_cast<int>(score->notes.size()) - 1;
             changed = true;
         }
+
+        // While the transport rolls, step entry would pile every held note on
+        // one spot; advancing the playhead is the transport's job, so nothing
+        // here moves it.
         if (changed) {
             dirty = true;
-            doc_status = std::format("{} notes", score->notes.size());
+            doc_status = std::format("{} notes{}", score->notes.size(),
+                                     rolling ? (midi_quantise ? " (recording, quantised)"
+                                                              : " (recording)")
+                                             : "");
         }
         return changed;
     }
@@ -3107,6 +3143,30 @@ vik::AnyElement Studio::pianoroll_panel(vik::Context<Studio>& cx) {
             .child(tool_chip("pr-double", "arrow-line-right", "Double the note",
                     [](Studio& s, const vik::ClickEvent&, vik::Window&,
                        vik::Context<Studio>& c) { s.scale_note(2.0); c.notify(); }))
+            // MIDI: what device is listening, and whether a performance gets
+            // rounded to the grid. Both belong here rather than in settings --
+            // they are decisions made while playing, not before.
+            .child(vik::div().id("pr-quant").px_2().py_1().rounded_md()
+                .cursor_pointer()
+                .bg(vik::rgb(midi_quantise ? 0x3a4a68 : 0x2c313d))
+                .tooltip(midi_quantise
+                             ? "Recorded notes snap to sixteenths"
+                             : "Recorded notes keep their own timing")
+                .on_click(cx.listener([](Studio& s, const vik::ClickEvent&,
+                                         vik::Window&, vik::Context<Studio>& c) {
+                    s.midi_quantise = !s.midi_quantise;
+                    c.notify();
+                }))
+                .child(vik::text(midi_quantise ? "quantise" : "free")
+                           .text_xs()
+                           .text_color(vik::rgb(midi_quantise ? 0xffffff : 0x8d94a3))))
+            .child(vik::text(midi.listening()
+                                 ? (g_mixer.transport.playing.load()
+                                        ? "MIDI recording"
+                                        : "MIDI ready")
+                                 : "no MIDI keyboard")
+                       .text_xs()
+                       .text_color(vik::rgb(midi.listening() ? 0x56c08a : 0x565c6b)))
             .child(tool_chip("pr-del", "trash", "Delete the note",
                     [](Studio& s, const vik::ClickEvent&, vik::Window&,
                        vik::Context<Studio>& c) { s.delete_note(); c.notify(); }))
