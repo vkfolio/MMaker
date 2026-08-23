@@ -44,6 +44,15 @@ public:
     /// you want is third in the list.
     static std::vector<std::string> capture_devices();
 
+    /// Whether Windows is muting the default capture endpoint.
+    ///
+    /// A muted endpoint still delivers full-rate frames, all zeroed, so it is
+    /// indistinguishable from a quiet room from inside the audio callback --
+    /// the only way to know is to ask the endpoint. Returns false when it
+    /// cannot be determined, since claiming "muted" wrongly sends someone to
+    /// fix a setting that was never the problem.
+    static bool input_muted();
+
     /// Whether the device opened with an input side.
     bool capturing() const { return capture_channels_ > 0; }
     uint32_t capture_channels() const { return capture_channels_; }

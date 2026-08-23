@@ -30,6 +30,18 @@
 #include <vector>
 
 #include "audio/device.h"
+// NOMINMAX before anything drags in windows.h: mmdeviceapi.h does, and its
+// min/max macros turn every std::max( in this translation unit -- and in Skia's
+// headers -- into a syntax error a long way from here.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
+
 #include "miniaudio.h"
 
 #include "audio/midi_in.h"
@@ -1184,11 +1196,21 @@ struct Studio {
 
         record_from = playhead();
         recording = true;
-        record_error.clear();
+        // Checked before the take, not after it. A muted endpoint delivers
+        // full-rate silence, so without this the first sign is a clip that
+        // looks recorded and plays as nothing.
+        record_error = mx::Device::input_muted()
+            ? std::format("\"{}\" is muted in Windows -- unmute it in Sound "
+                          "settings, or with the microphone key",
+                          g_device.capture_name().empty()
+                              ? std::string("the input")
+                              : g_device.capture_name())
+            : std::string{};
         // Roll the transport with it. Recording against a stopped playhead
         // gives a take with nothing to play along to, which is not a take.
         if (!g_mixer.transport.playing.load()) toggle_play();
-        doc_status = "recording";
+        doc_status = record_error.empty() ? "recording"
+                                          : "recording -- but " + record_error;
         (void)app;
     }
 
@@ -3191,6 +3213,12 @@ vik::AnyElement Studio::input_picker(vik::Context<Studio>& cx) {
                 static_cast<int>(i)));
     }
 
+    if (mx::Device::input_muted())
+        column = std::move(column).child(
+            vik::text("This input is MUTED in Windows -- unmute it in Sound "
+                      "settings, or with the microphone key on the keyboard.")
+                .text_xs().text_color(vik::rgb(0xe05c72)));
+
     // What is actually open right now, which is the only thing that explains a
     // silent take.
     column = std::move(column).child(
@@ -4917,6 +4945,58 @@ int bounce_offline(const fs::path& folder, const fs::path& out) {
 /// app microphone access, the default device being something that never
 /// carries signal, and the duplex device opening an input side that is never
 /// filled. This separates them.
+/// Ask Windows whether the default capture endpoint is muted and how far up
+/// its level is.
+///
+/// A device that is ACTIVE, opens cleanly and delivers a full-rate stream of
+/// digital silence is indistinguishable from a quiet room until you ask the
+/// mixer what it did to the signal. This is that question, and the answer is
+/// usually "muted" or "zero".
+void report_input_mute() {
+    // RPC_E_CHANGED_MODE is not a failure: miniaudio has already initialised
+    // COM on this thread with the other apartment model, and the interfaces
+    // below work regardless. Treating it as one is how this reported "COM
+    // unavailable" on a machine where COM was plainly available.
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                                   COINIT_DISABLE_OLE1DDE);
+    const bool owns_com = SUCCEEDED(co);
+    if (FAILED(co) && co != RPC_E_CHANGED_MODE) {
+        std::printf("mute state      : (COM unavailable)\n");
+        return;
+    }
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice* device = nullptr;
+    IAudioEndpointVolume* volume = nullptr;
+
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                                   CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+                                   reinterpret_cast<void**>(&enumerator))) &&
+        SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &device)) &&
+        SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
+                                   nullptr, reinterpret_cast<void**>(&volume)))) {
+        BOOL muted = FALSE;
+        float level = -1.0f;
+        volume->GetMute(&muted);
+        volume->GetMasterVolumeLevelScalar(&level);
+        std::printf("mute state      : %s\n", muted ? "MUTED" : "not muted");
+        std::printf("input level     : %.0f%%\n", level * 100.0f);
+        if (muted)
+            std::printf("\n  -> Windows is muting this input. Sound settings >\n"
+                        "     Recording > the device > Levels, or the microphone\n"
+                        "     mute key on the keyboard.\n");
+        else if (level <= 0.01f)
+            std::printf("\n  -> The input level is zero. Raise it in Sound\n"
+                        "     settings > Recording > the device > Levels.\n");
+    } else {
+        std::printf("mute state      : (could not be read)\n");
+    }
+
+    if (volume) volume->Release();
+    if (device) device->Release();
+    if (enumerator) enumerator->Release();
+    if (owns_com) CoUninitialize();
+}
+
 int mic_check(double seconds, int device_index = -1) {
     ma_context context;
     if (ma_context_init(nullptr, 0, nullptr, &context) != MA_SUCCESS) {
@@ -4990,6 +5070,7 @@ int mic_check(double seconds, int device_index = -1) {
         return 1;
     }
 
+    report_input_mute();
     std::printf("\nlistening for %.0fs -- make some noise\n\n", seconds);
     for (int i = 0; i < static_cast<int>(seconds); ++i) {
         std::this_thread::sleep_for(std::chrono::seconds(1));

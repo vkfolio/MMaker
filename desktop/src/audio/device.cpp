@@ -1,5 +1,11 @@
 #include "device.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
+
 #include "miniaudio.h"
 
 namespace mx {
@@ -28,6 +34,34 @@ void on_data(ma_device* device, void* out, const void* in, ma_uint32 frames) {
 }  // namespace
 
 Device::~Device() { stop(); }
+
+bool Device::input_muted() {
+    // RPC_E_CHANGED_MODE only means COM was already initialised on this thread
+    // with the other apartment model; the interfaces below work regardless.
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                                   COINIT_DISABLE_OLE1DDE);
+    if (FAILED(co) && co != RPC_E_CHANGED_MODE) return false;
+    const bool owns_com = SUCCEEDED(co);
+
+    bool muted = false;
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice* endpoint = nullptr;
+    IAudioEndpointVolume* volume = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                   __uuidof(IMMDeviceEnumerator),
+                                   reinterpret_cast<void**>(&enumerator))) &&
+        SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &endpoint)) &&
+        SUCCEEDED(endpoint->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
+                                     nullptr, reinterpret_cast<void**>(&volume)))) {
+        BOOL is_muted = FALSE;
+        if (SUCCEEDED(volume->GetMute(&is_muted))) muted = is_muted != FALSE;
+    }
+    if (volume) volume->Release();
+    if (endpoint) endpoint->Release();
+    if (enumerator) enumerator->Release();
+    if (owns_com) CoUninitialize();
+    return muted;
+}
 
 std::vector<std::string> Device::capture_devices() {
     std::vector<std::string> out;
