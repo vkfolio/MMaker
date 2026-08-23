@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "audio/device.h"
+#include "audio/recorder.h"
 #include "audio/mixer.h"
 #include "media/bounce.h"
 #include "net/api.h"
@@ -190,6 +191,10 @@ private:
 Inbox      g_inbox;
 mx::Mixer  g_mixer;
 mx::Device g_device;
+/// Lives beside the device because the audio callback holds a pointer to it for
+/// as long as the device runs; a shorter-lived recorder would be a
+/// use-after-free on the audio thread.
+mx::Recorder g_recorder;
 
 std::atomic<int> g_pending{0};
 
@@ -1106,6 +1111,106 @@ struct Studio {
                                    accepted == 1 ? "" : "s"));
         }
         if (skipped) doc_status = why;
+    }
+
+    // --- recording ----------------------------------------------------------
+    //
+    // A take is written to disk as it arrives, not buffered and saved at the
+    // end, so a crash costs the tail of a performance rather than all of it.
+    // That is the whole reason this is careful: nobody can repeat a take
+    // exactly, and losing one is not the same kind of bug as losing a setting.
+
+    bool     recording = false;
+    int64_t  record_from = 0;          // timeline frame the take started at
+    mx::TrackId record_track = 0;      // which lane it lands on
+    std::string record_error;
+
+    /// Where takes live: beside the document when it has been saved, otherwise
+    /// in the cache. A take must never be written somewhere that gets cleaned
+    /// up between the recording and the save.
+    std::filesystem::path takes_dir() const {
+        if (!document_path.empty())
+            return document_path.parent_path() / (document_path.stem().string() + " takes");
+        return mx::net::cache_root() / "takes";
+    }
+
+    bool can_record() const { return g_device.capturing(); }
+
+    void toggle_record(vik::App& app) {
+        if (recording) { stop_record(app); return; }
+        start_record(app);
+    }
+
+    void start_record(vik::App& app) {
+        if (recording) return;
+        if (!can_record()) {
+            record_error = g_device.error().empty()
+                               ? "no input device -- plug in a microphone and restart"
+                               : g_device.error();
+            doc_status = record_error;
+            return;
+        }
+
+        // Arm a lane. The selected clip's track when there is one, so
+        // overdubbing lands where you were looking; a fresh track otherwise,
+        // because recording over an existing take by default is how takes get
+        // lost.
+        record_track = 0;
+        if (const mx::Clip* c = session.find_clip(selected)) record_track = c->track_id;
+        if (!record_track) {
+            push_undo("record");
+            auto& t = session.add_track(std::format("Take {}", session.tracks.size() + 1),
+                                        0xffe05c72);
+            record_track = t.id;
+        }
+
+        const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        const auto path = takes_dir() / std::format("take_{}.wav", stamp);
+        if (!g_recorder.start(path, session.rate, g_device.capture_channels())) {
+            record_error = g_recorder.error();
+            doc_status = record_error;
+            return;
+        }
+
+        record_from = playhead();
+        recording = true;
+        record_error.clear();
+        // Roll the transport with it. Recording against a stopped playhead
+        // gives a take with nothing to play along to, which is not a take.
+        if (!g_mixer.transport.playing.load()) toggle_play();
+        doc_status = "recording";
+        (void)app;
+    }
+
+    void stop_record(vik::App& app) {
+        if (!recording) return;
+        recording = false;
+        const auto path = g_recorder.path();
+        const int64_t frames = g_recorder.frames_written();
+        const uint64_t dropped = g_recorder.overruns();
+        g_recorder.stop();
+
+        if (g_mixer.transport.playing.load()) toggle_play();
+
+        if (frames <= 0) {
+            doc_status = "nothing was recorded -- check the input device";
+            return;
+        }
+
+        // The take is on disk either way; placing it is a document edit and
+        // therefore undoable.
+        push_undo("record");
+        auto& src = session.add_source(path, path.stem().string());
+        pending_import[src.id] = Placement{record_track, record_from};
+        spawn_decode(src.id, path, app);
+
+        doc_status = dropped
+            ? std::format("take recorded, but {} block(s) were dropped", dropped)
+            : std::format("take recorded ({:.1f}s)",
+                          static_cast<double>(frames) / session.rate);
+        after_edit(doc_status);
     }
 
     void mark_dirty() { dirty = true; }
@@ -2253,12 +2358,13 @@ struct Studio {
             job_note = " [" + jobs.front().kind + " " + std::to_string(secs) + "s]";
         }
         std::printf(
-            "STUDIO device=%s rate=%u latency_ms=%.1f | sources=%d pending=%d "
+            "STUDIO device=%s rate=%u latency_ms=%.1f in=%uch%s | sources=%d pending=%d "
             "decode_ms=%.0f | tracks=%zu clips=%zu | playhead=%.2fs xruns=%u "
             "| theme=%d keys=%d net=%s stems=%d/%d cached=%d jobs=%zu%s | paint_ms=%.2f (build %.2f skia %.2f) worst=%.2f frames=%d columns=%lld\n",
             g_device.running() ? g_device.backend().c_str() : "NONE",
             g_device.rate(), 1000.0 * g_device.latency_frames() /
                 std::max(1u, g_device.rate()),
+            g_device.capture_channels(), recording ? " REC" : "",
             loaded_sources, g_pending.load(), last_decode_ms,
             session.tracks.size(), session.clips.size(),
             static_cast<double>(playhead()) / std::max(1u, session.rate),
@@ -3779,6 +3885,15 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 .child(icon_button("play", playing ? "pause" : "play", playing,
                     [](Studio& s, const vik::ClickEvent&, vik::Window&,
                        vik::Context<Studio>& c) { s.toggle_play(); c.notify(); }))
+                // Record. Disabled with the reason when there is no input, so
+                // "why is this grey" has an answer on the button itself.
+                .child(icon_button("rec", "record", recording,
+                    [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                       vik::Context<Studio>& c) { s.toggle_record(c.app()); c.notify(); })
+                    .tooltip(can_record()
+                                 ? (recording ? "Stop recording  (Ctrl+R)"
+                                              : "Record a take  (Ctrl+R)")
+                                 : "No input device"))
                 .child(icon_button("loop", "repeat",
                                    g_mixer.transport.looping.load(),
                     [](Studio&, const vik::ClickEvent&, vik::Window&,
@@ -4412,6 +4527,7 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                 if (ctrl && e.key == "x") { s.cut_selected(); c.notify(); return; }
                 if (ctrl && e.key == "v") { s.paste_clipboard(); c.notify(); return; }
                 if (ctrl && e.key == "s") { s.save_document_now(); c.notify(); return; }
+                if (ctrl && e.key == "r") { s.toggle_record(c.app()); c.notify(); return; }
                 if (e.key == "delete" || e.key == "backspace") {
                     s.delete_selected();
                     c.notify();
@@ -4761,6 +4877,9 @@ int main(int argc, char** argv) {
     bool probe_only = false;
     bool doctest = false;
     double cancel_after = -1.0;
+    // Records for N seconds and exits, so the capture path can be proven
+    // without a person holding a microphone.
+    double record_secs = -1.0;
     std::string layer_class;
     std::string gen_prompt;
     std::string open_panel;
@@ -4769,7 +4888,8 @@ int main(int argc, char** argv) {
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--selftest") selftest = true;
+        if (arg == "--record" && i + 1 < argc) record_secs = std::stod(argv[++i]);
+        else if (arg == "--selftest") selftest = true;
         else if (arg == "--render" && i + 1 < argc) render_to = argv[++i];
         else if (arg == "--bounce" && i + 1 < argc) bounce_to = argv[++i];
         else if (arg == "--connect" && i + 1 < argc) pod_url = argv[++i];
@@ -4800,7 +4920,10 @@ int main(int argc, char** argv) {
     if (!pod_url.empty() && probe_only)
         return connect_probe(pod_url, pod_token, pod_project);
 
-    if (!g_device.start(g_mixer, 48000))
+    // Duplex from the start. Opening the input only when recording begins
+    // would mean the first take waits on a device that takes a moment to
+    // start, and the input meter could never show anything beforehand.
+    if (!g_device.start(g_mixer, 48000, &g_recorder))
         std::printf("audio: %s\n", g_device.error().c_str());
 
     vik::App::run([&](vik::App& app) {
@@ -5014,6 +5137,28 @@ int main(int argc, char** argv) {
                     if (done) a.quit();
                     return !done;
                 });
+
+                if (record_secs > 0.0) {
+                    // Start immediately, stop after the requested time, then
+                    // let the selftest budget end the run.
+                    app.update_entity(handle, [](Studio& s, vik::Context<Studio>& c) {
+                        s.new_document();
+                        s.start_record(c.app());
+                        c.notify();
+                    });
+                    app.set_timer(
+                        std::chrono::milliseconds(
+                            static_cast<int>(record_secs * 1000.0)),
+                        [handle](vik::App& a) {
+                            a.update_entity(handle, [](Studio& s,
+                                                       vik::Context<Studio>& c) {
+                                s.stop_record(c.app());
+                                std::printf("RECORDED %s\n", s.doc_status.c_str());
+                                std::fflush(stdout);
+                                c.notify();
+                            });
+                        });
+                }
 
                 if (selftest) {
                     app.set_timer(std::chrono::milliseconds(1200), [handle](vik::App& a) {

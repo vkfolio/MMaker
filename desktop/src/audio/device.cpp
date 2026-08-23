@@ -3,34 +3,77 @@
 #include "miniaudio.h"
 
 namespace mx {
+
+/// What the audio callback needs, in one allocation that outlives it.
+struct Device::Sides {
+    Mixer*    mixer = nullptr;
+    Recorder* recorder = nullptr;
+    uint32_t  capture_channels = 0;
+};
+
 namespace {
 
-void on_data(ma_device* device, void* out, const void*, ma_uint32 frames) {
-    auto* mixer = static_cast<Mixer*>(device->pUserData);
-    if (mixer) mixer->process(static_cast<float*>(out), static_cast<int64_t>(frames));
+void on_data(ma_device* device, void* out, const void* in, ma_uint32 frames) {
+    auto* sides = static_cast<Device::Sides*>(device->pUserData);
+    if (!sides) return;
+    // Capture first: the input for this block is already here, and pushing it
+    // before the mix keeps the two in step even if the mix is the slow part.
+    if (sides->recorder && in)
+        sides->recorder->push(static_cast<const float*>(in),
+                              static_cast<int64_t>(frames), sides->capture_channels);
+    if (sides->mixer)
+        sides->mixer->process(static_cast<float*>(out), static_cast<int64_t>(frames));
 }
 
 }  // namespace
 
 Device::~Device() { stop(); }
 
-bool Device::start(Mixer& mixer, uint32_t preferred_rate) {
+bool Device::start(Mixer& mixer, uint32_t preferred_rate, Recorder* recorder) {
     stop();
 
-    ma_device_config cfg  = ma_device_config_init(ma_device_type_playback);
+    const bool want_capture = recorder != nullptr;
+    ma_device_config cfg = ma_device_config_init(
+        want_capture ? ma_device_type_duplex : ma_device_type_playback);
     cfg.playback.format   = ma_format_f32;
     cfg.playback.channels = channels_;
+    if (want_capture) {
+        cfg.capture.format = ma_format_f32;
+        // 0 means "whatever the device has". Asking for two on a mono
+        // interface is how an input device fails to open at all.
+        cfg.capture.channels = 0;
+        cfg.capture.shareMode = ma_share_mode_shared;
+    }
     cfg.sampleRate        = preferred_rate;
     cfg.dataCallback      = &on_data;
-    cfg.pUserData         = &mixer;
+
+    sides_ = new Device::Sides{&mixer, recorder, 0};
+    cfg.pUserData = sides_;
 
     device_ = new ma_device{};
     if (ma_device_init(nullptr, &cfg, device_) != MA_SUCCESS) {
+        // A machine with no microphone still deserves playback. Falling back
+        // rather than failing is the difference between "recording is
+        // unavailable" and "the app has no sound".
+        if (want_capture) {
+            delete device_;
+            device_ = nullptr;
+            delete sides_;
+            sides_ = nullptr;
+            capture_channels_ = 0;
+            const bool ok = start(mixer, preferred_rate, nullptr);
+            if (ok) error_ = "no input device -- recording is unavailable";
+            return ok;
+        }
         error_ = "no output device";
         delete device_;
         device_ = nullptr;
+        delete sides_;
+        sides_ = nullptr;
         return false;
     }
+    capture_channels_ = want_capture ? device_->capture.channels : 0;
+    sides_->capture_channels = capture_channels_;
 
     // What the device actually gave us, which need not be what was asked for.
     rate_     = device_->sampleRate;
@@ -67,7 +110,13 @@ void Device::stop() {
     ma_device_uninit(device_);      // stops the callback before returning
     delete device_;
     device_ = nullptr;
+    // Only after uninit: the callback dereferences this every block, and
+    // freeing it while the device still runs is a use-after-free on the audio
+    // thread, which crashes somewhere else entirely.
+    delete sides_;
+    sides_ = nullptr;
     running_ = false;
+    capture_channels_ = 0;
     mixer_ = nullptr;
 }
 

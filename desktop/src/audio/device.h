@@ -12,6 +12,7 @@
 #include <string>
 
 #include "mixer.h"
+#include "recorder.h"
 
 struct ma_device;
 
@@ -19,10 +20,25 @@ namespace mx {
 
 class Device {
 public:
+    /// What the audio callback needs, defined in the .cpp. Public only so the
+    /// callback -- a free function, as miniaudio requires -- can name it.
+    struct Sides;
+
     ~Device();
 
     /// Opens the default output device and starts pulling from `mixer`.
-    bool start(Mixer& mixer, uint32_t preferred_rate = 48000);
+    ///
+    /// `recorder`, when given, makes this a duplex device: the same callback
+    /// receives capture as well as playback. One device rather than two,
+    /// because two run on independent clocks and a take recorded against a
+    /// drifting one lands progressively further from the beat -- audible over
+    /// a minute and impossible to fix afterwards.
+    bool start(Mixer& mixer, uint32_t preferred_rate = 48000,
+               Recorder* recorder = nullptr);
+
+    /// Whether the device opened with an input side.
+    bool capturing() const { return capture_channels_ > 0; }
+    uint32_t capture_channels() const { return capture_channels_; }
     void stop();
 
     bool        running() const { return running_; }
@@ -34,11 +50,13 @@ public:
 
 private:
     ma_device*  device_ = nullptr;
+    Sides*      sides_ = nullptr;   // owned; freed only after the device stops
     Mixer*      mixer_  = nullptr;
     bool        running_ = false;
     uint32_t    rate_ = 0;
     uint32_t    channels_ = 2;
     uint32_t    latency_frames_ = 0;
+    uint32_t    capture_channels_ = 0;
     std::string backend_;
     std::string error_;
 };
