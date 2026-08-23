@@ -1286,6 +1286,31 @@ struct Studio {
         return changed;
     }
 
+    // --- autosave -----------------------------------------------------------
+    //
+    // Rotating, and never over the last good file. An autosave written while
+    // the document is in a bad state must not be the only copy left, so it
+    // goes to its own file and the real save stays where the user put it.
+    std::chrono::steady_clock::time_point last_autosave{};
+
+    std::filesystem::path autosave_path() const {
+        const std::string stem =
+            document_path.empty() ? std::string("Untitled") : document_path.stem().string();
+        return mx::documents_root() / (stem + ".autosave.mmproj");
+    }
+
+    void maybe_autosave() {
+        if (!dirty || recording) return;   // never mid-take: the take is the state
+        const auto now = std::chrono::steady_clock::now();
+        if (last_autosave.time_since_epoch().count() != 0 &&
+            now - last_autosave < std::chrono::seconds(30))
+            return;
+        last_autosave = now;
+        if (session.tracks.empty()) return;
+        std::string error;
+        mx::save_document(session, autosave_path(), &error);
+    }
+
     void mark_dirty() { dirty = true; }
 
     void new_document() {
@@ -1313,6 +1338,8 @@ struct Studio {
         std::string error;
         if (mx::save_document(session, document_path, &error)) {
             dirty = false;
+            std::error_code ec;
+            std::filesystem::remove(autosave_path(), ec);
             doc_status = "saved " + document_path.filename().string();
             settings.last_document = document_path.string();
             settings.save();
@@ -3649,6 +3676,31 @@ vik::ui::MenuBuilder Studio::ai_tools_menu(vik::Context<Studio>&) {
     entry(needs("Extend", can_complete), ranged && can_complete, Tool::Extend);
     menu.separator();
     menu.disabled_item("Vocal to MIDI");        // no endpoint for it yet
+
+    // The editing half. These need no engine and no selection range -- they
+    // are the operations that make this a timeline rather than a list of
+    // results -- so they sit below the AI tools and are always reachable.
+    menu.separator();
+    const bool has_clip = session.find_clip(selected) != nullptr;
+    auto edit = [&menu, handle = self](const char* label, const char* keys,
+                                       bool enabled, void (Studio::*fn)()) {
+        if (!enabled) { menu.disabled_item(label); return; }
+        menu.item_with_shortcut(label, keys, [handle, fn](vik::Window&, vik::App& app) {
+            app.update_entity(handle, [fn](Studio& s, vik::Context<Studio>& c) {
+                (s.*fn)();
+                c.notify();
+            });
+        });
+    };
+    edit("Cut", "Ctrl+X", has_clip, &Studio::cut_selected);
+    edit("Copy", "Ctrl+C", has_clip, &Studio::copy_selected);
+    edit("Paste", "Ctrl+V", has_clipboard, &Studio::paste_clipboard);
+    edit("Duplicate", "Ctrl+D", has_clip, &Studio::duplicate_selected);
+    edit("Split at playhead", "Ctrl+E", true, &Studio::split_at_playhead);
+    edit("Delete", "Del", has_clip, &Studio::delete_selected);
+    menu.separator();
+    edit("Undo", "Ctrl+Z", !undo_stack.empty(), &Studio::undo);
+    edit("Redo", "Ctrl+Shift+Z", !redo_stack.empty(), &Studio::redo);
     return menu;
 }
 
@@ -5114,6 +5166,7 @@ int main(int argc, char** argv) {
                 app.set_interval(std::chrono::milliseconds(16), [handle](vik::App& a) {
                     a.update_entity(handle, [](Studio& s, vik::Context<Studio>& c) {
                         const bool landed = s.pump() | s.pump_ai(c.app()) | s.pump_midi();
+                        s.maybe_autosave();
 
                         if (!s.scripted_prompt.empty() && !s.regen_fired &&
                             !s.net_busy) {
