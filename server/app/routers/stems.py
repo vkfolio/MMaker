@@ -44,7 +44,8 @@ def repaint(project_id: str, stem_id: str, body: RepaintRequest):
     def work(report):
         proj = _get(project_id)
         return service.repaint_stem(proj, proj.stem(stem_id), start_s, end_s,
-                                    body.prompt, body.seed, report)
+                                    body.prompt, body.seed, report,
+                                    strength=body.strength)
 
     return {"job": jobs.queue.submit("repaint", work, project_id).public()}
 

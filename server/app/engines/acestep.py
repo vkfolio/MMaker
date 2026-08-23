@@ -534,7 +534,13 @@ class AceStepEngine:
         return self._run(params, dest, src_audio, report)
 
     def repaint(self, dest, src_audio, start_s, end_s, prompt, grid, seed,
-                report=None, quality=None):
+                report=None, quality=None, strength=None, mode=None):
+        """Regenerate a range, conditioned on the surrounding audio.
+
+        This -- not `cover` -- is what produces a genuine variation on the
+        installed turbo checkpoint. `strength` is ACE-Step's repaint_strength:
+        how far the new take is allowed to depart from what was there.
+        """
         params = {
             **self._grid_params(grid),
             **self._quality_params(quality),
@@ -545,6 +551,10 @@ class AceStepEngine:
             "chunk_mask_mode": "explicit",
             **_seed_params(seed),
         }
+        if strength is not None:
+            params["repaint_strength"] = round(float(strength), 3)
+        if mode is not None:
+            params["repaint_mode"] = mode
         return self._run(params, dest, src_audio, report)
 
     def extend(self, dest, src_audio, added_s, prompt, grid, seed, report=None,

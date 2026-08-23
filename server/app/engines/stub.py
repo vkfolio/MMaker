@@ -116,7 +116,7 @@ class StubEngine:
         return audio.write(dest, _render(track_class, grid, seed, duration), SR)
 
     def repaint(self, dest, src_audio, start_s, end_s, prompt, grid, seed,
-                report=None, quality=None):
+                report=None, quality=None, strength=None, mode=None):
         data, sr = audio.load(src_audio)
         fresh = _render("mix", grid, seed, max(end_s - start_s, 0.01))
         i0 = int(start_s * sr)

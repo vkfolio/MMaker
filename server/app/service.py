@@ -296,7 +296,7 @@ def _next_path(project: Project, stem: Stem, op: str) -> Path:
 
 def repaint_stem(project: Project, stem: Stem, start_s: float, end_s: float,
                  prompt: str | None = None, seed: int | None = None,
-                 report=None) -> dict:
+                 report=None, strength: float | None = None) -> dict:
     """Regenerate a time region. Callers pass seconds; bars are resolved above."""
     _require_confirmed(project)
     if end_s <= start_s:
@@ -327,7 +327,8 @@ def repaint_stem(project: Project, stem: Stem, start_s: float, end_s: float,
     rendered = dest.with_suffix(".render.wav")
     engines.music().repaint(rendered, src, start_s, end_s,
                             prompt or stem.prompt, project.grid, seed,
-                            report=report, **_quality(project))
+                            report=report, strength=strength,
+                            **_quality(project))
     try:
         audio.splice(src, rendered, dest, start_s, end_s)
     finally:
@@ -339,6 +340,7 @@ def repaint_stem(project: Project, stem: Stem, start_s: float, end_s: float,
         audio=_rel(project, dest), op="repaint",
         params={"start_s": round(start_s, 3), "end_s": round(end_s, 3),
                 "seed": seed, "prompt": prompt or stem.prompt,
+                **({"strength": strength} if strength is not None else {}),
                 "outside_residual": outside_residual},
         sync=_verify(dest, project.grid),
         # 0.05 relative RMS is about -26 dB -- it accepted plainly audible

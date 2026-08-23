@@ -194,6 +194,12 @@ class RepaintRequest(BaseModel):
     end_s: float | None = Field(None, gt=0)
     prompt: str | None = None
     seed: int | None = None
+    # ACE-Step's repaint_strength. Plumbed because it is the documented dial
+    # and a fuller checkpoint may honour it, but MEASURED TO DO NOTHING on
+    # acestep-v15-turbo: 0.1, 0.3, 0.6 and 0.9 all returned mel-similarity
+    # 0.844 to the source, identical to three decimal places. Do not put a
+    # slider on it without re-measuring on the checkpoint in use.
+    strength: float | None = Field(None, ge=0.0, le=1.0)
 
     def resolve(self, grid) -> tuple[float, float]:
         """Seconds win when given; otherwise convert the bar range."""
@@ -205,7 +211,25 @@ class RepaintRequest(BaseModel):
 
 
 class CoverRequest(BaseModel):
-    """Reimagine existing audio, with a dial for how far to stray.
+    """Reimagine existing audio.
+
+    WARNING -- measured on acestep-v15-turbo, this does not work. A cover of a
+    synth arpeggio prompted "solo violin, slow sad ballad, no drums, no synth"
+    came back as the input: mel-similarity 0.991, sample correlation 0.935. The
+    prompt is ignored, and so are both strength parameters -- cover_noise_
+    strength 0.5 and 0.9 produced bit-identical output, with and without the
+    language model enabled. The one setting that changes anything is
+    cover_noise_strength = 0, which takes the branch that discards the source
+    latents entirely, so it is text2music rather than a variation.
+
+    Use repaint over the region instead: it genuinely re-performs (mel 0.844,
+    correlation 0.000) in about seven seconds, and it is the path the desktop
+    offers. This is kept because it is correct against a non-turbo checkpoint,
+    where cover is a supported and meaningful task.
+
+    Original description follows.
+
+    Reimagine existing audio, with a dial for how far to stray.
 
     This is the answer to "here is my idea, play with it". ACE-Step's cover
     task conditions generation on source audio, and two parameters control how
@@ -244,6 +268,10 @@ class CoverRequest(BaseModel):
     # is how the dial's mapping gets characterised rather than guessed.
     audio_cover_strength: float | None = Field(None, ge=0.0, le=1.0)
     cover_noise_strength: float | None = Field(None, ge=0.0, le=1.0)
+    # ACE-Step skips its language model on cover and drives the DiT directly.
+    # The LM is what turns a prompt into semantic audio codes, so without it a
+    # cover may have nothing to reinterpret the source *towards*.
+    thinking: bool | None = None
 
     def engine_params(self) -> dict:
         """Map one dial onto the model's two.
@@ -262,6 +290,8 @@ class CoverRequest(BaseModel):
             params["audio_cover_strength"] = round(self.audio_cover_strength, 3)
         if self.cover_noise_strength is not None:
             params["cover_noise_strength"] = round(self.cover_noise_strength, 3)
+        if self.thinking is not None:
+            params["thinking"] = bool(self.thinking)
         return params
 
 
