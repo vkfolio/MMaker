@@ -50,6 +50,7 @@ add_executable(musicx
     src/media/peaks.cpp
     src/ui/arrangement.cpp
     src/ui/pianoroll.cpp
+    src/ai/sidecar.cpp
     src/miniaudio_impl.c
 )
 target_include_directories(musicx PRIVATE src third_party)

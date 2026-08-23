@@ -30,6 +30,10 @@ struct Settings {
     std::string local_url = "http://127.0.0.1:8000";
     std::string pod_url;
     std::string pod_token;
+    /// Anthropic key for the AI helper. Optional: the Agent SDK will use an
+    /// existing Claude Code login on this machine when there is one, which is
+    /// why this is not a precondition for the feature.
+    std::string ai_key;
     bool        auto_connect = false;
     std::string last_document;      // reopened on launch when present
 

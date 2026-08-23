@@ -101,6 +101,7 @@ Settings Settings::load() {
         s.auto_connect = j.value("auto_connect", false);
         s.last_document = j.value("last_document", "");
         s.pod_token = unprotect_secret(j.value("pod_token_dpapi", ""));
+        s.ai_key = unprotect_secret(j.value("ai_key_dpapi", ""));
     } catch (const json::exception&) {
         return Settings{};               // corrupt settings are not fatal
     }
@@ -120,6 +121,9 @@ bool Settings::save() const {
     // paste elsewhere -- and so a future reader knows why it will not decrypt
     // on another machine.
     j["pod_token_dpapi"] = protect_secret(pod_token);
+    // Same treatment as the pod token: an API key in cleartext under
+    // %LOCALAPPDATA% is readable by anything running as this user, and synced.
+    j["ai_key_dpapi"] = protect_secret(ai_key);
 
     std::ofstream file(path(), std::ios::trunc);
     if (!file) return false;

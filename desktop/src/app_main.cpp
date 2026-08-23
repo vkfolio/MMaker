@@ -48,6 +48,8 @@
 #include "components/phosphor.h"
 #include "components/text_input.h"
 
+#include "ai/sidecar.h"
+
 #include <include/core/SkStream.h>
 #include <include/core/SkSurface.h>
 #include <include/encode/SkPngEncoder.h>
@@ -528,6 +530,25 @@ struct Studio {
     vik::Handle<vik::ui::TextInputState> lyrics_input;
     bool gen_inputs_ready = false;
 
+    // --- Inspire Me: a plain-language idea, turned into a caption ----------
+    //
+    // The sidecar is spawned on first use rather than at startup. It costs a
+    // node process, and most sessions never open this panel.
+    std::unique_ptr<mx::ai::Sidecar> ai;
+    bool                  show_inspire = false;
+    bool                  inspire_from_lyrics = false;   // which tab
+    bool                  inspire_instrumental = false;
+    bool                  inspire_advanced = false;      // the disclosure
+    bool                  inspire_busy = false;
+    std::string           inspire_error;
+    std::string           inspire_request;   // id of the request in flight
+    int                   inspire_seq = 0;
+    mx::ai::Proposal      proposal;          // empty caption => nothing yet
+    bool                  has_proposal = false;
+    vik::Handle<vik::ui::TextInputState> idea_input;
+    vik::Handle<vik::ui::TextInputState> refine_input;
+    bool                  inspire_inputs_ready = false;
+
     /// What the pod is doing for us right now.
     ///
     /// The plan asks for real queue position, elapsed time and cancel -- and
@@ -678,6 +699,129 @@ struct Studio {
     /// Editing writes into `settings` as you type so the panel reflects it,
     /// but saving on every keystroke would litter the disk and store every
     /// half-typed address. This is the commit point.
+    /// Bring the sidecar up, once, on first use.
+    ///
+    /// Failure is a message rather than a dead button: no Node, no
+    /// node_modules and no API key all present differently, and a panel that
+    /// simply does nothing teaches the user nothing.
+    bool ensure_ai() {
+        if (ai && !ai->exited.load()) return true;
+        ai = mx::ai::Sidecar::spawn();
+        if (!ai->spawn_error.empty()) {
+            inspire_error = ai->spawn_error;
+            return false;
+        }
+        nlohmann::json start{{"type", "start"}};
+        // A key is optional: the SDK will use an existing Claude Code login on
+        // this machine when there is one, which is the common case here.
+        if (!settings.ai_key.empty()) start["api_key"] = settings.ai_key;
+        ai->send(start);
+        return true;
+    }
+
+    /// Ask for a whole proposal from the idea (or the pasted lyrics).
+    void inspire_compose(const std::string& text) {
+        if (text.empty()) {
+            inspire_error = "write an idea first";
+            return;
+        }
+        if (!ensure_ai()) return;
+        inspire_error.clear();
+        inspire_busy = true;
+        inspire_request = std::format("c{}", ++inspire_seq);
+
+        nlohmann::json advanced = nlohmann::json::object();
+        // Only what was actually set. Sending bpm 0 would read as an
+        // instruction to write something at zero beats per minute.
+        if (inspire_advanced) {
+            advanced["bpm"] = static_cast<int>(std::lround(session.bpm));
+            advanced["bars"] = gen_bars;
+        }
+        ai->send({{"type", "compose"},
+                  {"id", inspire_request},
+                  {"mode", inspire_from_lyrics ? "lyrics" : "idea"},
+                  {"text", text},
+                  {"instrumental", inspire_instrumental},
+                  {"advanced", advanced}});
+    }
+
+    /// Iterate on what was just proposed, in the same session.
+    void inspire_refine(const std::string& text) {
+        if (text.empty() || !has_proposal) return;
+        if (!ensure_ai()) return;
+        inspire_error.clear();
+        inspire_busy = true;
+        inspire_request = std::format("c{}", ++inspire_seq);
+        ai->send({{"type", "refine"}, {"id", inspire_request}, {"text", text}});
+    }
+
+    /// Drain the sidecar. Called from the same tick that drains the workers.
+    bool pump_ai(vik::App& app) {
+        if (!ai) return false;
+        bool landed = false;
+        for (const auto& ev : ai->drain()) {
+            const std::string type = ev.value("type", std::string{});
+            if (type == "result") {
+                mx::ai::Proposal p;
+                if (mx::ai::parse_result(ev, &p)) {
+                    proposal = std::move(p);
+                    has_proposal = true;
+                    // The proposal is shown, not applied. Generating from
+                    // something the user has not read yet is how you end up
+                    // with a song nobody asked for.
+                    gen_prompt = proposal.caption;
+                    gen_lyrics = proposal.lyrics;
+                    gen_instrumental = proposal.lyrics.empty();
+                    if (proposal.bpm >= 30 && proposal.bpm <= 300)
+                        session.bpm = proposal.bpm;
+                    if (!proposal.title.empty() && session.title.empty())
+                        session.title = proposal.title;
+                    seed_generate_fields(app);
+                }
+                inspire_busy = false;
+                landed = true;
+            } else if (type == "error") {
+                inspire_error = ev.value("message", std::string{"the sidecar failed"});
+                if (inspire_error.find("API") != std::string::npos ||
+                    inspire_error.find("key") != std::string::npos) {
+                    const std::string tail = ai->log_tail(3);
+                    if (!tail.empty()) inspire_error += "  (" + tail + ")";
+                }
+                inspire_busy = false;
+                landed = true;
+            } else if (type == "ready") {
+                landed = true;
+            }
+        }
+        if (ai->exited.load() && inspire_busy) {
+            inspire_busy = false;
+            inspire_error = "the AI helper stopped. " + ai->log_tail(3);
+            landed = true;
+        }
+        return landed;
+    }
+
+    /// Push the proposal into the Generate panel's fields.
+    ///
+    /// Those are entities with their own content, so assigning gen_prompt is
+    /// not enough -- without this the panel would still show what was typed
+    /// before, which reads as the proposal having been ignored.
+    void seed_generate_fields(vik::App& app) {
+        if (!gen_inputs_ready) return;
+        const std::string caption = gen_prompt;
+        const std::string words = gen_lyrics;
+        app.update_entity(prompt_input,
+            [&caption](vik::ui::TextInputState& t, vik::Context<vik::ui::TextInputState>&) {
+                t.content = caption;
+                t.move_end(false);
+            });
+        app.update_entity(lyrics_input,
+            [&words](vik::ui::TextInputState& t, vik::Context<vik::ui::TextInputState>&) {
+                t.content = words;
+                t.move_end(false);
+            });
+    }
+
     void save_connection(vik::App& app) {
         settings.save();
         pod_url = settings.active_url();
@@ -1881,6 +2025,7 @@ struct Studio {
     vik::AnyElement pianoroll_panel(vik::Context<Studio>& cx);
     vik::AnyElement new_clip_menu(vik::Context<Studio>& cx);
     vik::AnyElement home_screen(vik::Context<Studio>& cx);
+    vik::AnyElement inspire_modal(vik::Context<Studio>& cx);
     vik::AnyElement quality_chip(vik::Context<Studio>& cx, const char* tier,
                                  bool on);
 };
@@ -2479,6 +2624,196 @@ vik::AnyElement Studio::pianoroll_panel(vik::Context<Studio>& cx) {
 /// document loaded there is nothing behind it worth seeing, and the app used to
 /// open onto four synthesised demo tones, which looks like a project that
 /// failed to load rather than like no project at all.
+
+/// Inspire Me: start from an idea, or from lyrics you already have.
+///
+/// The panel the reference shows -- two tabs, one big text area, an
+/// Instrumental toggle and Generate -- with the parts that only matter
+/// sometimes folded away. Advanced stays shut until asked for, because tempo
+/// and key are decisions most ideas do not have yet, and showing empty boxes
+/// for them turns a sentence into a form.
+///
+/// The proposal is shown, never applied silently. Generating from words the
+/// user has not read is how you get a song nobody asked for.
+vik::AnyElement Studio::inspire_modal(vik::Context<Studio>& cx) {
+    if (!inspire_inputs_ready) {
+        idea_input = vik::ui::text_input_state(cx.app());
+        refine_input = vik::ui::text_input_state(cx.app());
+        inspire_inputs_ready = true;
+    }
+
+    auto tab = [&cx](const char* label, bool on, bool lyrics_mode) {
+        auto t = vik::div().id(std::string("insp-tab-") + label)
+            .px_3().py_2().cursor_pointer()
+            .child(vik::text(label).text_color(vik::rgb(on ? 0xffffff : 0x8d94a3)));
+        if (on)
+            t = std::move(t).border_1().border_color(vik::rgb(0x6b63e8));
+        return std::move(t).on_click(cx.listener(
+            [lyrics_mode](Studio& s, const vik::ClickEvent&, vik::Window&,
+                          vik::Context<Studio>& c) {
+                s.inspire_from_lyrics = lyrics_mode;
+                c.notify();
+            }));
+    };
+
+    auto toggle = [&cx](const std::string& id, const char* label, bool on, auto fn) {
+        return vik::div().id(id).flex_row().items_center().gap_2()
+            .px_3().py_2().rounded_md().cursor_pointer()
+            .bg(vik::rgb(on ? 0x3a4a68 : 0x2c313d))
+            .on_click(cx.listener(fn))
+            .child(vik::ui::phosphor(on ? "check-circle" : "circle",
+                                     vik::ui::PhWeight::Regular)
+                       .size(15.0f).color(vik::rgb(on ? 0x9b93ff : 0x6c7383)))
+            .child(vik::text(label)
+                       .text_color(vik::rgb(on ? 0xffffff : 0xc9cedb)));
+    };
+
+    auto body = vik::div().flex_col().gap_3().p_4().w_px(560.0f)
+        .occlude()
+        .on_mouse_down(vik::MouseButton::Left,
+            [](const vik::MouseDownEvent&, vik::Window& w, vik::App&) {
+                w.stop_propagation();
+            })
+        .rounded_lg().bg(vik::rgb(0x232834))
+        .border_1().border_color(vik::rgb(0x3b4250))
+
+        .child(vik::div().flex_row().items_center().justify_between()
+            .child(vik::text("Inspire Me").text_xl().text_color(vik::white()))
+            .child(vik::div().id("insp-close").px_3().py_2().rounded_md()
+                .cursor_pointer().bg(vik::rgb(0x21252f))
+                .on_click(cx.listener([](Studio& s, const vik::ClickEvent&,
+                                         vik::Window&, vik::Context<Studio>& c) {
+                    s.show_inspire = false;
+                    c.notify();
+                }))
+                .child(vik::ui::phosphor("x", vik::ui::PhWeight::Regular)
+                           .size(15.0f).color(vik::rgb(0xc9cedb)))))
+
+        .child(vik::div().flex_row().gap_1()
+            .child(tab("From Idea", !inspire_from_lyrics, false))
+            .child(tab("From Lyrics", inspire_from_lyrics, true)))
+
+        .child(vik::ui::text_input("insp-idea", idea_input)
+                   .placeholder(inspire_from_lyrics
+                                    ? "paste your lyrics"
+                                    : "describe the song -- a mood, a reference, an occasion")
+                   .w_full()
+                   .on_submit(cx.listener(
+                       [](Studio& s, const std::string& value, vik::Window&,
+                          vik::Context<Studio>& c) {
+                           s.inspire_compose(value);
+                           c.notify();
+                       })));
+
+    // --- advanced, folded away ------------------------------------------
+    body = std::move(body).child(
+        vik::div().id("insp-adv").flex_row().items_center().gap_2()
+            .cursor_pointer()
+            .on_click(cx.listener([](Studio& s, const vik::ClickEvent&, vik::Window&,
+                                     vik::Context<Studio>& c) {
+                s.inspire_advanced = !s.inspire_advanced;
+                c.notify();
+            }))
+            .child(vik::ui::phosphor(inspire_advanced ? "caret-down" : "caret-right",
+                                     vik::ui::PhWeight::Regular)
+                       .size(13.0f).color(vik::rgb(0x8d94a3)))
+            .child(vik::text("Advanced").text_xs().text_color(vik::rgb(0x8d94a3))));
+
+    if (inspire_advanced) {
+        body = std::move(body).child(
+            vik::div().flex_row().items_center().gap_2()
+                .child(vik::text(std::format("{:.0f} BPM", session.bpm))
+                           .text_xs().text_color(vik::rgb(0xc9cedb)))
+                .child(vik::text(std::format("{} bars", gen_bars))
+                           .text_xs().text_color(vik::rgb(0xc9cedb)))
+                .child(vik::text("set on the transport; the model is told to keep them")
+                           .text_xs().text_color(vik::rgb(0x6c7383))));
+    }
+
+    body = std::move(body).child(
+        vik::div().flex_row().items_center().gap_2()
+            .child(toggle("insp-inst", "Instrumental", inspire_instrumental,
+                [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                   vik::Context<Studio>& c) {
+                    s.inspire_instrumental = !s.inspire_instrumental;
+                    c.notify();
+                }))
+            .child(vik::div().flex_1())
+            .child(vik::div().id("insp-go").px_4().py_2().rounded_md()
+                .cursor_pointer()
+                .bg(vik::rgb(inspire_busy ? 0x3a4150 : 0x6b63e8))
+                .on_click(cx.listener([](Studio& s, const vik::ClickEvent&,
+                                         vik::Window& w, vik::Context<Studio>& c) {
+                    if (s.inspire_busy) return;
+                    // The field owns the text; read it rather than shadowing it.
+                    c.app().update_entity(s.idea_input,
+                        [&s](vik::ui::TextInputState& t,
+                             vik::Context<vik::ui::TextInputState>&) {
+                            s.inspire_compose(t.content);
+                        });
+                    c.notify();
+                }))
+                .child(vik::text(inspire_busy ? "Thinking…" : "Write it")
+                           .text_color(vik::white()))));
+
+    if (!inspire_error.empty())
+        body = std::move(body).child(
+            vik::text(inspire_error).text_xs().text_color(vik::rgb(0xe05c72)));
+
+    // --- the proposal ----------------------------------------------------
+    if (has_proposal) {
+        body = std::move(body)
+            .child(vik::div().h_px(1.0f).bg(vik::rgb(0x2c313d)))
+            .child(vik::text(proposal.title.empty() ? "Proposal" : proposal.title)
+                       .text_color(vik::rgb(0xffffff)))
+            .child(vik::text(proposal.caption).text_xs()
+                       .text_color(vik::rgb(0xc9cedb)))
+            .child(vik::text(std::format("{} BPM · {}{}", proposal.bpm,
+                                         proposal.key_scale,
+                                         proposal.lyrics.empty() ? " · instrumental" : ""))
+                       .text_xs().text_color(vik::rgb(0x8d94a3)))
+            .child(vik::text(proposal.notes).text_xs()
+                       .text_color(vik::rgb(0x6c7383)))
+            // Iteration, in the same session: "make the chorus shorter" lands
+            // against what was just proposed rather than starting over.
+            .child(vik::ui::text_input("insp-refine", refine_input)
+                       .placeholder("change something -- shorter chorus, add a sax hook…")
+                       .w_full()
+                       .on_submit(cx.listener(
+                           [](Studio& s, const std::string& value, vik::Window&,
+                              vik::Context<Studio>& c) {
+                               s.inspire_refine(value);
+                               c.notify();
+                           })))
+            .child(vik::div().flex_row().gap_2()
+                .child(vik::div().id("insp-open").px_3().py_2().rounded_md()
+                    .cursor_pointer().bg(vik::rgb(0x2c313d))
+                    .on_click(cx.listener([](Studio& s, const vik::ClickEvent&,
+                                             vik::Window&, vik::Context<Studio>& c) {
+                        // Into the Generate panel, where it can be edited and
+                        // the quality and length chosen before anything runs.
+                        s.show_inspire = false;
+                        s.show_generate = true;
+                        c.notify();
+                    }))
+                    .child(vik::text("Open in Generate")
+                               .text_color(vik::rgb(0xc9cedb)))));
+    }
+
+    return vik::div().absolute().top(0.0f).left(0.0f).right(0.0f).bottom(0.0f)
+        .flex_row().items_center().justify_center()
+        .occlude()
+        .on_mouse_down(vik::MouseButton::Left, cx.listener(
+            [](Studio& s, const vik::MouseDownEvent&, vik::Window&,
+               vik::Context<Studio>& c) {
+                s.show_inspire = false;
+                c.notify();
+            }))
+        .bg(vik::rgba(0x00000099))
+        .child(std::move(body))
+        .into_any();
+}
+
 vik::AnyElement Studio::home_screen(vik::Context<Studio>& cx) {
     auto action = [&cx](const std::string& id, const char* icon, const char* title,
                         const char* blurb, auto fn) {
@@ -2506,6 +2841,16 @@ vik::AnyElement Studio::home_screen(vik::Context<Studio>& cx) {
                       [](Studio& s, const vik::ClickEvent&, vik::Window&,
                          vik::Context<Studio>& c) {
                           s.new_document();
+                          c.notify();
+                      }))
+        .child(action("home-idea", "sparkle", "Start from an idea",
+                      "Describe it; Claude writes the prompt and lyrics",
+                      [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                         vik::Context<Studio>& c) {
+                          if (s.session.tracks.empty() && s.document_path.empty())
+                              s.new_document();
+                          s.show_home = false;
+                          s.show_inspire = true;
                           c.notify();
                       }))
         .child(action("home-import", "waveform", "Start from audio or MIDI",
@@ -2852,7 +3197,10 @@ vik::ui::MenuBuilder Studio::ai_tools_menu(vik::Context<Studio>&) {
     // Ordered as in the reference, and disabled with a reason rather than
     // hidden: a menu that changes shape with state is harder to learn than one
     // where an item explains why it cannot run.
-    entry(needs("Inspire Me", can_lego), ranged && can_lego, Tool::Inspire);
+    // Not "Inspire Me": in the reference that name belongs to the panel that
+    // starts a song from an idea, which is what Studio::inspire_modal is. This
+    // one asks the model for another performance of an existing stem.
+    entry(needs("Another take", can_lego), ranged && can_lego, Tool::Inspire);
     entry(needs("Add a Layer", can_lego), connected && can_lego, Tool::Layer);
     entry("Music Enhancer", ranged, Tool::Enhance);
     entry("Voice Changer", ranged, Tool::Voice);
@@ -3360,6 +3708,13 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                             s.show_generate = true;
                             c.notify();
                         }))
+            .child(dock_tool("t-idea", "lightbulb", "Inspire Me -- start from an idea",
+                        true,
+                        [](Studio& s, const vik::ClickEvent&, vik::Window&,
+                           vik::Context<Studio>& c) {
+                            s.show_inspire = true;
+                            c.notify();
+                        }))
             .child(dock_tool("t-mic", "microphone-stage", "Record a voice take (not yet)",
                         false, [](Studio&, const vik::ClickEvent&, vik::Window&,
                                   vik::Context<Studio>&) {}))
@@ -3608,6 +3963,8 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
 
     if (show_new_clip_menu) overlay = new_clip_menu(cx);
 
+    if (show_inspire) overlay = inspire_modal(cx);
+
     if (tool != Tool::None)
         overlay = current_tool_modal(cx);
     else if (show_settings && !show_layers && !show_generate)
@@ -3687,11 +4044,12 @@ vik::AnyElement Studio::render(vik::Window&, vik::Context<Studio>& cx) {
                     return;
                 }
 
-                if (s.tool != Tool::None || s.show_generate ||
+                if (s.tool != Tool::None || s.show_generate || s.show_inspire ||
                     s.show_layers || s.show_settings) {
                     if (e.key == "escape") {
                         s.tool = Studio::Tool::None;
                         s.show_generate = s.show_layers = s.show_settings = false;
+                        s.show_inspire = false;
                         c.notify();
                     }
                     return;
@@ -4157,6 +4515,7 @@ int main(int argc, char** argv) {
                     else if (open_panel == "voice") s.tool = Studio::Tool::Voice;
                     else if (open_panel == "tool-layer") s.tool = Studio::Tool::Layer;
                     else if (open_panel == "home") s.show_home = true;
+                    else if (open_panel == "inspire") s.show_inspire = true;
                     s.stress = stress;
                     // Read the theme once at startup. It is what tooltips
                     // dereference, and a missing one used to surface only when
@@ -4207,7 +4566,7 @@ int main(int argc, char** argv) {
                 // sleep rather than spinning at 60 Hz forever.
                 app.set_interval(std::chrono::milliseconds(16), [handle](vik::App& a) {
                     a.update_entity(handle, [](Studio& s, vik::Context<Studio>& c) {
-                        const bool landed = s.pump();
+                        const bool landed = s.pump() | s.pump_ai(c.app());
 
                         if (!s.scripted_prompt.empty() && !s.regen_fired &&
                             !s.net_busy) {
