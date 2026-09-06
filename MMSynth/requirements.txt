@@ -1,0 +1,13 @@
+# The service itself. Deliberately laptop-installable: no torch, no models.
+# Everything here is pure Python or a small wheel, so the whole API and its
+# tests run on a machine with no GPU, exactly as musicmaker's server does.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+pyyaml>=6.0
+numpy>=1.26
+requests>=2.32
+# Reading MIDI people hand us, and reading back what we wrote in tests. The
+# writer is ours (score.py); the reader must be somebody else's, or a
+# symmetrical bug hides behind itself.
+mido>=1.3

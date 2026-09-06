@@ -1,0 +1,24 @@
+# Model registry. Each enabled entry is downloaded once to the network volume
+# on first boot, and /health reports progress.
+#
+# Only SoulX-Singer is MMSynth's own weight. The refine pass borrows ACE-Step
+# from musicmaker over HTTP rather than loading a second copy of a 4 GB model
+# into the same card -- MMSynth's dependency there is a URL, not a checkpoint.
+#
+# Disabled until gate/soulx_probe.py has run on a pod. Its VRAM, its parameter
+# count and its call signature are all undocumented upstream, and enabling a
+# download before knowing whether the thing fits is 40 GB of optimism.
+
+models:
+  - name: soulx-singer
+    label: SoulX-Singer
+    kind: huggingface
+    repo_id: Soul-AILab/SoulX-Singer
+    approx_gb: 6            # a guess from its architecture, not a measurement
+    enabled: false
+    purpose: singing voice synthesis from notes and lyrics, zero-shot timbre
+    licence: Apache-2.0
+    # The README describes intended use as "academic research" while the licence
+    # is Apache-2.0. Permissive licence, ambiguous sentence: a question for a
+    # lawyer before release, not before a prototype.
+    note: verify the licence position before shipping commercially

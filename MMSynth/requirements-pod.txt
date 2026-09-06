@@ -1,0 +1,11 @@
+# Installed in the image, on top of requirements.txt. Nothing here is needed to
+# run the tests.
+soundfile>=0.12
+librosa>=0.10
+huggingface-hub>=0.26
+hf_transfer>=0.1
+# SoulX-Singer's stack. Versions unpinned until the Phase 0 gate says what it
+# actually wants -- see gate/soulx_probe.py.
+torch>=2.4
+torchaudio>=2.4
+transformers>=4.44

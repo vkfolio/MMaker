@@ -1,0 +1,1091 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MMSynth</title>
+
+<!--
+  MMSynth — a bench of single-purpose tools, served by the pod that runs them.
+
+  Design direction: a patchbay.
+
+  Every tool here is one transformation with a declared input and output, so
+  the page is a list of signal paths rather than a grid of cards. The wire
+  between "what you have" and "what you get" is the identity, and it is
+  coloured by signal type — brass for notes, steel for audio, rose for a voice.
+  Read the page and you can see, without labels, which tools take a score and
+  which take a recording.
+
+  Everything else stays quiet so the wires are the memorable thing.
+
+  No framework, no build step, one file. It is served from the same origin as
+  the API it talks to, which is what makes that reasonable.
+-->
+
+<style>
+  :root {
+    color-scheme: dark light;
+
+    --ground:   #101418;
+    --panel:    #171c22;
+    --panel-2:  #1d242b;
+    --rule:     #262d35;
+    --rule-lit: #3a444f;
+    --ink:      #e6eaee;
+    --dim:      #93a0ac;
+    --faint:    #5f6b77;
+
+    /* Signal types. These carry meaning, not decoration: every wire on the
+       home page is coloured by what flows through it. */
+    --notes: #e0a33e;
+    --audio: #63a6c9;
+    --voice: #d4796e;
+    --bad:   #d4796e;
+    --good:  #7fb08a;
+
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+            "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --radius: 4px;
+    --gutter: clamp(18px, 4vw, 44px);
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      --ground: #f2f3f5; --panel: #ffffff; --panel-2: #f7f8f9;
+      --rule: #dde1e5; --rule-lit: #c3cad1;
+      --ink: #1b2026; --dim: #5b6874; --faint: #8b97a2;
+      --notes: #9a6a12; --audio: #2d6b8f; --voice: #a5483d;
+    }
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  /* Components that set display:flex/grid beat the attribute, so restate it. */
+  [hidden] { display: none !important; }
+
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font: 400 15px/1.55 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :focus-visible { outline: 2px solid var(--notes); outline-offset: 3px; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+
+  button, input, select, textarea { font: inherit; color: inherit; }
+
+  /* ---------- shell ---------- */
+  .shell { max-width: 940px; margin: 0 auto; padding: 0 var(--gutter) 96px; }
+
+  header.bar {
+    position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; gap: 14px;
+    padding: 16px var(--gutter);
+    background: color-mix(in srgb, var(--ground) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--rule);
+  }
+  .wordmark {
+    font-weight: 620; letter-spacing: -0.02em; font-size: 16px;
+    background: none; border: 0; padding: 0; cursor: pointer;
+  }
+  .bar .spacer { margin-left: auto; }
+  .rig { font-size: 12.5px; color: var(--dim); display: flex; align-items: center; gap: 8px; }
+  .led { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
+  .led.ready { background: var(--good); }
+  .led.working { background: var(--notes); animation: breathe 1.6s ease-in-out infinite; }
+  .led.error { background: var(--bad); }
+  @keyframes breathe { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+
+  /* ---------- home: the patchbay ---------- */
+  .intro { padding: 44px 0 12px; max-width: 54ch; }
+  .intro h1 { font-size: clamp(23px, 3.6vw, 31px); line-height: 1.18;
+              letter-spacing: -0.022em; font-weight: 600; margin: 0 0 10px; }
+  .intro p { margin: 0; color: var(--dim); }
+
+  .tools { display: flex; flex-direction: column; }
+
+  .tool {
+    display: block; width: 100%; text-align: left;
+    background: none; border: 0; border-top: 1px solid var(--rule);
+    padding: 22px 0 24px; cursor: pointer;
+    transition: border-color .15s;
+  }
+  .tools .tool:last-child { border-bottom: 1px solid var(--rule); }
+  .tool:hover:not(:disabled), .tool:focus-visible { border-top-color: var(--rule-lit); }
+  .tool:disabled { cursor: not-allowed; }
+  .tool:disabled .tool-name, .tool:disabled .end { color: var(--faint); }
+  .tool:disabled .wire { opacity: .3; }
+
+  .tool-name { font-size: 17px; font-weight: 560; letter-spacing: -0.012em; margin-bottom: 12px; }
+
+  /* The wire. Input on the left, output on the right, and the line between
+     them carries a gradient from the input signal's colour to the output's. */
+  .path { display: flex; align-items: center; gap: 12px; margin-bottom: 9px; }
+  .end { font-size: 13.5px; color: var(--dim); white-space: nowrap; }
+  .end.to { color: var(--ink); }
+  .wire {
+    flex: 1 1 auto; min-width: 40px; height: 9px; position: relative;
+  }
+  .wire::before {
+    content: ""; position: absolute; inset: 4px 0 auto 0; height: 1px;
+    background: linear-gradient(to right, var(--from), var(--to));
+  }
+  .wire::after {                      /* the plug at the far end */
+    content: ""; position: absolute; right: 0; top: 1px;
+    border: 3.5px solid transparent; border-left: 6px solid var(--to);
+  }
+  .plug { width: 6px; height: 6px; border-radius: 50%; background: var(--from); flex: none; }
+
+  .blurb { margin: 0; font-size: 13.5px; color: var(--dim); max-width: 62ch; }
+  .flag { font-size: 12px; color: var(--notes); margin-top: 7px; }
+
+  /* ---------- panels ---------- */
+  .panel { background: var(--panel); border: 1px solid var(--rule);
+           border-radius: var(--radius); padding: 20px; }
+  .back { background: none; border: 0; color: var(--dim); cursor: pointer;
+          padding: 0; margin: 30px 0 16px; font-size: 13.5px; }
+  .back:hover { color: var(--ink); }
+  h2.title { font-size: 21px; font-weight: 600; letter-spacing: -0.018em; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 13.5px; margin: 0 0 22px; }
+
+  .field { margin-bottom: 16px; }
+  .field > label { display: block; font-size: 13px; color: var(--dim); margin-bottom: 6px; }
+  input[type=text], textarea, select {
+    width: 100%; background: var(--ground); border: 1px solid var(--rule);
+    border-radius: var(--radius); padding: 9px 11px; color: var(--ink);
+  }
+  textarea { min-height: 78px; resize: vertical; line-height: 1.5; }
+  input[type=text]:focus, textarea:focus, select:focus { border-color: var(--rule-lit); outline-offset: 1px; }
+
+  .drop {
+    display: block; border: 1px dashed var(--rule-lit); border-radius: var(--radius);
+    padding: 26px 18px; text-align: center; color: var(--dim); cursor: pointer;
+    background: var(--panel-2); transition: border-color .15s, color .15s;
+  }
+  .drop:hover, .drop.over { border-color: var(--notes); color: var(--ink); }
+  .drop strong { color: var(--ink); font-weight: 500; }
+  .drop input { display: none; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; }
+  .chip {
+    background: var(--panel-2); border: 1px solid var(--rule); color: var(--dim);
+    border-radius: 100px; padding: 5px 12px; font-size: 13px; cursor: pointer;
+  }
+  .chip[aria-pressed=true] { border-color: var(--notes); color: var(--ink); }
+
+  .btn {
+    background: var(--panel-2); border: 1px solid var(--rule); color: var(--ink);
+    border-radius: var(--radius); padding: 9px 16px; cursor: pointer;
+  }
+  .btn:hover:not(:disabled) { border-color: var(--rule-lit); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.primary { background: var(--ink); color: var(--ground); border-color: var(--ink); font-weight: 520; }
+  .btn.small { padding: 5px 11px; font-size: 13px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+  /* ---------- results ---------- */
+  .result { margin-top: 18px; border-top: 1px solid var(--rule); padding-top: 18px; }
+  .take { display: flex; align-items: center; gap: 12px; padding: 11px 0;
+          border-bottom: 1px solid var(--rule); }
+  .take:last-child { border-bottom: 0; }
+  .take .what { flex: 1; min-width: 0; }
+  .take .what b { font-weight: 520; font-size: 14px; }
+  .take .what span { display: block; color: var(--faint); font-size: 12px;
+                     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .play { width: 34px; height: 34px; flex: none; border-radius: 50%;
+          background: var(--panel-2); border: 1px solid var(--rule);
+          color: var(--ink); cursor: pointer; line-height: 1; }
+  .play:hover { border-color: var(--rule-lit); }
+
+  /* ---------- syllables ---------- */
+  .syls { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+  .syl { background: var(--panel-2); border: 1px solid var(--rule);
+         border-radius: 3px; padding: 4px 8px; min-width: 44px; }
+  .syl b { display: block; font-size: 13px; font-weight: 500; }
+  .syl span { display: block; font: 400 10.5px/1.4 var(--mono); color: var(--voice); }
+  .syl.hold b { color: var(--faint); }
+
+  /* ---------- jobs, toasts, boot ---------- */
+  .jobs { display: flex; gap: 8px; align-items: center; }
+  .job { display: flex; gap: 8px; align-items: center; font-size: 12.5px;
+         color: var(--dim); background: var(--panel); border: 1px solid var(--rule);
+         border-radius: 100px; padding: 4px 6px 4px 12px; }
+
+  #toast { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+           display: flex; flex-direction: column; gap: 8px; z-index: 60; width: min(520px, 92vw); }
+  .toast { background: var(--panel); border: 1px solid var(--rule);
+           border-left: 2px solid var(--rule-lit); border-radius: var(--radius);
+           padding: 11px 14px; font-size: 13.5px; }
+  .toast.bad { border-left-color: var(--bad); }
+  .toast.good { border-left-color: var(--good); }
+
+  #boot { position: fixed; inset: 0; z-index: 90; background: var(--ground);
+          display: flex; align-items: center; justify-content: center; padding: 24px; }
+  #boot .inner { width: min(430px, 100%); }
+  #boot h1 { font-size: 17px; font-weight: 560; margin: 0 0 6px; letter-spacing: -0.015em; }
+  #boot p { color: var(--dim); font-size: 13.5px; margin: 0 0 22px; }
+  .meter { margin-bottom: 12px; }
+  .meter .lab { display: flex; justify-content: space-between; font-size: 12px;
+                color: var(--dim); margin-bottom: 5px; }
+  .meter .track { height: 2px; background: var(--rule); }
+  .meter .fill { height: 100%; background: var(--notes); transition: width .4s; }
+
+  .empty { color: var(--faint); font-size: 13.5px; padding: 14px 0; }
+  .num { font: 400 12px/1 var(--mono); color: var(--faint); }
+
+  @media (max-width: 620px) {
+    .path { flex-wrap: wrap; }
+    .wire { min-width: 24px; }
+    .end { white-space: normal; }
+  }
+</style>
+
+<header class="bar">
+  <button class="wordmark" id="home">MMSynth</button>
+  <div class="spacer"></div>
+  <div class="jobs" id="jobs"></div>
+  <div class="rig"><span class="led" id="led"></span><span id="rig">connecting</span></div>
+</header>
+
+<main class="shell">
+  <section id="view"></section>
+</main>
+
+<div id="toast"></div>
+
+<div id="boot">
+  <div class="inner">
+    <h1 id="bootTitle">Starting the engines</h1>
+    <p id="bootMsg">Reaching the pod…</p>
+    <div id="bootMeters"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ---------- plumbing ---------- */
+
+const $ = (s, r = document) => r.querySelector(s);
+const el = (t, cls, txt) => { const n = document.createElement(t);
+  if (cls) n.className = cls; if (txt != null) n.textContent = txt; return n; };
+
+/* A pod behind a public proxy can require a token. It rides in the query string
+   because EventSource and <audio> cannot set headers, and both need to reach
+   gated routes. Every URL in the app goes through this one function. */
+/* localStorage, not sessionStorage: people reach this pod from the RunPod
+   console's Connect button, which opens the bare URL with no ?token= on it.
+   Remembering the token per-browser rather than per-tab means that arrives
+   somewhere useful instead of at a password prompt every time. */
+let TOKEN = new URLSearchParams(location.search).get("token")
+         || localStorage.getItem("mm_token") || "";
+if (TOKEN) {
+  localStorage.setItem("mm_token", TOKEN);
+  /* Take it out of the address bar once it is stored. A token in the URL ends
+     up in history, screenshots and anything pasted to a colleague. */
+  if (location.search.includes("token=")) {
+    history.replaceState(null, "", location.pathname + location.hash);
+  }
+}
+
+function url(path) {
+  if (!TOKEN) return path;
+  return path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(url(path), opts);
+  if (res.status === 401) { askToken(); throw new Error("This pod needs an access token."); }
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = (await res.json()).detail || detail; } catch (_) {}
+    throw new Error(detail);
+  }
+  return res.status === 204 ? null : res.json();
+}
+const post = (p, body) => api(p, {
+  method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
+});
+
+/* A proper screen rather than window.prompt. A bare prompt tells you nothing
+   about which secret is wanted or where to find it, which is a poor first
+   impression of a tool you just switched on. Guarded so several failing
+   requests cannot stack up several screens. */
+let asking = false;
+function askToken() {
+  if (asking) return;
+  asking = true;
+
+  const wrap = el("div"); wrap.id = "boot";
+  const inner = el("div", "inner");
+  inner.append(el("h1", "", "This pod needs its access token"));
+  const p = el("p", "",
+    "It is printed in the pod log when the pod starts, and kept on the volume "
+    + "at /workspace/.mmsynth-token — the token keeps a public pod URL from "
+    + "being an open GPU.");
+  inner.append(p);
+
+  const field = el("div", "field");
+  const input = el("input");
+  input.type = "text"; input.placeholder = "paste it here";
+  input.autocapitalize = "off"; input.spellcheck = false;
+  field.append(input);
+  inner.append(field);
+
+  const row = el("div", "row");
+  const go = el("button", "btn primary", "Unlock");
+  const save = () => {
+    const t = input.value.trim();
+    if (!t) { input.focus(); return; }
+    localStorage.setItem("mm_token", t);
+    location.reload();
+  };
+  go.addEventListener("click", save);
+  input.addEventListener("keydown", e => { if (e.key === "Enter") save(); });
+  row.append(go);
+  inner.append(row);
+
+  wrap.append(inner);
+  document.querySelectorAll("#boot").forEach(n => n.remove());
+  document.body.append(wrap);
+  input.focus();
+}
+
+function toast(msg, kind) {
+  const n = el("div", "toast" + (kind ? " " + kind : ""), msg);
+  $("#toast").append(n);
+  setTimeout(() => n.remove(), kind === "bad" ? 7000 : 3500);
+}
+
+/* ---------- state ---------- */
+
+const state = { tools: [], instruments: [], voices: [], health: null, results: [] };
+const jobs = new Map();
+
+/* ---------- jobs ---------- */
+
+function renderJobs() {
+  const box = $("#jobs");
+  if (!jobs.size) { box.replaceChildren(); return; }
+  /* Rebuild only when the set of jobs changes. Rebuilding every second to tick
+     the clock destroys the Cancel button under the user's pointer. */
+  const want = [...jobs.keys()].join(",");
+  if (box.dataset.ids !== want) {
+    box.dataset.ids = want;
+    box.replaceChildren(...[...jobs.entries()].map(([id, j]) => {
+      const n = el("div", "job");
+      n.append(el("span", "", j.label));
+      const time = el("span", "num", "0s"); time.dataset.since = j.started; n.append(time);
+      const stop = el("button", "btn small", "Stop");
+      stop.addEventListener("click", async () => {
+        stop.disabled = true;
+        try { await post(`/jobs/${id}/cancel`); } catch (e) { toast(e.message, "bad"); }
+      });
+      n.append(stop);
+      return n;
+    }));
+  }
+  box.querySelectorAll("[data-since]").forEach(t => {
+    t.textContent = Math.round((Date.now() - Number(t.dataset.since)) / 1000) + "s";
+  });
+}
+setInterval(renderJobs, 1000);
+
+/* Follow a job to completion. SSE first, then polling — a proxy that buffers or
+   drops the stream must not strand the render. */
+function follow(job, label, onMessage) {
+  jobs.set(job.id, { label, started: Date.now() });
+  renderJobs();
+  const done = () => { jobs.delete(job.id); renderJobs(); };
+
+  return new Promise((resolve, reject) => {
+    let settled = false, gotAny = false;
+    const finish = (fn, arg) => { if (!settled) { settled = true; done(); fn(arg); } };
+
+    const handle = (j) => {
+      if (j.heartbeat) return true;
+      gotAny = true;
+      if (onMessage) onMessage(j);
+      if (j.status === "done") { finish(resolve, j.result); return false; }
+      if (j.status === "error") { finish(reject, new Error(j.error || "failed")); return false; }
+      if (j.status === "cancelled") { finish(reject, new Error("Stopped.")); return false; }
+      return true;
+    };
+
+    const src = new EventSource(url(`/jobs/${job.id}/events`));
+    src.onmessage = (ev) => { if (!handle(JSON.parse(ev.data))) src.close(); };
+    src.onerror = () => {
+      src.close();
+      if (settled) return;
+      if (!gotAny) poll();            // the stream never worked; fall back
+      else finish(reject, new Error("Lost the connection to the engine."));
+    };
+
+    async function poll() {
+      while (!settled) {
+        await new Promise(r => setTimeout(r, 2000));
+        try { if (!handle(await api(`/jobs/${job.id}`))) return; }
+        catch (e) { finish(reject, e); return; }
+      }
+    }
+  });
+}
+
+/* ---------- audio ---------- */
+
+const player = { audio: null, id: null };
+function playPause(id, path, btn) {
+  if (player.id === id && player.audio && !player.audio.paused) {
+    player.audio.pause(); paintPlay(); return;
+  }
+  if (player.audio) {
+    /* Release properly: clearing src without load() leaves the element holding
+       its network slot, and enough orphans exhaust the browser's media pool. */
+    player.audio.pause();
+    player.audio.removeAttribute("src");
+    player.audio.load();
+  }
+  player.audio = new Audio(url("/audio/" + path));
+  player.id = id;
+  player.audio.addEventListener("ended", paintPlay);
+  player.audio.addEventListener("pause", paintPlay);
+  player.audio.addEventListener("play", paintPlay);
+  player.audio.play().catch(e => toast("Could not play that: " + e.message, "bad"));
+}
+function paintPlay() {
+  document.querySelectorAll("[data-play]").forEach(b => {
+    const on = player.id === b.dataset.play && player.audio && !player.audio.paused;
+    b.textContent = on ? "❚❚" : "▶";
+    b.setAttribute("aria-label", on ? "Pause" : "Play");
+  });
+}
+
+function addResult(kind, name, audio, detail) {
+  state.results.unshift({ kind, name, audio, detail, at: Date.now() });
+  state.results = state.results.slice(0, 12);
+  try { sessionStorage.setItem("mm_results", JSON.stringify(state.results)); } catch (_) {}
+}
+/* Results are refreshed in place, never by re-running route(). Rebuilding the
+   whole panel after a render throws away the file you loaded and the chips you
+   chose -- so trying a second instrument would mean uploading again, which is
+   the exact loop this tool exists for. */
+function refreshResults() {
+  const old = document.getElementById("results");
+  if (!old) return;
+  const fresh = buildResults();
+  old.replaceWith(fresh);
+  paintPlay();
+}
+
+function renderResults(into) { into.append(buildResults()); paintPlay(); }
+
+function buildResults() {
+  const box = el("div", "result");
+  box.id = "results";
+  box.append(el("div", "sub", "Results"));
+  if (!state.results.length) {
+    box.append(el("p", "empty", "Nothing yet. What you make appears here."));
+  } else {
+    state.results.forEach(r => {
+      const row = el("div", "take");
+      const b = el("button", "play", "▶");
+      b.dataset.play = r.audio;
+      b.addEventListener("click", () => playPause(r.audio, r.audio, b));
+      const what = el("div", "what");
+      what.append(el("b", "", r.name));
+      what.append(el("span", "", r.detail || ""));
+      const dl = el("a", "btn small", "Save");
+      dl.href = url("/audio/" + r.audio); dl.download = r.name.replace(/\s+/g, "_") + ".wav";
+      row.append(b, what, dl);
+      box.append(row);
+    });
+  }
+  return box;
+}
+
+/* ---------- routing ---------- */
+
+function go(id) { location.hash = id ? "#" + id : ""; }
+window.addEventListener("hashchange", route);
+$("#home").addEventListener("click", () => go(""));
+
+function route() {
+  const id = location.hash.replace(/^#/, "");
+  const view = $("#view");
+  view.replaceChildren();
+  const tool = state.tools.find(t => t.id === id);
+  if (!tool) return renderHome(view);
+  if (id === "play") return renderPlay(view, tool);
+  if (id === "sing") return renderSing(view, tool);
+  if (id === "improve") return renderImprove(view, tool);
+  if (id === "sing_over") return renderSingOver(view, tool);
+  if (id === "voices") return renderVoices(view, tool);
+  renderHome(view);
+}
+
+/* ---------- home ---------- */
+
+const SIGNAL = { notes: "var(--notes)", audio: "var(--audio)", voice: "var(--voice)" };
+
+function renderHome(view) {
+  const intro = el("div", "intro");
+  intro.append(el("h1", "", "What have you got?"));
+  intro.append(el("p", "", "Each tool takes one thing and gives back another. "
+    + "Your timing and your key are never touched."));
+  view.append(intro);
+
+  const list = el("div", "tools");
+  state.tools.forEach(t => {
+    const btn = el("button", "tool");
+    btn.append(el("div", "tool-name", t.name));
+
+    const path = el("div", "path");
+    path.append(el("span", "end from", t.takes));
+    const plug = el("span", "plug");
+    plug.style.background = SIGNAL[t.signal_in] || "var(--dim)";
+    const wire = el("span", "wire");
+    wire.style.setProperty("--from", SIGNAL[t.signal_in] || "var(--dim)");
+    wire.style.setProperty("--to", SIGNAL[t.signal_out] || "var(--dim)");
+    path.append(plug, wire, el("span", "end to", t.gives));
+    btn.append(path);
+
+    btn.append(el("p", "blurb", t.blurb));
+    if (t.state !== "ready") {
+      btn.disabled = true;
+      btn.append(el("div", "flag", t.state === "gated"
+        ? "Not ready — " + t.evidence
+        : "Untested — " + t.evidence));
+    } else {
+      btn.addEventListener("click", () => go(t.id));
+    }
+    list.append(btn);
+  });
+  view.append(list);
+  renderResults(view);
+}
+
+/* ---------- shared bits ---------- */
+
+function backTo(view, tool) {
+  const b = el("button", "back", "← All tools");
+  b.addEventListener("click", () => go(""));
+  view.append(b);
+  view.append(el("h2", "title", tool.name));
+  view.append(el("p", "sub", tool.blurb));
+}
+
+/* A dropped .mid becomes notes here. The file never leaves the browser until
+   the user asks for something, so a mis-drop costs nothing. */
+function midiDrop(onNotes) {
+  const wrap = el("label", "drop");
+  const text = el("span");
+  text.innerHTML = "<strong>Drop a MIDI file</strong><br>or click to choose one";
+  const input = el("input");
+  input.type = "file"; input.accept = ".mid,.midi";
+  wrap.append(text, input);
+
+  const read = async (file) => {
+    if (!file) return;
+    text.textContent = "Reading " + file.name + "…";
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await api("/midi", { method: "POST", body: fd });
+      text.innerHTML = "<strong>" + file.name + "</strong><br>"
+        + res.notes.length + " notes · " + res.note;
+      onNotes(res.notes, res.bpm);
+    } catch (e) {
+      text.innerHTML = "<strong>Drop a MIDI file</strong><br>or click to choose one";
+      toast(e.message, "bad");
+    }
+  };
+
+  input.addEventListener("change", () => read(input.files[0]));
+  ["dragover", "dragenter"].forEach(ev => wrap.addEventListener(ev, e => {
+    e.preventDefault(); wrap.classList.add("over");
+  }));
+  ["dragleave", "drop"].forEach(ev => wrap.addEventListener(ev, () => wrap.classList.remove("over")));
+  wrap.addEventListener("drop", e => { e.preventDefault(); read(e.dataTransfer.files[0]); });
+  return wrap;
+}
+
+const ACTIONS = ["brighter", "darker", "warmer", "more_air", "more_bite",
+                 "softer", "louder", "more_legato", "tighter", "wetter", "drier"];
+
+function chipRow(options, chosen) {
+  const box = el("div", "chips");
+  options.forEach(o => {
+    const c = el("button", "chip", o.replace(/_/g, " "));
+    c.type = "button";
+    c.setAttribute("aria-pressed", chosen.has(o) ? "true" : "false");
+    c.addEventListener("click", () => {
+      chosen.has(o) ? chosen.delete(o) : chosen.add(o);
+      c.setAttribute("aria-pressed", chosen.has(o) ? "true" : "false");
+    });
+    box.append(c);
+  });
+  return box;
+}
+
+/* ---------- play a melody ---------- */
+
+function renderPlay(view, tool) {
+  backTo(view, tool);
+  let notes = null, bpm = 120;
+  const chosen = new Set();
+
+  const panel = el("div", "panel");
+  const f1 = el("div", "field");
+  f1.append(midiDrop((n, b) => { notes = n; bpm = b || 120; run.disabled = false; }));
+  panel.append(f1);
+
+  const f2 = el("div", "field");
+  f2.append(el("label", "", "Instrument"));
+  const pick = el("select");
+  state.instruments.forEach(i => {
+    const o = el("option", "", i.label); o.value = i.id; pick.append(o);
+  });
+  f2.append(pick);
+  panel.append(f2);
+
+  const f3 = el("div", "field");
+  f3.append(el("label", "", "Adjust"));
+  f3.append(chipRow(ACTIONS, chosen));
+  panel.append(f3);
+
+  const f4 = el("div", "field");
+  f4.append(el("label", "", "Or describe it in your own words"));
+  const words = el("input"); words.type = "text";
+  words.placeholder = "close mic, a little dusty, played gently";
+  f4.append(words);
+  panel.append(f4);
+
+  const run = el("button", "btn primary", "Play it");
+  run.disabled = true;
+  run.addEventListener("click", async () => {
+    run.disabled = true;
+    const was = run.textContent;
+    try {
+      const res = await post("/render", {
+        notes, bpm, instrument_id: pick.value,
+        actions: [...chosen], prompt: words.value.trim(),
+      });
+      const out = await follow(res.job, "playing", j => {
+        run.textContent = j.determinate === false
+          ? (j.message || "Working…")
+          : (j.message || Math.round((j.progress || 0) * 100) + "%");
+      });
+      addResult("play", pick.options[pick.selectedIndex].text, out.audio,
+                out.notes + " notes · " + out.duration_s + "s");
+      refreshResults();
+      toast("Played.", "good");
+    } catch (e) { toast(e.message, "bad"); }
+    finally { run.textContent = was; run.disabled = false; }
+  });
+  const actions = el("div", "row");
+  actions.append(run);
+  panel.append(actions);
+
+  view.append(panel);
+  renderResults(view);
+}
+
+/* ---------- sing a melody ---------- */
+
+function renderSing(view, tool) {
+  backTo(view, tool);
+  let notes = null, bpm = 120;
+
+  const panel = el("div", "panel");
+  const f1 = el("div", "field");
+  f1.append(midiDrop(async (n, b) => {
+    notes = n; bpm = b || 120;
+    await spread();
+    run.disabled = false;
+  }));
+  panel.append(f1);
+
+  const f2 = el("div", "field");
+  f2.append(el("label", "", "Words"));
+  const words = el("textarea");
+  words.placeholder = "twinkle twinkle little star";
+  f2.append(words);
+  const sylBox = el("div", "syls");
+  f2.append(sylBox);
+  panel.append(f2);
+
+  /* Show the alignment before anything is rendered. Melisma and long words are
+     where singing goes wrong, and seeing it first is cheaper than hearing it
+     afterwards. */
+  let spreading = null;
+  async function spread() {
+    if (!notes || !words.value.trim()) { sylBox.replaceChildren(); return; }
+    clearTimeout(spreading);
+    spreading = setTimeout(async () => {
+      try {
+        const res = await post("/lyrics", { notes, line: words.value });
+        res.notes.forEach((a, i) => { notes[i].lyric = a.lyric; notes[i].phonemes = a.phonemes; });
+        sylBox.replaceChildren(...res.notes.map(a => {
+          const s = el("div", "syl" + (a.lyric === "-" ? " hold" : ""));
+          s.append(el("b", "", a.lyric));
+          s.append(el("span", "", a.display));
+          return s;
+        }));
+        if (res.pending.length) {
+          toast(res.pending.length + " syllable(s) have no note yet: " + res.pending.join(" "));
+        }
+      } catch (e) { toast(e.message, "bad"); }
+    }, 350);
+  }
+  words.addEventListener("input", spread);
+
+  const f3 = el("div", "field");
+  f3.append(el("label", "", "Voice"));
+  const pick = el("select");
+  if (!state.voices.length) {
+    const o = el("option", "", "No voices yet — add one in Voices"); o.value = "";
+    pick.append(o); pick.disabled = true;
+  }
+  state.voices.forEach(v => {
+    const o = el("option", "", v.label + (v.usable ? "" : "  (no consent recorded)"));
+    o.value = v.id; pick.append(o);
+  });
+  f3.append(pick);
+  panel.append(f3);
+
+  const run = el("button", "btn primary", "Sing it");
+  run.disabled = true;
+  run.addEventListener("click", async () => {
+    run.disabled = true;
+    const was = run.textContent;
+    try {
+      const res = await post("/sing", { notes, bpm, voice_id: pick.value });
+      const out = await follow(res.job, "singing", j => {
+        run.textContent = j.determinate === false
+          ? (j.message || "Working…")
+          : (j.message || Math.round((j.progress || 0) * 100) + "%");
+      });
+      addResult("sing", "Vocal — " + (out.line || "untitled"), out.audio,
+                out.syllables + " syllables · " + out.duration_s + "s");
+      refreshResults();
+      toast("Sung.", "good");
+    } catch (e) { toast(e.message, "bad"); }
+    finally { run.textContent = was; run.disabled = false; }
+  });
+  const actions = el("div", "row");
+  actions.append(run);
+  panel.append(actions);
+
+  view.append(panel);
+  renderResults(view);
+}
+
+/* ---------- voices ---------- */
+
+function renderVoices(view, tool) {
+  backTo(view, tool);
+  const panel = el("div", "panel");
+
+  if (!state.voices.length) {
+    panel.append(el("p", "empty",
+      "No voices yet. A voice is a short clip of someone singing — the model "
+      + "copies the timbre and sings your melody with it."));
+  }
+  state.voices.forEach(v => {
+    const row = el("div", "take");
+    const what = el("div", "what");
+    what.append(el("b", "", v.label));
+    what.append(el("span", "", v.usable
+      ? (v.description || "ready")
+      : "Not usable: no consent recorded for AI singing-voice use."));
+    row.append(what);
+    panel.append(row);
+  });
+
+  const note = el("p", "blurb",
+    "Voices live on this pod's volume, so they are still here next time you "
+    + "switch it on. A voice needs recorded consent from the person singing "
+    + "before it will be used.");
+  note.style.marginTop = "16px";
+  panel.append(note);
+
+  view.append(panel);
+}
+
+/* A recording the user brings. Uploading is separate from rendering: it is
+   cheap, it lets the page say what it found before any GPU is spent, and one
+   upload can feed several attempts. */
+function audioDrop(onUploaded) {
+  const wrap = el("label", "drop");
+  const text = el("span");
+  const idle = "<strong>Drop a recording</strong><br>wav, mp3, flac or ogg";
+  text.innerHTML = idle;
+  const input = el("input");
+  input.type = "file"; input.accept = "audio/*,.wav,.mp3,.flac,.ogg,.m4a";
+  wrap.append(text, input);
+
+  const read = async (file) => {
+    if (!file) return;
+    text.textContent = "Reading " + file.name + "…";
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await api("/uploads", { method: "POST", body: fd });
+      text.innerHTML = "<strong>" + res.name + "</strong><br>"
+        + res.seconds + "s · " + res.channels + " ch · peak " + res.peak_db + " dB";
+      onUploaded(res);
+    } catch (e) {
+      text.innerHTML = idle;
+      toast(e.message, "bad");
+    }
+  };
+
+  input.addEventListener("change", () => read(input.files[0]));
+  ["dragover", "dragenter"].forEach(ev => wrap.addEventListener(ev, e => {
+    e.preventDefault(); wrap.classList.add("over");
+  }));
+  ["dragleave", "drop"].forEach(ev => wrap.addEventListener(ev, () => wrap.classList.remove("over")));
+  wrap.addEventListener("drop", e => { e.preventDefault(); read(e.dataTransfer.files[0]); });
+  return wrap;
+}
+
+function progressLabel(btn, was) {
+  return (j) => {
+    btn.textContent = j.determinate === false
+      ? (j.message || "Working…")
+      : (j.message || Math.round((j.progress || 0) * 100) + "%");
+  };
+}
+
+/* ---------- improve a recording ---------- */
+
+function renderImprove(view, tool) {
+  backTo(view, tool);
+  let upload = null;
+  const chosen = new Set();
+
+  const panel = el("div", "panel");
+  const f1 = el("div", "field");
+  f1.append(audioDrop(u => { upload = u; run.disabled = false; }));
+  panel.append(f1);
+
+  const f2 = el("div", "field");
+  f2.append(el("label", "", "What should it sound like?"));
+  const words = el("input"); words.type = "text";
+  words.placeholder = "close-mic solo violin, warm, concert hall";
+  f2.append(words);
+  panel.append(f2);
+
+  const f3 = el("div", "field");
+  f3.append(el("label", "", "Or start from an instrument"));
+  const pick = el("select");
+  const none = el("option", "", "— describe it myself —"); none.value = "";
+  pick.append(none);
+  state.instruments.forEach(i => {
+    const o = el("option", "", i.label); o.value = i.id; pick.append(o);
+  });
+  f3.append(pick);
+  panel.append(f3);
+
+  const f4 = el("div", "field");
+  f4.append(el("label", "", "Adjust"));
+  f4.append(chipRow(ACTIONS, chosen));
+  panel.append(f4);
+
+  const f5 = el("div", "field");
+  const keepWrap = el("label", "row");
+  const keep = el("input"); keep.type = "checkbox";
+  keepWrap.append(keep, el("span", "", "Hold hard to the source (for a full mix)"));
+  f5.append(keepWrap);
+  f5.append(el("p", "blurb",
+    "A single line can take a lot of freedom and stay itself. A whole "
+    + "arrangement cannot — the model may reinterpret the harmony, not just the "
+    + "sound. Tick this and it is held much closer."));
+  panel.append(f5);
+
+  const run = el("button", "btn primary", "Improve it");
+  run.disabled = true;
+  run.addEventListener("click", async () => {
+    run.disabled = true;
+    const was = run.textContent;
+    try {
+      const res = await post("/enhance", {
+        upload_id: upload.id, prompt: words.value.trim(),
+        instrument_id: pick.value, actions: [...chosen],
+        keep_arrangement: keep.checked,
+      });
+      const out = await follow(res.job, "improving", progressLabel(run, was));
+      addResult("improve", out.label || "Improved", out.audio,
+                out.source + " · " + (out.duration_s || "?") + "s"
+                + (out.kept_arrangement ? " · held to source" : ""));
+      refreshResults();
+      toast("Improved.", "good");
+    } catch (e) { toast(e.message, "bad"); }
+    finally { run.textContent = was; run.disabled = false; }
+  });
+  const actions = el("div", "row");
+  actions.append(run);
+  panel.append(actions);
+
+  view.append(panel);
+  renderResults(view);
+}
+
+/* ---------- sing over a track ---------- */
+
+function renderSingOver(view, tool) {
+  backTo(view, tool);
+  let notes = null;
+
+  const panel = el("div", "panel");
+  const f1 = el("div", "field");
+  const found = el("p", "blurb");
+  f1.append(audioDrop(async (u) => {
+    found.textContent = "Reading the melody…";
+    try {
+      const res = await post("/transcribe", { upload_id: u.id });
+      notes = res.notes;
+      found.textContent = res.note;
+      await spread();
+      run.disabled = false;
+    } catch (e) { found.textContent = ""; toast(e.message, "bad"); }
+  }));
+  f1.append(found);
+  panel.append(f1);
+
+  const f2 = el("div", "field");
+  f2.append(el("label", "", "Words"));
+  const words = el("textarea");
+  words.placeholder = "the words to sing on that tune";
+  f2.append(words);
+  const sylBox = el("div", "syls");
+  f2.append(sylBox);
+  panel.append(f2);
+
+  let pending = null;
+  async function spread() {
+    if (!notes || !words.value.trim()) { sylBox.replaceChildren(); return; }
+    clearTimeout(pending);
+    pending = setTimeout(async () => {
+      try {
+        const res = await post("/lyrics", { notes, line: words.value });
+        res.notes.forEach((a, i) => { notes[i].lyric = a.lyric; notes[i].phonemes = a.phonemes; });
+        sylBox.replaceChildren(...res.notes.map(a => {
+          const s = el("div", "syl" + (a.lyric === "-" ? " hold" : ""));
+          s.append(el("b", "", a.lyric));
+          s.append(el("span", "", a.display));
+          return s;
+        }));
+      } catch (e) { toast(e.message, "bad"); }
+    }, 350);
+  }
+  words.addEventListener("input", spread);
+
+  const f3 = el("div", "field");
+  f3.append(el("label", "", "Voice"));
+  const pick = el("select");
+  state.voices.forEach(v => {
+    const o = el("option", "", v.label + (v.usable ? "" : "  (no consent recorded)"));
+    o.value = v.id; pick.append(o);
+  });
+  f3.append(pick);
+  panel.append(f3);
+
+  const run = el("button", "btn primary", "Sing it");
+  run.disabled = true;
+  run.addEventListener("click", async () => {
+    run.disabled = true;
+    const was = run.textContent;
+    try {
+      const res = await post("/sing", { notes, bpm: 120, voice_id: pick.value });
+      const out = await follow(res.job, "singing", progressLabel(run, was));
+      addResult("sing", "Vocal — " + (out.line || "untitled"), out.audio,
+                out.syllables + " syllables · " + out.duration_s + "s");
+      refreshResults();
+      toast("Sung.", "good");
+    } catch (e) { toast(e.message, "bad"); }
+    finally { run.textContent = was; run.disabled = false; }
+  });
+  const actions = el("div", "row");
+  actions.append(run);
+  panel.append(actions);
+
+  view.append(panel);
+  renderResults(view);
+}
+
+/* ---------- boot ---------- */
+
+async function pollBoot() {
+  let health;
+  try { health = await api("/health"); }
+  catch (_) {
+    $("#bootMsg").textContent = "Cannot reach the pod. Check it is still running.";
+    return setTimeout(pollBoot, 3000);
+  }
+  state.health = health;
+
+  const TITLE = {
+    starting: "Starting the engines",
+    downloading: "Fetching model weights",
+    ready: "Ready",
+    error: "Something went wrong",
+  };
+  const MSG = {
+    starting: "Almost there.",
+    downloading: "This happens once. The next time you switch this pod on it is instant.",
+    ready: "",
+    error: health.message || "Check the pod logs.",
+  };
+  $("#bootTitle").textContent = TITLE[health.status] || health.status;
+  $("#bootMsg").textContent = MSG[health.status] || "";
+
+  const meters = $("#bootMeters");
+  meters.replaceChildren(...(health.models || []).map(m => {
+    const box = el("div", "meter");
+    const lab = el("div", "lab");
+    lab.append(el("span", "", m.label));
+    lab.append(el("span", "", m.state === "downloading" ? m.percent + "%" : m.state));
+    const track = el("div", "track");
+    const fill = el("div", "fill");
+    fill.style.width = (m.state === "ready" ? 100 : m.percent) + "%";
+    track.append(fill);
+    box.append(lab, track);
+    return box;
+  }));
+
+  if (health.status === "ready") return start();
+  setTimeout(pollBoot, health.status === "error" ? 6000 : 1200);
+}
+
+async function start() {
+  try {
+    const [tools, instruments, voices] = await Promise.all([
+      api("/tools"), api("/instruments").catch(() => ({instruments: []})),
+      api("/voices").catch(() => ({voices: []})),
+    ]);
+    state.tools = tools.tools;
+    state.instruments = instruments.instruments || [];
+    state.voices = voices.voices || [];
+  } catch (e) {
+    if (String(e.message).includes("token")) return;   // askToken already fired
+    toast(e.message, "bad");
+  }
+
+  try { state.results = JSON.parse(sessionStorage.getItem("mm_results") || "[]"); } catch (_) {}
+
+  const gpu = state.health.gpu || {};
+  $("#rig").textContent = gpu.available ? `${gpu.name} · ${gpu.total_gb} GB` : "no GPU";
+  $("#led").className = "led ready";
+
+  $("#boot").remove();
+  route();
+}
+
+pollBoot();
+</script>

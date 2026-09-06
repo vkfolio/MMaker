@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+_data/
+_models/
+_out/
+.pytest_cache/
+# Reference clips are somebody's voice. Metadata is versioned; audio is not.
+voices/*/
+!voices/README.md
+sf2/
+sfz/
+.work/

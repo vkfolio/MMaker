@@ -1,0 +1,135 @@
+# The AI instruments.
+#
+# An "AI instrument" here is a preset, and saying so plainly is what keeps the
+# feature honest. It names four things:
+#
+#   patch      what actually makes the sound -- an SFZ region set when one is
+#              installed, otherwise a General MIDI program through the soundfont
+#   humanise   how it is performed: velocity shape, timing, articulation
+#   refine     the caption ACE-Step is given, and `noise`
+#              (= cover_noise_strength) which is how much freedom it gets.
+#              Counter-intuitively LOWER noise means MORE freedom: with `cover`
+#              the melody is carried by FSQ semantic codes, not the waveform,
+#              so the tune survives at every level (PHASE0.md).
+#   space      how much room it sits in
+#
+# The neural pass is what makes these more than a soundfont, but the sampler
+# underneath is what makes them predictable. Both halves are load-bearing: a
+# render with `dry: true` skips the model entirely and is still musical, which
+# is what you want while you are drawing notes.
+#
+# The ids match the desktop's existing instrument names where they overlap
+# (desktop/src/app_main.cpp:2299), so a score written before MMSynth existed
+# still resolves.
+
+instruments:
+  - id: grand_piano
+    label: Grand Piano
+    track_class: keyboard
+    program: 0
+    sfz: keys/salamander.sfz
+    humanise: {velocity_centre: 82, velocity_range: 26, accent: 11,
+               timing_jitter_ms: 9, legato: 0.05}
+    refine: {prompt: "close-mic grand piano, felt hammers, natural room",
+             noise: 0.28}
+    space: {mix: 0.16, decay_s: 1.5}
+
+  - id: warm_rhodes
+    label: Warm Rhodes
+    track_class: keyboard
+    program: 4
+    humanise: {velocity_centre: 76, velocity_range: 20, accent: 8,
+               timing_jitter_ms: 11, legato: 0.20}
+    refine: {prompt: "warm electric piano, tape saturation, gentle chorus",
+             noise: 0.36}
+    space: {mix: 0.20, decay_s: 1.8}
+
+  - id: guitar
+    label: Acoustic Guitar
+    track_class: guitar
+    program: 24
+    humanise: {velocity_centre: 80, velocity_range: 24, accent: 10,
+               timing_jitter_ms: 13, legato: -0.10}
+    refine: {prompt: "fingerpicked steel-string acoustic guitar, close mic, woody",
+             noise: 0.34}
+    space: {mix: 0.18, decay_s: 1.3}
+
+  - id: bass
+    label: Upright Bass
+    track_class: bass
+    program: 32
+    humanise: {velocity_centre: 88, velocity_range: 14, accent: 9,
+               timing_jitter_ms: 10, legato: 0.15}
+    refine: {prompt: "upright acoustic bass, round low end, finger noise",
+             noise: 0.26}
+    space: {mix: 0.08, decay_s: 0.9}
+
+  - id: strings
+    label: String Section
+    track_class: strings
+    program: 48
+    humanise: {velocity_centre: 74, velocity_range: 30, accent: 6,
+               timing_jitter_ms: 18, legato: 0.55, end_lengthen: 0.20}
+    refine: {prompt: "warm string section, legato bowing, hall",
+             noise: 0.40}
+    space: {mix: 0.34, decay_s: 2.6}
+
+  - id: violin
+    label: Solo Violin
+    track_class: strings
+    program: 40
+    humanise: {velocity_centre: 78, velocity_range: 28, accent: 7,
+               timing_jitter_ms: 15, legato: 0.45, end_lengthen: 0.18}
+    refine: {prompt: "solo violin, expressive vibrato, rosin and bow noise",
+             noise: 0.42}
+    space: {mix: 0.28, decay_s: 2.1}
+
+  - id: cello
+    label: Solo Cello
+    track_class: strings
+    program: 42
+    humanise: {velocity_centre: 78, velocity_range: 26, accent: 7,
+               timing_jitter_ms: 16, legato: 0.50, end_lengthen: 0.20}
+    refine: {prompt: "solo cello, deep resonant body, expressive legato",
+             noise: 0.42}
+    space: {mix: 0.30, decay_s: 2.3}
+
+  - id: flute
+    label: Flute
+    track_class: woodwinds
+    program: 73
+    humanise: {velocity_centre: 72, velocity_range: 22, accent: 6,
+               timing_jitter_ms: 14, legato: 0.35}
+    refine: {prompt: "solo flute, breathy attack, airy tone",
+             noise: 0.40}
+    space: {mix: 0.26, decay_s: 1.9}
+
+  - id: sax
+    label: Tenor Sax
+    track_class: woodwinds
+    program: 66
+    humanise: {velocity_centre: 82, velocity_range: 30, accent: 9,
+               timing_jitter_ms: 17, legato: 0.30}
+    refine: {prompt: "tenor saxophone, breathy, late-night club, close mic",
+             noise: 0.44}
+    space: {mix: 0.24, decay_s: 1.7}
+
+  - id: trumpet
+    label: Trumpet
+    track_class: brass
+    program: 56
+    humanise: {velocity_centre: 86, velocity_range: 28, accent: 12,
+               timing_jitter_ms: 12, legato: 0.10}
+    refine: {prompt: "solo trumpet, brassy, muted warmth, room",
+             noise: 0.42}
+    space: {mix: 0.24, decay_s: 1.8}
+
+  - id: analog_pad
+    label: Analog Pad
+    track_class: synth
+    program: 89
+    humanise: {velocity_centre: 68, velocity_range: 16, accent: 4,
+               timing_jitter_ms: 6, legato: 0.80, end_lengthen: 0.30}
+    refine: {prompt: "warm analog synth pad, slow filter movement, wide",
+             noise: 0.45}
+    space: {mix: 0.40, decay_s: 3.2}
